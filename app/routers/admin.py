@@ -32,6 +32,15 @@ def migrar_base_de_datos_urgente(db: Session = Depends(get_session)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error en migración: {str(e)}")
+    
+@router.get("/usuarios/me", tags=["Perfil"])
+def obtener_perfil_actual(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
+    """
+    Devuelve los datos del usuario logueado según la base de datos de TYMEO.
+    El Frontend debe llamar a esta ruta apenas Auth0 confirma el login 
+    para descubrir el rol real, el tenant_id y sus nombres.
+    """
+    return usuario
 
 # --- MOLDES LIMPIOS Y ACTUALIZADOS ---
 class NuevoUsuarioSaaS(BaseModel):
