@@ -35,6 +35,34 @@ def ver_secreto(usuario_validado: dict = Depends(get_usuario_actual)):
 # Conectamos el módulo de administración
 app.include_router(admin.router)
 
+@app.get("/ascender-estanislao")
+def ascender_estanislao(db: Session = Depends(get_session)):
+    """Ruta temporal de emergencia para ascender o CREAR al usuario de Google OAuth"""
+    id_google = "google-oauth2|103641955647524616968"
+    
+    # 1. Buscamos tu usuario en la base de datos local
+    mi_usuario = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == id_google)).first()
+    
+    if mi_usuario:
+        # Si ya existías, te ascendemos
+        mi_usuario.rol = RolUsuario.SUPERADMIN
+        mi_usuario.tenant_id = "tymeo_core"
+        db.add(mi_usuario)
+        db.commit()
+        return {"status": "ÉXITO", "mensaje": "¡Usuario actualizado a SUPERADMIN!"}
+    else:
+        # 2. Si la base de datos no te conocía, ¡te creamos como dueño absoluto!
+        nuevo_admin = UsuarioSaaS(
+            auth0_id=id_google,
+            email="estanislao@inspectia.ai",
+            tenant_id="tymeo_core",  # El tenant principal
+            rol=RolUsuario.SUPERADMIN,
+            activo=True
+        )
+        db.add(nuevo_admin)
+        db.commit()
+        return {"status": "ÉXITO", "mensaje": "¡Usuario CREADO desde cero y coronado como SUPERADMIN!"}
+
 @app.post("/setup/primer-admin")
 def crear_primer_superadmin(
     payload: dict = Depends(verificar_token_auth0), 
