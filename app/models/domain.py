@@ -27,6 +27,16 @@ class TenantBase(SQLModel):
     """Garantiza el aislamiento B2B. Todas las tablas lo heredan."""
     tenant_id: str = Field(index=True, description="ID del cliente/tenant")
 
+class Tenant(SQLModel, table=True):
+    """Tabla maestra para la configuración y branding de cada empresa cliente"""
+    __tablename__ = "tenants_saas"
+    
+    id: str = Field(primary_key=True, description="Coincide con el tenant_id (ej: springwall)")
+    nombre: str = Field(description="Nombre comercial o razón social de la empresa")
+    logo_url: Optional[str] = Field(default=None, description="URL pública de la imagen del logo")
+    color_primario: Optional[str] = Field(default=None, description="Color principal en formato HSL o HEX")
+    locale_default: str = Field(default="es", description="Idioma por defecto de la interfaz")
+
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
 # ==========================================
