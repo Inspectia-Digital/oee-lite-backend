@@ -5,7 +5,7 @@ from typing import Optional
 from sqlalchemy import text
 from app.core.database import get_session
 from app.core.auth import get_usuario_actual
-from app.models.domain import UsuarioSaaS, RolUsuario
+from app.models.domain import UsuarioSaaS, RolUsuario, Tenant
 from app.core.auth0_service import crear_usuario_en_auth0 
 
 router = APIRouter(prefix="/accesos")
@@ -184,3 +184,42 @@ def actualizar_usuario_interno(
     db.refresh(usuario_db)
     
     return {"mensaje": "Personal actualizado exitosamente", "usuario": usuario_db}
+
+from app.models.domain import Tenant # Ajusta la ruta si es diferente
+
+@router.get("/setup/init-tenants", tags=["Setup"])
+def inicializar_tenants_base(db: Session = Depends(get_session)):
+    """
+    Ruta temporal para crear los tenants fundacionales y asignar al SuperAdmin.
+    """
+    # 1. Crear el Tenant de InspectIA (Tu Cuartel General)
+    tenant_inspectia = db.exec(select(Tenant).where(Tenant.id == "inspectia_admin")).first()
+    if not tenant_inspectia:
+        tenant_inspectia = Tenant(id="inspectia_admin", nombre="Administrador InspectIA")
+        db.add(tenant_inspectia)
+
+    # 2. Crear el Tenant de Springwall (Tu primer cliente)
+    tenant_springwall = db.exec(select(Tenant).where(Tenant.id == "springwall")).first()
+    if not tenant_springwall:
+        tenant_springwall = Tenant(id="springwall", nombre="Springwall")
+        db.add(tenant_springwall)
+
+    db.commit() # Guardamos las empresas primero
+
+    # 3. Buscar a todos los SuperAdmins (tu usuario) y asignarlos a InspectIA
+    superadmins = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.rol == RolUsuario.SUPERADMIN)).all()
+    
+    admins_actualizados = 0
+    for admin in superadmins:
+        admin.tenant_id = "inspectia_admin"
+        db.add(admin)
+        admins_actualizados += 1
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "mensaje": "Tenants fundacionales inicializados correctamente",
+        "tenants_creados": ["inspectia_admin", "springwall"],
+        "superadmins_asignados": admins_actualizados
+    }
