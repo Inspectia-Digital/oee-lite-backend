@@ -165,9 +165,14 @@ def actualizar_usuario_interno(
     if not usuario_db:
         raise HTTPException(status_code=404, detail="Usuario no encontrado en tu empresa.")
         
-    # 2. Evitamos que un gerente se ascienda a SuperAdmin por error/malicia
+# 2. Evitamos que un gerente asigne o mantenga el rol de SuperAdmin
     if datos.rol == RolUsuario.SUPERADMIN:
-        raise HTTPException(status_code=403, detail="No tienes permisos para asignar este rol.")
+        # El único que puede manipular el rol superadmin es el propio superadmin
+        if admin_local.rol != RolUsuario.SUPERADMIN:
+            raise HTTPException(
+                status_code=403, 
+                detail="No tienes permiso para asignar este rol."
+            )
         
     # 3. Aplicamos los cambios (solo los campos que el frontend haya enviado)
     update_data = datos.model_dump(exclude_unset=True) 
