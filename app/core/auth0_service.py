@@ -46,7 +46,7 @@ def crear_usuario_en_auth0(email: str) -> str:
     response = requests.post(url, json=payload, headers=headers)
     
     if response.status_code == 409:
-        raise HTTPException(status_code=400, detail="Este correo ya tiene una cuenta en Auth0.")
+        raise HTTPException(status_code=400, detail="Este correo ya tiene una cuenta.")
     if response.status_code != 201:
         raise HTTPException(status_code=500, detail=f"Error de Auth0: {response.text}")
         
