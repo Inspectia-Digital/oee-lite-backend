@@ -37,6 +37,12 @@ class Tenant(SQLModel, table=True):
     color_primario: Optional[str] = Field(default=None, description="Color principal en formato HSL o HEX")
     locale_default: str = Field(default="es", description="Idioma por defecto de la interfaz")
 
+    # --- NUEVO: Configuración de la Planta ---
+    modo_asignacion_operarios: str = Field(
+        default="manual", 
+        description="Define si los operarios se asignan 'manual' (supervisor) o por 'escaneo' (terminal)"
+    )
+
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
 # ==========================================
