@@ -1,7 +1,7 @@
 from app.core.auth import verificar_token_auth0, get_usuario_actual
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import analytics, operacion, configuracion, admin # Importamos las rutas
+from app.routers import analytics, operacion, configuracion, admin, scans # Importamos las rutas
 from app.core.database import get_session, engine
 from sqlmodel import Session, select, SQLModel
 from app.models.domain import UsuarioSaaS, RolUsuario
@@ -98,6 +98,7 @@ def crear_primer_superadmin(
 app.include_router(configuracion.router)
 app.include_router(operacion.router)
 app.include_router(analytics.router)
+app.include_router(scans.router)
 
 # 4. Endpoints base
 @app.get("/")
