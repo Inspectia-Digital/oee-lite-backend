@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
 from sqlmodel import Session, select
 from typing import Optional
@@ -7,6 +7,7 @@ from app.core.database import get_session
 from app.core.auth import get_usuario_actual
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant
 from app.core.auth0_service import crear_usuario_en_auth0 
+import base64
 
 router = APIRouter(prefix="/accesos")
 
@@ -43,6 +44,17 @@ def obtener_perfil_actual(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
     return usuario
 
 # --- MOLDES LIMPIOS Y ACTUALIZADOS ---
+
+class TenantCreate(BaseModel):
+    id: str
+    nombre: str
+
+class TenantUpdate(BaseModel):
+    nombre: Optional[str] = None
+    color_primario: Optional[str] = None
+    # El logo_url se actualizará por un endpoint separado, pero lo permitimos aquí por si acaso
+    logo_url: Optional[str] = None
+
 class NuevoUsuarioSaaS(BaseModel):
     tenant_id: str
     email: str
@@ -88,6 +100,14 @@ def crear_usuario_b2b(
     
     return {"mensaje": f"Se ha enviado un correo a {db_usuario.email} para configurar su acceso.", "usuario": db_usuario}
 
+@router.get("/superadmin/usuarios", tags=["SuperAdmin (Global)"])
+def listar_todos_los_usuarios(
+    db: Session = Depends(get_session), 
+    admin: UsuarioSaaS = Depends(get_superadmin)
+):
+    """Lista todos los usuarios registrados en todas las empresas de la plataforma."""
+    # Nota: Asegúrate de tener UsuarioSaaS importado arriba
+    return db.exec(select(UsuarioSaaS)).all()
 
 @router.patch("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
 def actualizar_usuario(
@@ -185,8 +205,6 @@ def actualizar_usuario_interno(
     
     return {"mensaje": "Personal actualizado exitosamente", "usuario": usuario_db}
 
-from app.models.domain import Tenant # Ajusta la ruta si es diferente
-
 @router.get("/setup/init-tenants", tags=["Setup"])
 def inicializar_tenants_base(db: Session = Depends(get_session)):
     """
@@ -223,3 +241,115 @@ def inicializar_tenants_base(db: Session = Depends(get_session)):
         "tenants_creados": ["inspectia_admin", "springwall"],
         "superadmins_asignados": admins_actualizados
     }
+
+# ==========================================
+# GESTIÓN DE TENANTS (SUPERADMIN)
+# ==========================================
+
+@router.get("/superadmin/tenants", tags=["SuperAdmin (Global)"])
+def listar_todos_los_tenants(db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
+    """Lista todas las empresas cliente registradas en el sistema."""
+    from app.models.domain import Tenant
+    return db.exec(select(Tenant)).all()
+
+@router.post("/superadmin/tenants", tags=["SuperAdmin (Global)"])
+def crear_tenant(datos: TenantCreate, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
+    """Crea una nueva empresa/tenant."""
+    from app.models.domain import Tenant
+    
+    if db.exec(select(Tenant).where(Tenant.id == datos.id)).first():
+        raise HTTPException(status_code=400, detail="El ID del tenant ya existe.")
+        
+    nuevo_tenant = Tenant(id=datos.id, nombre=datos.nombre)
+    db.add(nuevo_tenant)
+    db.commit()
+    db.refresh(nuevo_tenant)
+    return {"mensaje": "Empresa creada exitosamente", "tenant": nuevo_tenant}
+
+@router.patch("/superadmin/tenants/{tenant_id}", tags=["SuperAdmin (Global)"])
+def actualizar_tenant_global(tenant_id: str, datos: TenantUpdate, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
+    """Permite al SuperAdmin editar cualquier empresa."""
+    from app.models.domain import Tenant
+    
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if not tenant_db:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+        
+    update_data = datos.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(tenant_db, key, value)
+        
+    db.add(tenant_db)
+    db.commit()
+    db.refresh(tenant_db)
+    return {"mensaje": "Empresa actualizada", "tenant": tenant_db}
+
+import base64
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from sqlmodel import Session, select
+# Mueve este import al principio de tu archivo admin.py
+from app.models.domain import Tenant, UsuarioSaaS 
+from app.core.database import get_session
+# Asumo que tienes tus esquemas TenantUpdate definidos arriba
+
+# ==========================================
+# GESTIÓN DE BRANDING (MI EMPRESA)
+# ==========================================
+
+@router.get("/mi-empresa/tenant", tags=["Gestión de Accesos (Empresa)"])
+def obtener_mi_tenant(db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
+    """Devuelve los datos de branding de la empresa del usuario logueado."""
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
+    
+    if not tenant_db:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    return tenant_db
+
+@router.patch("/mi-empresa/tenant", tags=["Gestión de Accesos (Empresa)"])
+def actualizar_mi_tenant(datos: TenantUpdate, db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
+    """Permite a Gerencia actualizar el nombre o color de su empresa."""
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
+    
+    if not tenant_db:
+         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    
+    update_data = datos.model_dump(exclude_unset=True)
+    
+    # Bloqueamos que intenten cambiar el ID del tenant maliciosamente
+    update_data.pop("id", None) 
+    
+    for key, value in update_data.items():
+        setattr(tenant_db, key, value)
+        
+    db.add(tenant_db)
+    db.commit()
+    db.refresh(tenant_db)
+    return {"mensaje": "Branding actualizado", "tenant": tenant_db}
+
+@router.post("/mi-empresa/tenant/logo", tags=["Gestión de Accesos (Empresa)"])
+async def subir_mi_logo(file: UploadFile = File(...), db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
+    """Sube un logo y lo guarda como Base64 en la base de datos (Solución MVP)."""
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="El archivo debe ser una imagen.")
+        
+    contenido = await file.read()
+    
+    # Restringir tamaño a ~2MB para no saturar la base de datos
+    if len(contenido) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="La imagen es demasiado grande. Máximo 2MB.")
+        
+    # Convertir a Base64
+    base64_encoded = base64.b64encode(contenido).decode("utf-8")
+    logo_data_uri = f"data:{file.content_type};base64,{base64_encoded}"
+    
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
+    
+    if not tenant_db:
+         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+         
+    tenant_db.logo_url = logo_data_uri
+    
+    db.add(tenant_db)
+    db.commit()
+    
+    return {"mensaje": "Logo actualizado exitosamente", "logo_url": logo_data_uri}
