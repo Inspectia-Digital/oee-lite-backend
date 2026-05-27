@@ -1,13 +1,15 @@
 import json
+import os
 from urllib.request import urlopen
-from fastapi import Depends, HTTPException, status
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from sqlmodel import Session, select
 
 from app.core.database import get_session
-from app.models.domain import UsuarioSaaS
-import os
+from app.models.domain import UsuarioSaaS, RolUsuario
 
 # ==========================================
 # CONFIGURACIÓN DE AUTH0
@@ -80,3 +82,27 @@ def get_usuario_actual(payload: dict = Depends(verificar_token_auth0), db: Sessi
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo.")
         
     return usuario_db
+
+
+# ==========================================
+# AISLAMIENTO Y "MODO DIOS" (IMPERSONATION)
+# ==========================================
+
+def obtener_tenant_aislado(
+    tenant_impersonado: Optional[str] = Query(
+        None, 
+        alias="tenant_id", 
+        description="Solo SuperAdmin: Permite ver los datos de otra empresa"
+    ),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+) -> str:
+    """
+    Resuelve el tenant_id garantizando el aislamiento estricto de datos B2B.
+    Si un SuperAdmin envía ?tenant_id=X en la URL, el sistema adopta esa identidad para soporte.
+    Para el resto de los mortales, ignora cualquier parámetro y fuerza el tenant real del usuario.
+    """
+    if usuario.rol == RolUsuario.SUPERADMIN and tenant_impersonado:
+        return tenant_impersonado
+        
+    # Candado irrompible: forzamos el tenant_id real del usuario
+    return usuario.tenant_id

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from app.core.database import get_session
-from app.core.auth import get_usuario_actual
+# 1. IMPORTAMOS LA NUEVA DEPENDENCIA MAGICA
+from app.core.auth import obtener_tenant_aislado
 from app.models.domain import (
     EventoEscaneo, Estacion, Operario, Turno, AsignacionTurno, 
-    ParadaDetectada, MotivoParada, EstadoParada, UsuarioSaaS
+    ParadaDetectada, MotivoParada, EstadoParada
 )
 from pydantic import BaseModel
 from datetime import datetime
@@ -51,7 +52,7 @@ def parsear_barcode(barcode: str) -> BarcodeDecodificado:
 @router.get("/test-parser/{barcode}", tags=["Pruebas"])
 def probar_parser(
     barcode: str, 
-    usuario: UsuarioSaaS = Depends(get_usuario_actual) # Protegemos hasta las pruebas
+    tenant_id: str = Depends(obtener_tenant_aislado) # Protegemos hasta las pruebas
 ):
     try:
         return {"status": "ok", "data": parsear_barcode(barcode)}
@@ -59,22 +60,25 @@ def probar_parser(
         return {"status": "error", "detalle": str(e)}
 
 
-# --- ENDPOINTS ---
+# ==========================================
+# ENDPOINTS BLINDADOS (SOPORTAN "MODO DIOS")
+# ==========================================
+
 @router.post("/eventos/", response_model=EventoEscaneo)
 def registrar_evento(
     evento: EventoEscaneo, 
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
-    # 🔒 Forzamos el tenant_id del usuario autenticado
-    evento.tenant_id = usuario.tenant_id
+    # 🔒 Forzamos el tenant_id interceptado
+    evento.tenant_id = tenant_id
 
     if isinstance(evento.timestamp, str):
         evento.timestamp = datetime.fromisoformat(evento.timestamp.replace("Z", ""))
 
-    # 🔒 Validamos que la estación pertenezca a esta empresa
+    # 🔒 Validamos que la estación pertenezca a este tenant
     estacion = db.get(Estacion, evento.estacion_fk)
-    if not estacion or estacion.tenant_id != usuario.tenant_id:
+    if not estacion or estacion.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Estación no encontrada o no pertenece a su empresa")
 
     # ==============================================================
@@ -85,7 +89,7 @@ def registrar_evento(
         operario = db.exec(
             select(Operario).where(
                 Operario.legajo == evento.barcode, 
-                Operario.tenant_id == usuario.tenant_id
+                Operario.tenant_id == tenant_id
             )
         ).first()
         
@@ -97,7 +101,7 @@ def registrar_evento(
         # 🔒 Buscamos el turno de la empresa
         turno_actual = db.exec(
             select(Turno).where(
-                Turno.tenant_id == usuario.tenant_id,
+                Turno.tenant_id == tenant_id,
                 Turno.hora_inicio <= hora_actual, 
                 Turno.hora_fin >= hora_actual
             )
@@ -107,7 +111,7 @@ def registrar_evento(
             raise HTTPException(status_code=400, detail="No hay un turno configurado para esta hora")
 
         nueva_asig = AsignacionTurno(
-            tenant_id=usuario.tenant_id,
+            tenant_id=tenant_id,
             fecha=evento.timestamp.date(),
             estacion_fk=estacion.id,
             operario_fk=operario.id,
@@ -132,7 +136,7 @@ def registrar_evento(
         select(AsignacionTurno, Turno)
         .join(Turno, AsignacionTurno.turno_fk == Turno.id)
         .where(
-            AsignacionTurno.tenant_id == usuario.tenant_id,
+            AsignacionTurno.tenant_id == tenant_id,
             AsignacionTurno.estacion_fk == estacion.id,
             AsignacionTurno.fecha == fecha_actual,
             Turno.hora_inicio <= hora_actual,
@@ -147,7 +151,7 @@ def registrar_evento(
     ultimo_evento = db.exec(
         select(EventoEscaneo)
         .where(
-            EventoEscaneo.tenant_id == usuario.tenant_id, 
+            EventoEscaneo.tenant_id == tenant_id, 
             EventoEscaneo.barcode == evento.barcode
         )
         .order_by(EventoEscaneo.timestamp.desc())
@@ -160,7 +164,7 @@ def registrar_evento(
         if diff_segundos > 150: 
             evento.desempeno = "ALERTA"
             nueva_parada = ParadaDetectada(
-                tenant_id=usuario.tenant_id, 
+                tenant_id=tenant_id, 
                 estacion_fk=estacion.id,
                 inicio=ultimo_evento.timestamp, 
                 fin=evento.timestamp,
@@ -190,16 +194,16 @@ def registrar_evento(
 def asignar_operario_retroactivo(
     datos: AsignacionRetroactiva, 
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
     # 🔒 Validamos que el operario exista y sea de esta empresa
     operario = db.get(Operario, datos.operario_fk)
-    if not operario or operario.tenant_id != usuario.tenant_id:
+    if not operario or operario.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Operario no encontrado en su empresa")
 
     eventos = db.exec(
         select(EventoEscaneo).where(
-            EventoEscaneo.tenant_id == usuario.tenant_id,
+            EventoEscaneo.tenant_id == tenant_id,
             EventoEscaneo.estacion_fk == datos.estacion_fk,
             EventoEscaneo.timestamp >= datos.inicio,
             EventoEscaneo.timestamp <= datos.fin
@@ -223,12 +227,12 @@ def asignar_operario_retroactivo(
 @router.get("/paradas/pendientes/", response_model=list[ParadaDetectada])
 def obtener_paradas_pendientes(
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
     return db.exec(
         select(ParadaDetectada)
         .where(
-            ParadaDetectada.tenant_id == usuario.tenant_id,
+            ParadaDetectada.tenant_id == tenant_id,
             ParadaDetectada.estado == EstadoParada.PENDIENTE
         )
     ).all()
@@ -238,16 +242,16 @@ def clasificar_parada(
     parada_id: uuid.UUID, 
     datos: ClasificarParada, 
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
     # 🔒 Verificamos que la parada exista y pertenezca a la empresa
     parada = db.get(ParadaDetectada, parada_id)
-    if not parada or parada.tenant_id != usuario.tenant_id:
+    if not parada or parada.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa")
     
     # 🔒 Verificamos que el motivo de parada pertenezca a la empresa
     motivo = db.get(MotivoParada, datos.motivo_fk)
-    if not motivo or motivo.tenant_id != usuario.tenant_id:
+    if not motivo or motivo.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Motivo de parada no válido o no autorizado")
 
     parada.motivo_fk = motivo.id
@@ -262,16 +266,16 @@ def clasificar_parada(
 def registrar_parada_planificada(
     datos: ParadaPlanificadaCreate, 
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
     # 🔒 Validamos estación
     estacion = db.get(Estacion, datos.estacion_fk)
-    if not estacion or estacion.tenant_id != usuario.tenant_id:
+    if not estacion or estacion.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Estación no encontrada")
 
     # 🔒 Validamos motivo
     motivo = db.get(MotivoParada, datos.motivo_fk)
-    if not motivo or motivo.tenant_id != usuario.tenant_id:
+    if not motivo or motivo.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Motivo no encontrado")
         
     if str(motivo.tipo_parada).lower().replace("tipoparada.", "") != "planificada":
@@ -282,7 +286,7 @@ def registrar_parada_planificada(
          raise HTTPException(status_code=400, detail="La fecha de fin debe ser mayor a la de inicio")
 
     nueva_parada = ParadaDetectada(
-        tenant_id=usuario.tenant_id,
+        tenant_id=tenant_id,
         estacion_fk=datos.estacion_fk,
         motivo_fk=motivo.id,
         inicio=datos.inicio,
@@ -301,10 +305,10 @@ def registrar_parada_planificada(
 def crear_asignacion(
     asignacion: AsignacionTurno, 
     db: Session = Depends(get_session),
-    usuario: UsuarioSaaS = Depends(get_usuario_actual)
+    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
 ):
     # 🔒 Forzamos el tenant
-    asignacion.tenant_id = usuario.tenant_id
+    asignacion.tenant_id = tenant_id
     
     # 🔒 Opcional: Podrías verificar que estación, operario y turno sean de esta empresa.
     # Por ahora confiaremos en que los IDs que envíe el Front (ya filtrados) son correctos,
