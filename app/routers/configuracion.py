@@ -25,9 +25,12 @@ class EstacionUpdate(BaseModel):
     activa: Optional[bool] = None
     posicion_linea: Optional[int] = None
     ramal: Optional[str] = None
+    modo_asignacion_operarios: Optional[str] = None
+    codigo_plc: Optional[str] = None
 
 class LineaUpdate(BaseModel):
     nombre: Optional[str] = None
+    modo_asignacion_operarios: Optional[str] = None
 
 class OperarioUpdate(BaseModel):
     legajo: Optional[str] = None
@@ -303,80 +306,6 @@ def actualizar_supervisor(
     db.commit()
     db.refresh(supervisor_db)
     return supervisor_db
-
-# ==========================================
-# IMPORTADORES MASIVOS (FASE 2)
-# ==========================================
-@router.post("/upload/skus/")
-def importar_maestro_skus(
-    file: UploadFile = File(...), 
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    contenido = file.file.read()
-    try:
-        if file.filename.lower().endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python', encoding='utf-8-sig')
-        else:
-            df = pd.read_excel(io.BytesIO(contenido))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error de lectura: {str(e)}")
-
-    df.columns = [str(c).replace('\ufeff', '').replace(';', '').strip().upper() for c in df.columns]
-    
-    if "SKU" not in df.columns or "DESCRIPCION" not in df.columns:
-        raise HTTPException(status_code=400, detail=f"Faltan columnas obligatorias. Detectadas: {df.columns.tolist()}")
-
-    creados, actualizados = 0, 0
-    for _, row in df.iterrows():
-        sku_code = str(row["SKU"]).strip()
-        if not sku_code or sku_code.lower() == "nan": continue
-        
-        sku_db = db.exec(select(MaestroSKU).where(MaestroSKU.tenant_id == tenant_id, MaestroSKU.codigo_sku == sku_code)).first()
-        
-        if sku_db:
-            sku_db.descripcion = str(row["DESCRIPCION"]).strip()
-            actualizados += 1
-        else:
-            db.add(MaestroSKU(tenant_id=tenant_id, codigo_sku=sku_code, descripcion=str(row["DESCRIPCION"]).strip(), tiempo_ciclo_teorico=240.0))
-            creados += 1
-    
-    db.commit()
-    return {"status": "ok", "mensaje": f"Catálogo actualizado. Creados: {creados}, Actualizados: {actualizados}."}
-
-@router.post("/upload/plan/")
-def importar_plan_produccion(
-    file: UploadFile = File(...), 
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    contenido = file.file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python', header=None, encoding='utf-8-sig')
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error en Plan: {str(e)}")
-
-    lineas = 0
-    for i in range(len(df)):
-        try:
-            fila = df.iloc[i]
-            sku_id = str(fila[0]).strip()      
-            cantidad = int(fila[3])            
-            fecha_plan = str(fila[4]).strip()  
-            
-            nueva_op = OrdenProduccion(
-                tenant_id=tenant_id,
-                id_orden=f"OP-{sku_id[:5]}-{i}", 
-                plan_fecha=fecha_plan,
-                estado="abierta" 
-            )
-            db.add(nueva_op)
-            lineas += 1
-        except Exception as e:
-            continue
-
-    db.commit()
-    return {"status": "ok", "mensaje": f"Plan cargado. {lineas} órdenes listas para fabricar."}
 
 # ==========================================
 # ENDPOINTS MANUALES Y UTILERÍA

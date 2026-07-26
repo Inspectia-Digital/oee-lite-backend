@@ -1,15 +1,17 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlmodel import Session, select
-from sqlalchemy.orm import Session
 from sqlalchemy import func, case
-from app.core.database import get_session
-# 1. IMPORTAMOS LA NUEVA DEPENDENCIA DE IMPERSONATION
-from app.core.auth import obtener_tenant_aislado 
-from app.models.domain import Estacion, EventoEscaneo, ParadaDetectada, MotivoParada, Operario, Turno, Linea, TipoParada, UsuarioSaaS
-from pydantic import BaseModel
 from datetime import datetime, time, date, timedelta
 from typing import List, Optional
 import uuid
+
+from app.core.database import get_session
+from app.core.auth import obtener_tenant_aislado
+from app.models.domain import (
+    Estacion, EventoEscaneo, ParadaDetectada, 
+    MotivoParada, Operario, Turno, Linea, TipoParada, UsuarioSaaS
+)
+from pydantic import BaseModel
 
 router = APIRouter(tags=["Analytics"])
 
@@ -71,14 +73,14 @@ def obtener_rango_dia(fecha_busqueda: date = None):
 
 
 # ==========================================
-# ENDPOINTS BLINDADOS (SOPORTAN "MODO DIOS")
+# ENDPOINTS BLINDADOS (MULTI-TENANT)
 # ==========================================
 
 @router.get("/reportes/dashboard", response_model=list[MetricasEstacion])
 def obtener_dashboard_estaciones(
-    skip: int = 0, limit: int = 500000, 
+    skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio_dia, fin_dia = obtener_rango_dia()
     
@@ -86,7 +88,7 @@ def obtener_dashboard_estaciones(
         select(EventoEscaneo, Estacion)
         .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id, # <-- ACTUALIZADO
+            EventoEscaneo.tenant_id == tenant_id,
             EventoEscaneo.timestamp >= inicio_dia,
             EventoEscaneo.timestamp <= fin_dia
         )
@@ -140,12 +142,12 @@ def obtener_oee_general(
     fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio, fin = obtener_rango_dia(fecha_desde)
     
     query = select(EventoEscaneo, Estacion).join(Estacion, EventoEscaneo.estacion_fk == Estacion.id).where(
-        EventoEscaneo.tenant_id == tenant_id, # <-- ACTUALIZADO
+        EventoEscaneo.tenant_id == tenant_id,
         EventoEscaneo.timestamp >= inicio,
         EventoEscaneo.timestamp <= fin
     )
@@ -160,7 +162,7 @@ def obtener_oee_general(
     total_unidades = len(eventos)
     dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
     
-    q_turnos = select(Turno).where(Turno.tenant_id == tenant_id) # <-- ACTUALIZADO
+    q_turnos = select(Turno).where(Turno.tenant_id == tenant_id)
     if linea_id: q_turnos = q_turnos.where(Turno.linea_id == linea_id)
     if turno_id: q_turnos = q_turnos.where(Turno.id == turno_id)
     turnos = db.exec(q_turnos).all()
@@ -179,7 +181,7 @@ def obtener_oee_general(
         tiempo_planificado_seg = 28800 * dias_consulta
 
     q_paradas = select(ParadaDetectada, MotivoParada).outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id).join(Estacion, ParadaDetectada.estacion_fk == Estacion.id).where(
-        ParadaDetectada.tenant_id == tenant_id, # <-- ACTUALIZADO
+        ParadaDetectada.tenant_id == tenant_id,
         ParadaDetectada.inicio >= inicio, 
         ParadaDetectada.inicio <= fin
     )
@@ -228,9 +230,9 @@ def obtener_oee_general(
 
 @router.get("/analytics/reporte-operarios/", response_model=list[ReporteOperarioSpringwall])
 def obtener_reporte_springwall(
-    skip: int = 0, limit: int = 500000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
@@ -239,7 +241,7 @@ def obtener_reporte_springwall(
         .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
         .outerjoin(Operario, EventoEscaneo.operario_fk == Operario.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id, # <-- ACTUALIZADO
+            EventoEscaneo.tenant_id == tenant_id,
             EventoEscaneo.timestamp >= inicio_dia,
             EventoEscaneo.timestamp <= fin_dia
         )
@@ -288,9 +290,9 @@ def obtener_reporte_springwall(
 
 @router.get("/analytics/pareto-paradas/", response_model=list[ParetoParadas])
 def obtener_pareto_paradas(
-    skip: int = 0, limit: int = 500000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
@@ -298,7 +300,7 @@ def obtener_pareto_paradas(
         select(ParadaDetectada, MotivoParada)
         .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
         .where(
-            ParadaDetectada.tenant_id == tenant_id, # <-- ACTUALIZADO
+            ParadaDetectada.tenant_id == tenant_id,
             ParadaDetectada.inicio >= inicio_dia,
             ParadaDetectada.inicio <= fin_dia
         )
@@ -331,9 +333,9 @@ def obtener_pareto_paradas(
 
 @router.get("/analytics/cuellos-botella/", response_model=list[CuelloBotella])
 def obtener_cuellos_botella(
-    skip: int = 0, limit: int = 500000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
@@ -341,7 +343,7 @@ def obtener_cuellos_botella(
         select(EventoEscaneo, Estacion)
         .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id, # <-- ACTUALIZADO
+            EventoEscaneo.tenant_id == tenant_id,
             EventoEscaneo.timestamp >= inicio_dia,
             EventoEscaneo.timestamp <= fin_dia,
             EventoEscaneo.segundos_proceso > 0 
@@ -370,7 +372,7 @@ def obtener_cuellos_botella(
 def tendencia_oee_diaria(
     linea_id: Optional[uuid.UUID] = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO (Aunque devuelva mocks ahora, blinda la ruta)
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     hoy = datetime.now().date()
     datos = []
@@ -386,9 +388,9 @@ def tendencia_oee_diaria(
 
 @router.get("/analytics/alertas-vivas/", response_model=list[AlertaActiva])
 def obtener_alertas_vivas(
-    skip: int = 0, limit: int = 50000, 
+    skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    tenant_id: str = Depends(obtener_tenant_aislado)
 ):
     inicio_dia, fin_dia = obtener_rango_dia()
     alertas = []
@@ -397,7 +399,7 @@ def obtener_alertas_vivas(
         select(ParadaDetectada, Estacion)
         .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
         .where(
-            ParadaDetectada.tenant_id == tenant_id, # <-- ACTUALIZADO
+            ParadaDetectada.tenant_id == tenant_id,
             ParadaDetectada.estado == "pendiente",
             ParadaDetectada.inicio >= inicio_dia,
             ParadaDetectada.inicio <= fin_dia
@@ -416,7 +418,7 @@ def obtener_alertas_vivas(
         select(EventoEscaneo, Estacion)
         .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id, # <-- ACTUALIZADO
+            EventoEscaneo.tenant_id == tenant_id,
             EventoEscaneo.timestamp >= inicio_dia,
             EventoEscaneo.timestamp <= fin_dia,
             (EventoEscaneo.desempeno == "ALERTA") | (EventoEscaneo.es_retrabajo == True)

@@ -39,9 +39,13 @@ class TenantUpdate(BaseModel):
     nombre: Optional[str] = None
     color_primario: Optional[str] = None
     logo_url: Optional[str] = None
-    
-    # --- NUEVO: Permitimos que el gerente cambie el modo ---
     modo_asignacion_operarios: Optional[str] = None
+    
+    # --- NUEVO ---
+    tolerancia_lento_pct: Optional[float] = None
+    tolerancia_alerta_pct: Optional[float] = None
+    regex_parser_orden: Optional[str] = None
+    regex_parser_sku: Optional[str] = None
 
 class NuevoUsuarioSaaS(BaseModel):
     tenant_id: str

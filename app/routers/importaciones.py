@@ -1,0 +1,206 @@
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+from sqlmodel import Session, select
+from typing import Optional
+import pandas as pd
+import io
+import json
+
+from app.core.database import get_session
+from app.core.auth import obtener_tenant_aislado
+from app.models.domain import OrdenProduccion, MaestroSKU, Tenant
+
+router = APIRouter(prefix="/api/lite/importaciones", tags=["Importación y Exportación (UI)"])
+
+# ==========================================
+# HELPER: GUARDIA DE INTEGRACIÓN
+# ==========================================
+def verificar_permiso_carga_manual(db: Session, tenant_id: str):
+    tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if tenant and tenant.origen_maestros == "ERP":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP."
+        )
+
+# ==========================================
+# 1. IMPORTACIÓN DE PLAN DE PRODUCCIÓN
+# ==========================================
+@router.get("/plan/template", status_code=status.HTTP_200_OK)
+def descargar_template_plan():
+    df = pd.DataFrame(columns=["id_orden", "sku_fk", "cantidad_esperada", "plan_fecha", "linea_id"])
+    df.loc[0] = ["OP-EJEMPLO-01", "SKU-123", "500", "2024-12-31", "opcional_uuid_linea"]
+    
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
+    
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=template_plan_produccion.csv"
+    return response
+
+@router.post("/plan/upload", status_code=status.HTTP_200_OK)
+async def subir_plan(
+    file: UploadFile = File(...),
+    map_json: Optional[str] = Form(None, description='Opcional. Ej: {"Tango_ID": "id_orden", "Articulo": "sku_fk"}'), 
+    db: Session = Depends(get_session),
+    tenant_id: str = Depends(obtener_tenant_aislado)
+):
+    # 1. Validar que no estemos pisando un ERP activo
+    verificar_permiso_carga_manual(db, tenant_id)
+
+    # 2. Leer archivo
+    contenido = await file.read()
+    try:
+        if file.filename.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python')
+        elif file.filename.lower().endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(io.BytesIO(contenido))
+        else:
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
+
+    # 3. Lógica de Mapeo Dinámico o Template
+    origen_auditoria = "CSV_TEMPLATE"
+    if map_json:
+        try:
+            mapeo = json.loads(map_json)
+            df = df.rename(columns=mapeo)
+            origen_auditoria = "CSV_MAPPED"
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="El map_json provisto no es un JSON válido.")
+
+    # Validar columnas resultantes
+    columnas_requeridas = {"id_orden", "sku_fk", "cantidad_esperada", "plan_fecha"}
+    if not columnas_requeridas.issubset(df.columns):
+        faltantes = columnas_requeridas - set(df.columns)
+        raise HTTPException(status_code=400, detail=f"Faltan columnas requeridas en el archivo (o no fueron mapeadas): {faltantes}")
+
+    skus_validos = set(db.exec(select(MaestroSKU.codigo_sku).where(MaestroSKU.tenant_id == tenant_id)).all())
+    
+    creadas, actualizadas = 0, 0
+    errores = []
+
+    # 4. Upsert
+    for index, row in df.iterrows():
+        try:
+            orden_id = str(row["id_orden"]).strip()
+            sku = str(row["sku_fk"]).strip()
+            cant = int(row["cantidad_esperada"])
+            fecha = str(row["plan_fecha"]).strip()
+            
+            linea_fk = None
+            if "linea_id" in df.columns and not pd.isna(row["linea_id"]):
+                linea_fk = str(row["linea_id"]).strip()
+
+            if sku not in skus_validos:
+                errores.append(f"Fila {index}: El SKU '{sku}' no existe en la base de datos.")
+                continue
+
+            orden_db = db.exec(
+                select(OrdenProduccion)
+                .where(OrdenProduccion.id_orden == orden_id, OrdenProduccion.tenant_id == tenant_id)
+            ).first()
+
+            if orden_db:
+                orden_db.sku_fk = sku
+                orden_db.cantidad_esperada = cant
+                orden_db.plan_fecha = fecha
+                orden_db.origen = origen_auditoria
+                if linea_fk: 
+                    orden_db.linea_id = linea_fk
+                actualizadas += 1
+            else:
+                nueva_orden = OrdenProduccion(
+                    tenant_id=tenant_id, id_orden=orden_id, sku_fk=sku,
+                    cantidad_esperada=cant, plan_fecha=fecha, linea_id=linea_fk,
+                    origen=origen_auditoria
+                )
+                db.add(nueva_orden)
+                creadas += 1
+
+        except Exception as e:
+            errores.append(f"Fila {index}: Error de formato ({str(e)})")
+
+    db.commit()
+    return {"status": "ok", "resultados": {"creadas": creadas, "actualizadas": actualizadas, "errores": errores}}
+
+# ==========================================
+# 2. IMPORTACIÓN DE CATÁLOGO (SKUs)
+# ==========================================
+@router.get("/skus/template", status_code=status.HTTP_200_OK)
+def descargar_template_skus():
+    df = pd.DataFrame(columns=["codigo_sku", "descripcion", "tiempo_ciclo_teorico", "unidades_por_ciclo"])
+    df.loc[0] = ["SKU-123", "Colchón King Size 2x2", "240", "1"]
+    
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
+    
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=template_catalogo_skus.csv"
+    return response
+
+@router.post("/skus/upload", status_code=status.HTTP_200_OK)
+async def subir_skus(
+    file: UploadFile = File(...),
+    map_json: Optional[str] = Form(None), 
+    db: Session = Depends(get_session),
+    tenant_id: str = Depends(obtener_tenant_aislado)
+):
+    verificar_permiso_carga_manual(db, tenant_id)
+
+    contenido = await file.read()
+    try:
+        if file.filename.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python')
+        elif file.filename.lower().endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(io.BytesIO(contenido))
+        else:
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
+
+    if map_json:
+        try:
+            mapeo = json.loads(map_json)
+            df = df.rename(columns=mapeo)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="El map_json provisto no es un JSON válido.")
+
+    if "codigo_sku" not in df.columns or "descripcion" not in df.columns:
+        raise HTTPException(status_code=400, detail="Faltan columnas requeridas ('codigo_sku', 'descripcion').")
+
+    creados, actualizados = 0, 0
+    errores = []
+
+    for index, row in df.iterrows():
+        try:
+            sku_code = str(row["codigo_sku"]).strip()
+            if not sku_code or sku_code.lower() == "nan": 
+                continue
+                
+            desc = str(row["descripcion"]).strip()
+            
+            t_ciclo = float(row["tiempo_ciclo_teorico"]) if "tiempo_ciclo_teorico" in df.columns and not pd.isna(row["tiempo_ciclo_teorico"]) else 240.0
+            u_ciclo = int(row["unidades_por_ciclo"]) if "unidades_por_ciclo" in df.columns and not pd.isna(row["unidades_por_ciclo"]) else 1
+
+            sku_db = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_code, MaestroSKU.tenant_id == tenant_id)).first()
+
+            if sku_db:
+                sku_db.descripcion = desc
+                sku_db.tiempo_ciclo_teorico = t_ciclo
+                sku_db.unidades_por_ciclo = u_ciclo
+                actualizados += 1
+            else:
+                nuevo_sku = MaestroSKU(
+                    tenant_id=tenant_id, codigo_sku=sku_code, descripcion=desc,
+                    tiempo_ciclo_teorico=t_ciclo, unidades_por_ciclo=u_ciclo
+                )
+                db.add(nuevo_sku)
+                creados += 1
+
+        except Exception as e:
+            errores.append(f"Fila {index}: Error de formato ({str(e)})")
+
+    db.commit()
+    return {"status": "ok", "resultados": {"creados": creados, "actualizados": actualizados, "errores": errores}}

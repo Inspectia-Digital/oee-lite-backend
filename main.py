@@ -1,10 +1,13 @@
 from app.core.auth import verificar_token_auth0, get_usuario_actual
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import analytics, operacion, configuracion, admin, scans # Importamos las rutas
+from app.routers import analytics, operacion, configuracion, admin, scans, importaciones # Importamos las rutas
 from app.core.database import get_session, engine
 from sqlmodel import Session, select, SQLModel
 from app.models.domain import UsuarioSaaS, RolUsuario
+from app.api.plc_router import router as plc_router
+from app.api.lite_router import router as lite_router
+
 
 # Escanea tus modelos y crea las tablas que falten en Postgres
 SQLModel.metadata.create_all(engine)
@@ -99,6 +102,13 @@ app.include_router(configuracion.router)
 app.include_router(operacion.router)
 app.include_router(analytics.router)
 app.include_router(scans.router)
+app.include_router(plc_router)
+app.include_router(lite_router)
+app.include_router(importaciones.router)
+
+@app.get("/")
+def read_root():
+    return {"message": "Tymeo API is running"}
 
 # 4. Endpoints base
 @app.get("/")
