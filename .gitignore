@@ -12,10 +12,14 @@ __pycache__/
 # Variables de entorno y secretos
 .env
 .env.local
+.env.*
 
 # Bases de datos locales (si usaras SQLite, aunque usas Postgres)
 *.sqlite3
 *.db
+reset_db.py
+fix_token.py
+update_user.py
 
 # Archivos del sistema operativo (Mac/Windows)
 .DS_Store
