@@ -3,6 +3,8 @@ from datetime import datetime, time, date
 from enum import Enum
 from typing import List, Optional
 from sqlmodel import SQLModel, Field, Relationship, Index
+from sqlalchemy import Column
+from sqlalchemy import Enum as SaEnum
 
 # ==========================================
 # 1. ENUMS (Lógica de Negocio OS Shell & B2B)
@@ -64,8 +66,11 @@ class Tenant(SQLModel, table=True):
     id: str = Field(primary_key=True, description="Coincide con el tenant_id (ej: springwall)")
     nombre: str = Field(description="Nombre comercial o razón social de la empresa")
     
-    # Soporte Jerárquico OS Shell
-    tipo: TipoTenant = Field(default=TipoTenant.EMPRESA)
+    # FIX ORM: Mapeo explícito para forzar valores en minúscula hacia PostgreSQL
+    tipo: TipoTenant = Field(
+        default=TipoTenant.EMPRESA,
+        sa_column=Column(SaEnum(TipoTenant, values_callable=lambda obj: [e.value for e in obj]))
+    )
     parent_id: Optional[str] = Field(default=None, foreign_key="tenants_saas.id")
     modulos_contratados: str = Field(default="tymeo", description="Array CSV de módulos. Ej: tymeo,oee-hub,vision")
     theme_default: Optional[str] = None
@@ -73,14 +78,16 @@ class Tenant(SQLModel, table=True):
     logo_url: Optional[str] = Field(default=None, description="URL pública de la imagen del logo")
     color_primario: Optional[str] = Field(default=None, description="Color principal en formato HSL o HEX")
     locale_default: str = Field(default="es", description="Idioma por defecto de la interfaz")
-    modo_asignacion_operarios: ModoAsignacionOperarios = Field(default=ModoAsignacionOperarios.MANUAL)
+    
+    # FIX ORM: Mapeo explícito
+    modo_asignacion_operarios: ModoAsignacionOperarios = Field(
+        default=ModoAsignacionOperarios.MANUAL,
+        sa_column=Column(SaEnum(ModoAsignacionOperarios, values_callable=lambda obj: [e.value for e in obj]))
+    )
     activo: bool = Field(default=True)
 
-    # Tolerancias Dinámicas OEE (Configurables por Empresa)
     tolerancia_lento_pct: float = Field(default=1.15)
     tolerancia_alerta_pct: float = Field(default=1.25)
-
-    # Motor de Parseo Universal (Regex)
     regex_parser_orden: Optional[str] = Field(default=None)
     regex_parser_sku: Optional[str] = Field(default=None)
     origen_maestros: str = Field(default="MANUAL")
