@@ -78,9 +78,12 @@ def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
 def validar_planta(context: TenantContext):
-    """Firewall de OS Shell: Asegura que el supervisor seleccionó una planta."""
+    """Firewall de OS Shell: Si no hay planta seleccionada, aborta la consulta silenciosamente."""
     if not context.sub_tenant_id:
-        raise HTTPException(status_code=400, detail="Falta Header X-Sub-Tenant-Id. Seleccione una Planta en el menú.")
+        # Al lanzar un ValueError (y no un HTTPException), 
+        # el bloque 'try/except' general de nuestros endpoints lo atrapará 
+        # y devolverá la estructura vacía [] en lugar de un Error HTTP 400.
+        raise ValueError("Planta no seleccionada. Retornando panel vacío.")
 
 
 # ==========================================
