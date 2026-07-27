@@ -2,6 +2,7 @@ import json
 import os
 from urllib.request import urlopen
 from typing import Optional
+from functools import lru_cache
 
 from fastapi import Depends, HTTPException, status, Query, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -10,7 +11,6 @@ from jose import jwt
 from sqlmodel import Session, select
 
 from app.core.database import get_session
-# IMPORTACIÓN CORREGIDA: Añadimos Tenant
 from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 
 # ==========================================
@@ -22,15 +22,24 @@ ALGORITHMS = ["RS256"]
 
 token_auth_scheme = HTTPBearer()
 
-def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
-    """Valida la firma criptográfica del token contra Auth0."""
-    token = credentials.credentials
+@lru_cache(maxsize=1)
+def get_auth0_jwks():
+    """
+    Obtiene y CACHEA las llaves públicas de Auth0 en RAM.
+    Evita hacer requests externos por cada API call y previene baneos por Rate Limit.
+    """
     url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-    
     try:
-        jwks = json.loads(urlopen(url).read())
+        return json.loads(urlopen(url).read())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error de conexión con Auth0: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error de red al contactar Auth0 JWKS: {str(e)}")
+
+def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
+    """Valida la firma criptográfica del token contra Auth0 usando cache en RAM."""
+    token = credentials.credentials
+    
+    # Leemos desde la memoria RAM (0 milisegundos, 0 requests externos)
+    jwks = get_auth0_jwks()
 
     try:
         unverified_header = jwt.get_unverified_header(token)
@@ -85,12 +94,8 @@ def get_usuario_actual(payload: dict = Depends(verificar_token_auth0), db: Sessi
 # ==========================================
 # GOBERNANZA MULTI-TENANT (Control de Módulos)
 # ==========================================
-
 def requerir_modulo(modulo_requerido: str):
-    """
-    Dependencia de FastAPI para verificar si el Tenant actual 
-    tiene contratado y activo un módulo específico.
-    """
+    """Dependencia de FastAPI para verificar módulos contratados por el Tenant."""
     def dependencia_verificadora(
         usuario: UsuarioSaaS = Depends(get_usuario_actual),
         db: Session = Depends(get_session)
@@ -104,25 +109,22 @@ def requerir_modulo(modulo_requerido: str):
                 detail="La empresa (Tenant) no existe o se encuentra inactiva."
             )
 
-        # Parseamos el CSV de módulos (ej: "tymeo,oee-lite,vision")
         modulos_str = tenant.modulos_contratados or ""
         modulos_permitidos = [m.strip().lower() for m in modulos_str.split(",") if m.strip()]
         
         if modulo_requerido.lower() not in modulos_permitidos:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=f"Acceso denegado. El módulo '{modulo_requerido}' no está incluido en la suscripción de este Tenant."
+                detail=f"Acceso denegado. El módulo '{modulo_requerido}' no está incluido."
             )
 
         return tenant_id
-
     return dependencia_verificadora
 
 
 # ==========================================
 # CONTEXTO INSPECTIA OS (Multi-Planta & Modo Dios)
 # ==========================================
-
 class TenantContext(BaseModel):
     tenant_id: str
     sub_tenant_id: Optional[str] = None
@@ -134,13 +136,9 @@ def obtener_contexto_tenant(
     impersonate_tenant: Optional[str] = Query(None, alias="tenant_id"),
     db: Session = Depends(get_session)
 ) -> TenantContext:
-    """
-    Resuelve el tenant maestro, el modo dios (impersonación) y la planta activa del OS Shell.
-    """
     is_superadmin = (usuario.rol == RolUsuario.SUPERADMIN)
     tenant_activo = usuario.tenant_id
 
-    # 1. Impersonación (Modo Dios del OS Shell)
     if impersonate_tenant:
         if not is_superadmin:
             raise HTTPException(
@@ -149,7 +147,6 @@ def obtener_contexto_tenant(
             )
         tenant_activo = impersonate_tenant
 
-    # 2. Validación de Planta Activa (Sub-Tenant)
     if x_sub_tenant_id:
         planta = db.exec(
             select(Planta)
@@ -172,7 +169,6 @@ def obtener_tenant_aislado(
     tenant_impersonado: Optional[str] = Query(None, alias="tenant_id"),
     usuario: UsuarioSaaS = Depends(get_usuario_actual)
 ) -> str:
-    """(Legacy) Mantenido por retrocompatibilidad con endpoints viejos de Tymeo."""
     if usuario.rol == RolUsuario.SUPERADMIN and tenant_impersonado:
         return tenant_impersonado
     return usuario.tenant_id
