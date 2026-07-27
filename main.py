@@ -12,7 +12,7 @@ from app.models.domain import UsuarioSaaS, RolUsuario
 # IMPORTACIÓN DE ROUTERS
 # ==========================================
 # Routers migrados al nuevo estándar de InspectIA OS
-from app.api.routers import scans, operacion, importaciones
+from app.routers import scans, operacion, importaciones
 
 # Routers legacy que aún mantienen su ubicación original
 from app.routers import analytics, configuracion, admin, jerarquia 
