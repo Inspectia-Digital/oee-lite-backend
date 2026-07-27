@@ -60,36 +60,33 @@ class TenantBase(SQLModel):
     tenant_id: str = Field(index=True, description="ID del cliente/tenant")
 
 class Tenant(SQLModel, table=True):
-    """Tabla maestra para la configuración y branding de cada empresa cliente"""
     __tablename__ = "tenants_saas"
     
-    id: str = Field(primary_key=True, description="Coincide con el tenant_id (ej: springwall)")
-    nombre: str = Field(description="Nombre comercial o razón social de la empresa")
+    id: str = Field(primary_key=True)
+    nombre: str = Field(description="Nombre comercial")
     
-    # FIX ORM: Mapeo explícito para forzar valores en minúscula hacia PostgreSQL
+    # 🟢 Forzamos a SQLAlchemy a enviar "empresa" en minúsculas a Postgres
     tipo: TipoTenant = Field(
         default=TipoTenant.EMPRESA,
         sa_column=Column(SaEnum(TipoTenant, values_callable=lambda obj: [e.value for e in obj]))
     )
     parent_id: Optional[str] = Field(default=None, foreign_key="tenants_saas.id")
-    modulos_contratados: str = Field(default="tymeo", description="Array CSV de módulos. Ej: tymeo,oee-hub,vision")
+    modulos_contratados: str = Field(default="tymeo")
     theme_default: Optional[str] = None
+    logo_url: Optional[str] = None
+    color_primario: Optional[str] = None
+    locale_default: str = Field(default="es")
     
-    logo_url: Optional[str] = Field(default=None, description="URL pública de la imagen del logo")
-    color_primario: Optional[str] = Field(default=None, description="Color principal en formato HSL o HEX")
-    locale_default: str = Field(default="es", description="Idioma por defecto de la interfaz")
-    
-    # FIX ORM: Mapeo explícito
+    # 🟢 Mismo fix para la asignación
     modo_asignacion_operarios: ModoAsignacionOperarios = Field(
         default=ModoAsignacionOperarios.MANUAL,
         sa_column=Column(SaEnum(ModoAsignacionOperarios, values_callable=lambda obj: [e.value for e in obj]))
     )
     activo: bool = Field(default=True)
-
     tolerancia_lento_pct: float = Field(default=1.15)
     tolerancia_alerta_pct: float = Field(default=1.25)
-    regex_parser_orden: Optional[str] = Field(default=None)
-    regex_parser_sku: Optional[str] = Field(default=None)
+    regex_parser_orden: Optional[str] = None
+    regex_parser_sku: Optional[str] = None
     origen_maestros: str = Field(default="MANUAL")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 

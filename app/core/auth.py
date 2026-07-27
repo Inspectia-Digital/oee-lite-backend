@@ -4,7 +4,7 @@ import logging
 from urllib.request import urlopen
 from typing import Optional
 from functools import lru_cache
-
+import uuid
 from fastapi import Depends, HTTPException, status, Query, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -144,7 +144,6 @@ class TenantContext(BaseModel):
     sub_tenant_id: Optional[str] = None
     is_superadmin: bool = False
 
-import uuid
 
 def obtener_contexto_tenant(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
@@ -152,7 +151,6 @@ def obtener_contexto_tenant(
     impersonate_tenant: Optional[str] = Query(None, alias="tenant_id"),
     db: Session = Depends(get_session)
 ) -> TenantContext:
-    """Resuelve el tenant maestro, el modo dios (impersonación) y la planta activa del OS Shell."""
     is_superadmin = (usuario.rol == RolUsuario.SUPERADMIN)
     tenant_activo = usuario.tenant_id
 
@@ -160,28 +158,28 @@ def obtener_contexto_tenant(
         if not is_superadmin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, 
-                detail="Solo SuperAdmin puede usar el Modo Dios (?tenant_id=...)"
+                detail="Solo SuperAdmin puede usar el Modo Dios"
             )
         tenant_activo = impersonate_tenant
 
     if x_sub_tenant_id:
         try:
-            # 1. Intentamos parsearlo como un UUID válido (Comportamiento ideal)
+            # 1. Intentamos leerlo como UUID real (Producción)
             valid_uuid = uuid.UUID(x_sub_tenant_id)
             planta = db.exec(
                 select(Planta).where(Planta.id == valid_uuid, Planta.tenant_id == tenant_activo)
             ).first()
         except ValueError:
-            # 2. Resiliencia: Si el Frontend envió un Slug/Nombre (ej: "pilar"), buscamos por nombre
+            # 2. Si el front manda basura o un mock (ej: "pilar"), buscamos por nombre sin crashear
             planta = db.exec(
                 select(Planta).where(Planta.nombre.ilike(f"%{x_sub_tenant_id}%"), Planta.tenant_id == tenant_activo)
             ).first()
         
         if not planta:
-            # En vez de romper la UI con 403, reseteamos a vista global si mandan basura
+            # Si no existe la planta mock, limpiamos el header para que cargue la vista global
             x_sub_tenant_id = None
         else:
-            x_sub_tenant_id = str(planta.id) # Unificamos siempre a UUID real para el resto del código
+            x_sub_tenant_id = str(planta.id)
 
     return TenantContext(
         tenant_id=tenant_activo,
