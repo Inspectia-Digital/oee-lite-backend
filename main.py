@@ -17,6 +17,8 @@ from app.routers import scans, operacion, importaciones
 # Routers legacy que aún mantienen su ubicación original
 from app.routers import analytics, configuracion, admin, jerarquia 
 
+from app.api import plantas 
+
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
 # ==========================================
