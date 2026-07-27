@@ -15,9 +15,8 @@ from app.models.domain import UsuarioSaaS, RolUsuario
 from app.routers import scans, operacion, importaciones
 
 # Routers legacy que aún mantienen su ubicación original
-from app.routers import analytics, configuracion, admin, jerarquia 
+from app.routers import analytics, configuracion, admin, jerarquia, plantas
 
-from app.api import plantas 
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -81,6 +80,7 @@ app.include_router(admin.router)
 app.include_router(configuracion.router)
 app.include_router(analytics.router)
 app.include_router(jerarquia.router)
+app.include_router(plantas.router)
 
 
 # ==========================================
