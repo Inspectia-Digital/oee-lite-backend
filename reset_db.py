@@ -1,18 +1,22 @@
-from sqlalchemy import text
-from app.core.database import engine
+import os
+from sqlalchemy import create_engine, text
 
-def purgar_postgres():
-    print("Iniciando purga de PostgreSQL...")
-    try:
-        # isolation_level="AUTOCOMMIT" es vital para borrar esquemas enteros
-        with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-            conn.execute(text("DROP SCHEMA public CASCADE;"))
-            conn.execute(text("CREATE SCHEMA public;"))
-            conn.execute(text("GRANT ALL ON SCHEMA public TO public;"))
-            print("✅ ¡Éxito! Esquema 'public' borrado y recreado.")
-            print("Tu base de datos está completamente limpia.")
-    except Exception as e:
-        print(f"❌ Error al purgar: {e}")
+# Lee la variable de entorno que ya seteamos en la consola
+db_url = os.environ.get("DATABASE_URL")
 
-if __name__ == "__main__":
-    purgar_postgres()
+if not db_url:
+    print("❌ ERROR: No se encontró la variable DATABASE_URL.")
+    exit(1)
+
+print(f"🔌 Conectando a {db_url.split('@')[1]}...")
+engine = create_engine(db_url)
+
+with engine.connect() as conn:
+    print("🧹 Limpiando esquema public...")
+    # Esto borra todas las tablas, relaciones y ENUMs de un plumazo
+    conn.execute(text("DROP SCHEMA public CASCADE;"))
+    conn.execute(text("CREATE SCHEMA public;"))
+    conn.execute(text("GRANT ALL ON SCHEMA public TO public;"))
+    conn.commit()
+
+print("✅ Base de datos de Dev reiniciada. ¡Lista para Alembic!")

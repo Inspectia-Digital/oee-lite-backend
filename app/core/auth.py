@@ -10,7 +10,8 @@ from jose import jwt
 from sqlmodel import Session, select
 
 from app.core.database import get_session
-from app.models.domain import UsuarioSaaS, RolUsuario, Planta
+# IMPORTACIÓN CORREGIDA: Añadimos Tenant
+from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 
 # ==========================================
 # CONFIGURACIÓN DE AUTH0
@@ -79,6 +80,43 @@ def get_usuario_actual(payload: dict = Depends(verificar_token_auth0), db: Sessi
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo.")
         
     return usuario_db
+
+
+# ==========================================
+# GOBERNANZA MULTI-TENANT (Control de Módulos)
+# ==========================================
+
+def requerir_modulo(modulo_requerido: str):
+    """
+    Dependencia de FastAPI para verificar si el Tenant actual 
+    tiene contratado y activo un módulo específico.
+    """
+    def dependencia_verificadora(
+        usuario: UsuarioSaaS = Depends(get_usuario_actual),
+        db: Session = Depends(get_session)
+    ) -> str:
+        tenant_id = usuario.tenant_id
+        tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+        
+        if not tenant or not tenant.activo:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="La empresa (Tenant) no existe o se encuentra inactiva."
+            )
+
+        # Parseamos el CSV de módulos (ej: "tymeo,oee-lite,vision")
+        modulos_str = tenant.modulos_contratados or ""
+        modulos_permitidos = [m.strip().lower() for m in modulos_str.split(",") if m.strip()]
+        
+        if modulo_requerido.lower() not in modulos_permitidos:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Acceso denegado. El módulo '{modulo_requerido}' no está incluido en la suscripción de este Tenant."
+            )
+
+        return tenant_id
+
+    return dependencia_verificadora
 
 
 # ==========================================
