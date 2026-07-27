@@ -1,5 +1,6 @@
 import json
 import os
+import logging
 from urllib.request import urlopen
 from typing import Optional
 from functools import lru_cache
@@ -13,14 +14,26 @@ from sqlmodel import Session, select
 from app.core.database import get_session
 from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 
+# Habilitamos el logger para evitar que los errores queden invisibles en Cloud Run
+logger = logging.getLogger(__name__)
+
 # ==========================================
-# CONFIGURACIÓN DE AUTH0 (Sanitizada)
+# CONFIGURACIÓN DE AUTH0 (Bulletproof)
 # ==========================================
-_raw_domain = os.getenv("AUTH0_DOMAIN", "dev-bzem6wpwmlr14eha.us.auth0.com").strip()
-# Limpiamos el protocolo y las barras finales por si se inyectaron mal en GCP
+# 1. Leemos la variable. Si no existe o GCP inyectó un string vacío, el strip() la deja limpia.
+_raw_domain = os.getenv("AUTH0_DOMAIN", "").strip()
+
+# 2. Si vino vacía desde GCP, forzamos el hardcode de forma segura
+if not _raw_domain:
+    _raw_domain = "dev-bzem6wpwmlr14eha.us.auth0.com"
+
+# 3. Limpiamos cualquier protocolo mal inyectado (Soporta errores de configuración manual en .env)
 AUTH0_DOMAIN = _raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
 
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://api.tymeo.com")
+# Hacemos lo mismo con el Audience
+_raw_audience = os.getenv("AUTH0_AUDIENCE", "").strip()
+AUTH0_AUDIENCE = _raw_audience if _raw_audience else "https://api.tymeo.com"
+
 ALGORITHMS = ["RS256"]
 
 token_auth_scheme = HTTPBearer()
@@ -32,7 +45,10 @@ def get_auth0_jwks():
     try:
         return json.loads(urlopen(url).read())
     except Exception as e:
+        # Forzamos el log explícito en GCP antes de lanzar la excepción web
+        logger.error(f"Falla crítica contactando Auth0 en {url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error de red al contactar Auth0 JWKS en {url}: {str(e)}")
+
 
 def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
     """Valida la firma criptográfica del token contra Auth0 usando cache en RAM."""
@@ -134,9 +150,11 @@ def obtener_contexto_tenant(
     impersonate_tenant: Optional[str] = Query(None, alias="tenant_id"),
     db: Session = Depends(get_session)
 ) -> TenantContext:
+    """Resuelve el tenant maestro, el modo dios (impersonación) y la planta activa del OS Shell."""
     is_superadmin = (usuario.rol == RolUsuario.SUPERADMIN)
     tenant_activo = usuario.tenant_id
 
+    # 1. Impersonación (Modo Dios del OS Shell)
     if impersonate_tenant:
         if not is_superadmin:
             raise HTTPException(
@@ -145,6 +163,7 @@ def obtener_contexto_tenant(
             )
         tenant_activo = impersonate_tenant
 
+    # 2. Validación de Planta Activa (Sub-Tenant)
     if x_sub_tenant_id:
         planta = db.exec(
             select(Planta)
@@ -167,6 +186,7 @@ def obtener_tenant_aislado(
     tenant_impersonado: Optional[str] = Query(None, alias="tenant_id"),
     usuario: UsuarioSaaS = Depends(get_usuario_actual)
 ) -> str:
+    """(Legacy) Mantenido por retrocompatibilidad con endpoints viejos de Tymeo."""
     if usuario.rol == RolUsuario.SUPERADMIN and tenant_impersonado:
         return tenant_impersonado
     return usuario.tenant_id
