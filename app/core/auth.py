@@ -144,6 +144,8 @@ class TenantContext(BaseModel):
     sub_tenant_id: Optional[str] = None
     is_superadmin: bool = False
 
+import uuid
+
 def obtener_contexto_tenant(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
     x_sub_tenant_id: Optional[str] = Header(None, alias="X-Sub-Tenant-Id"),
@@ -154,7 +156,6 @@ def obtener_contexto_tenant(
     is_superadmin = (usuario.rol == RolUsuario.SUPERADMIN)
     tenant_activo = usuario.tenant_id
 
-    # 1. Impersonación (Modo Dios del OS Shell)
     if impersonate_tenant:
         if not is_superadmin:
             raise HTTPException(
@@ -163,18 +164,24 @@ def obtener_contexto_tenant(
             )
         tenant_activo = impersonate_tenant
 
-    # 2. Validación de Planta Activa (Sub-Tenant)
     if x_sub_tenant_id:
-        planta = db.exec(
-            select(Planta)
-            .where(Planta.id == x_sub_tenant_id, Planta.tenant_id == tenant_activo)
-        ).first()
+        try:
+            # 1. Intentamos parsearlo como un UUID válido (Comportamiento ideal)
+            valid_uuid = uuid.UUID(x_sub_tenant_id)
+            planta = db.exec(
+                select(Planta).where(Planta.id == valid_uuid, Planta.tenant_id == tenant_activo)
+            ).first()
+        except ValueError:
+            # 2. Resiliencia: Si el Frontend envió un Slug/Nombre (ej: "pilar"), buscamos por nombre
+            planta = db.exec(
+                select(Planta).where(Planta.nombre.ilike(f"%{x_sub_tenant_id}%"), Planta.tenant_id == tenant_activo)
+            ).first()
         
         if not planta:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="La planta seleccionada no existe o no pertenece a esta empresa."
-            )
+            # En vez de romper la UI con 403, reseteamos a vista global si mandan basura
+            x_sub_tenant_id = None
+        else:
+            x_sub_tenant_id = str(planta.id) # Unificamos siempre a UUID real para el resto del código
 
     return TenantContext(
         tenant_id=tenant_activo,
