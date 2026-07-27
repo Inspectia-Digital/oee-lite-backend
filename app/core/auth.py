@@ -14,9 +14,12 @@ from app.core.database import get_session
 from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 
 # ==========================================
-# CONFIGURACIÓN DE AUTH0
+# CONFIGURACIÓN DE AUTH0 (Sanitizada)
 # ==========================================
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "dev-bzem6wpwmlr14eha.us.auth0.com") 
+_raw_domain = os.getenv("AUTH0_DOMAIN", "dev-bzem6wpwmlr14eha.us.auth0.com").strip()
+# Limpiamos el protocolo y las barras finales por si se inyectaron mal en GCP
+AUTH0_DOMAIN = _raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
+
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://api.tymeo.com")
 ALGORITHMS = ["RS256"]
 
@@ -24,21 +27,16 @@ token_auth_scheme = HTTPBearer()
 
 @lru_cache(maxsize=1)
 def get_auth0_jwks():
-    """
-    Obtiene y CACHEA las llaves públicas de Auth0 en RAM.
-    Evita hacer requests externos por cada API call y previene baneos por Rate Limit.
-    """
+    """Obtiene y CACHEA las llaves públicas de Auth0 en RAM."""
     url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
     try:
         return json.loads(urlopen(url).read())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error de red al contactar Auth0 JWKS: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error de red al contactar Auth0 JWKS en {url}: {str(e)}")
 
 def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
     """Valida la firma criptográfica del token contra Auth0 usando cache en RAM."""
     token = credentials.credentials
-    
-    # Leemos desde la memoria RAM (0 milisegundos, 0 requests externos)
     jwks = get_auth0_jwks()
 
     try:
