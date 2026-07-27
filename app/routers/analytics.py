@@ -1,21 +1,23 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlmodel import Session, select
-from sqlalchemy import func, case
 from datetime import datetime, time, date, timedelta
 from typing import List, Optional
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_tenant_aislado
+from app.core.auth import obtener_contexto_tenant, TenantContext
 from app.models.domain import (
-    Estacion, EventoEscaneo, ParadaDetectada, 
-    MotivoParada, Operario, Turno, Linea, TipoParada, UsuarioSaaS
+    Estacion, LiteEventoProduccion, ParadaDetectada, 
+    MotivoParada, Operario, Turno, Linea, TipoParada
 )
 from pydantic import BaseModel
 
 router = APIRouter(tags=["Analytics"])
 
+# ==========================================
 # --- MOLDES (Schemas) ---
+# Se mantienen idénticos para no romper el Frontend[cite: 1]
+# ==========================================
 class MetricasEstacion(BaseModel):
     estacion_nombre: str
     total_piezas: int
@@ -66,31 +68,42 @@ class TendenciaOEERow(BaseModel):
     rend: float
     cal: float
 
-# --- HELPER FUNCIÓN ---
-def obtener_rango_dia(fecha_busqueda: date = None):
+# ==========================================
+# --- HELPER FUNCTIONS ---
+# ==========================================
+def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
     f = fecha_busqueda or datetime.now().date()
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
+def validar_planta(context: TenantContext):
+    """Firewall de OS Shell: Asegura que el supervisor seleccionó una planta."""
+    if not context.sub_tenant_id:
+        raise HTTPException(status_code=400, detail="Falta Header X-Sub-Tenant-Id. Seleccione una Planta en el menú.")
+
 
 # ==========================================
-# ENDPOINTS BLINDADOS (MULTI-TENANT)
+# ENDPOINTS BLINDADOS (MULTI-TENANT & MULTI-PLANTA)
 # ==========================================
 
 @router.get("/reportes/dashboard", response_model=list[MetricasEstacion])
 def obtener_dashboard_estaciones(
     skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio_dia, fin_dia = obtener_rango_dia()
     
+    # 🔒 JOIN con Linea para aislar por Planta (sub_tenant_id)
     resultados = db.exec(
-        select(EventoEscaneo, Estacion)
-        .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
+        select(LiteEventoProduccion, Estacion)
+        .join(Estacion, LiteEventoProduccion.id_estacion == Estacion.id) # Type cast implícito en Postgres
+        .join(Linea, Estacion.linea_id == Linea.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id,
-            EventoEscaneo.timestamp >= inicio_dia,
-            EventoEscaneo.timestamp <= fin_dia
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio_dia,
+            LiteEventoProduccion.timestamp <= fin_dia
         )
         .offset(skip)
         .limit(limit)
@@ -106,17 +119,22 @@ def obtener_dashboard_estaciones(
             }
         
         m = data_agrupada[estacion.nombre]
-        m["total"] += 1
         
-        if evento.desempeno == "OPTIMO": m["optimo"] += 1
-        elif evento.desempeno == "LENTO": m["lento"] += 1
-        elif evento.desempeno == "ALERTA": m["alerta"] += 1
+        # 🟢 IMPACTO GREEN MILLS: Sumamos lotes, no filas individuales
+        unidades = evento.unidades_procesadas
+        m["total"] += unidades
         
-        if evento.es_retrabajo:
-            m["retrabajo"] += 1
+        # Clasificamos las unidades producidas según el estado del ciclo
+        if evento.estado == "OPTIMO": m["optimo"] += unidades
+        elif evento.estado == "LENTO": m["lento"] += unidades
+        elif evento.estado == "ALERTA": m["alerta"] += unidades
+        
+        # Si la UI espera retrabajos, lo mapeamos si tuviéramos un estado RETRABAJO
+        if evento.estado == "RETRABAJO":
+            m["retrabajo"] += unidades
             
-        if evento.segundos_proceso and evento.segundos_proceso > 0:
-            m["suma_tiempos"] += evento.segundos_proceso
+        if evento.delta_t_segundos and evento.delta_t_segundos > 0:
+            m["suma_tiempos"] += evento.delta_t_segundos
             m["eventos_con_tiempo"] += 1
 
     reporte_final = []
@@ -142,15 +160,23 @@ def obtener_oee_general(
     fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio, fin = obtener_rango_dia(fecha_desde)
     
-    query = select(EventoEscaneo, Estacion).join(Estacion, EventoEscaneo.estacion_fk == Estacion.id).where(
-        EventoEscaneo.tenant_id == tenant_id,
-        EventoEscaneo.timestamp >= inicio,
-        EventoEscaneo.timestamp <= fin
+    query = (
+        select(LiteEventoProduccion, Estacion, Linea)
+        .join(Estacion, LiteEventoProduccion.id_estacion == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .where(
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio,
+            LiteEventoProduccion.timestamp <= fin
+        )
     )
+    if linea_id: query = query.where(Linea.id == linea_id)
     eventos = db.exec(query).all()
 
     if not eventos:
@@ -159,10 +185,16 @@ def obtener_oee_general(
             total_unidades=0, unidades_con_retrabajo=0, minutos_desvio_calidad=0.0
         )
 
-    total_unidades = len(eventos)
+    # 🟢 IMPACTO GREEN MILLS: Total real producido
+    total_unidades = sum(e.unidades_procesadas for e, _, _ in eventos)
+    
     dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
     
-    q_turnos = select(Turno).where(Turno.tenant_id == tenant_id)
+    # 🔒 PLANIFICACIÓN
+    q_turnos = select(Turno).join(Linea, Turno.linea_id == Linea.id).where(
+        Turno.tenant_id == context.tenant_id,
+        Linea.planta_id == context.sub_tenant_id
+    )
     if linea_id: q_turnos = q_turnos.where(Turno.linea_id == linea_id)
     if turno_id: q_turnos = q_turnos.where(Turno.id == turno_id)
     turnos = db.exec(q_turnos).all()
@@ -178,12 +210,20 @@ def obtener_oee_general(
         tiempo_planificado_seg += (duracion_neta_seg * dias_consulta)
         
     if tiempo_planificado_seg == 0:
-        tiempo_planificado_seg = 28800 * dias_consulta
+        tiempo_planificado_seg = 28800 * dias_consulta # Default 8hs
 
-    q_paradas = select(ParadaDetectada, MotivoParada).outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id).join(Estacion, ParadaDetectada.estacion_fk == Estacion.id).where(
-        ParadaDetectada.tenant_id == tenant_id,
-        ParadaDetectada.inicio >= inicio, 
-        ParadaDetectada.inicio <= fin
+    # 🔒 PARADAS
+    q_paradas = (
+        select(ParadaDetectada, MotivoParada)
+        .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
+        .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .where(
+            ParadaDetectada.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            ParadaDetectada.inicio >= inicio, 
+            ParadaDetectada.inicio <= fin
+        )
     )
     if linea_id: q_paradas = q_paradas.where(Estacion.linea_id == linea_id)
     paradas_db = db.exec(q_paradas).all()
@@ -200,17 +240,20 @@ def obtener_oee_general(
                 
     tiempo_planificado_neto = max(1, tiempo_planificado_seg - t_paradas_planificadas)
     tiempo_operativo_seg = max(1, tiempo_planificado_neto - t_paradas_no_planificadas)
+    
     disponibilidad = min(tiempo_operativo_seg / tiempo_planificado_neto, 1.0)
 
-    t_ideal_total = sum(est.umbral_optimo for _, est in eventos)
+    # 🟢 RENDIMIENTO: Basado en el número de CICLOS físicos (eventos), no en las unidades[cite: 1]
+    t_ideal_total = sum(est.umbral_optimo for _, est, _ in eventos)
     rendimiento = min((t_ideal_total / tiempo_operativo_seg) if tiempo_operativo_seg > 0 else 0.0, 1.0)
 
-    eventos_calidad = [(e, est) for e, est in eventos if est.tipo.lower() == "calidad"]
-    retrabajos = sum(1 for e, _ in eventos_calidad if e.es_retrabajo)
+    # 🟢 CALIDAD: Filtramos estaciones de calidad
+    eventos_calidad = [(e, est) for e, est, _ in eventos if est.tipo.lower() == "calidad"]
+    retrabajos = sum(e.unidades_procesadas for e, _ in eventos_calidad if e.estado == "RETRABAJO")
     
     if len(eventos_calidad) > 0:
         t_ideal_calidad = sum(est.umbral_optimo for _, est in eventos_calidad)
-        t_real_calidad = sum((e.segundos_proceso or 0) for e, _ in eventos_calidad)
+        t_real_calidad = sum((e.delta_t_segundos or 0) for e, _ in eventos_calidad)
         calidad = min((t_ideal_calidad / t_real_calidad) if t_real_calidad > 0 else 1.0, 1.0)
         minutos_desvio = max(0, t_real_calidad - t_ideal_calidad) / 60
     else:
@@ -232,18 +275,22 @@ def obtener_oee_general(
 def obtener_reporte_springwall(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
+    # CTO Note: Asume que se agregó operario_fk a LiteEventoProduccion según recomendación anterior.
     eventos = db.exec(
-        select(EventoEscaneo, Estacion, Operario)
-        .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
-        .outerjoin(Operario, EventoEscaneo.operario_fk == Operario.id)
+        select(LiteEventoProduccion, Estacion, Operario)
+        .join(Estacion, LiteEventoProduccion.id_estacion == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .outerjoin(Operario, LiteEventoProduccion.operario_fk == Operario.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id,
-            EventoEscaneo.timestamp >= inicio_dia,
-            EventoEscaneo.timestamp <= fin_dia
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio_dia,
+            LiteEventoProduccion.timestamp <= fin_dia
         )
         .offset(skip)
         .limit(limit)
@@ -261,9 +308,10 @@ def obtener_reporte_springwall(
             }
             
         grupo = data_agrupada[clave]
-        grupo["cantidad_real"] += 1
-        if evento.segundos_proceso and evento.segundos_proceso > 0:
-            grupo["tiempo_invertido"] += evento.segundos_proceso
+        grupo["cantidad_real"] += evento.unidades_procesadas # 🟢 Multiplicador de lotes
+        
+        if evento.delta_t_segundos and evento.delta_t_segundos > 0:
+            grupo["tiempo_invertido"] += evento.delta_t_segundos
 
     reporte_final = []
     for (nombre_op, nombre_est), metricas in data_agrupada.items():
@@ -292,15 +340,19 @@ def obtener_reporte_springwall(
 def obtener_pareto_paradas(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
     paradas = db.exec(
         select(ParadaDetectada, MotivoParada)
+        .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
         .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
         .where(
-            ParadaDetectada.tenant_id == tenant_id,
+            ParadaDetectada.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id, # 🔒 Firewall Planta
             ParadaDetectada.inicio >= inicio_dia,
             ParadaDetectada.inicio <= fin_dia
         )
@@ -335,18 +387,21 @@ def obtener_pareto_paradas(
 def obtener_cuellos_botella(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio_dia, fin_dia = obtener_rango_dia(fecha)
         
     eventos = db.exec(
-        select(EventoEscaneo, Estacion)
-        .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
+        select(LiteEventoProduccion, Estacion)
+        .join(Estacion, LiteEventoProduccion.id_estacion == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id,
-            EventoEscaneo.timestamp >= inicio_dia,
-            EventoEscaneo.timestamp <= fin_dia,
-            EventoEscaneo.segundos_proceso > 0 
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio_dia,
+            LiteEventoProduccion.timestamp <= fin_dia,
+            LiteEventoProduccion.delta_t_segundos > 0 
         )
         .offset(skip)
         .limit(limit)
@@ -357,7 +412,7 @@ def obtener_cuellos_botella(
         if estacion.nombre not in agrupado:
             agrupado[estacion.nombre] = {"esperado": estacion.umbral_optimo, "suma_real": 0, "cantidad": 0}
             
-        agrupado[estacion.nombre]["suma_real"] += evento.segundos_proceso
+        agrupado[estacion.nombre]["suma_real"] += evento.delta_t_segundos
         agrupado[estacion.nombre]["cantidad"] += 1
 
     res = []
@@ -372,8 +427,10 @@ def obtener_cuellos_botella(
 def tendencia_oee_diaria(
     linea_id: Optional[uuid.UUID] = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
+    # Mock data original mantenido para UI
     hoy = datetime.now().date()
     datos = []
     for i in range(5, -1, -1):
@@ -390,16 +447,20 @@ def tendencia_oee_diaria(
 def obtener_alertas_vivas(
     skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado)
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
+    validar_planta(context)
     inicio_dia, fin_dia = obtener_rango_dia()
     alertas = []
 
+    # 1. Paradas Pendientes
     paradas_huerfanas = db.exec(
         select(ParadaDetectada, Estacion)
         .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
         .where(
-            ParadaDetectada.tenant_id == tenant_id,
+            ParadaDetectada.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
             ParadaDetectada.estado == "pendiente",
             ParadaDetectada.inicio >= inicio_dia,
             ParadaDetectada.inicio <= fin_dia
@@ -414,26 +475,29 @@ def obtener_alertas_vivas(
             tipo="PARADA_PENDIENTE", mensaje=f"Máquina detenida durante {round(parada.duracion_segundos/60, 1)} min. Requiere clasificación."
         ))
 
+    # 2. Eventos Críticos (Lentitud Extrema o Retrabajo)
     eventos_criticos = db.exec(
-        select(EventoEscaneo, Estacion)
-        .join(Estacion, EventoEscaneo.estacion_fk == Estacion.id)
+        select(LiteEventoProduccion, Estacion)
+        .join(Estacion, LiteEventoProduccion.id_estacion == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
         .where(
-            EventoEscaneo.tenant_id == tenant_id,
-            EventoEscaneo.timestamp >= inicio_dia,
-            EventoEscaneo.timestamp <= fin_dia,
-            (EventoEscaneo.desempeno == "ALERTA") | (EventoEscaneo.es_retrabajo == True)
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio_dia,
+            LiteEventoProduccion.timestamp <= fin_dia,
+            (LiteEventoProduccion.estado == "ALERTA") | (LiteEventoProduccion.estado == "RETRABAJO")
         )
         .offset(skip)
         .limit(limit)
     ).all()
 
     for evento, estacion in eventos_criticos:
-        if evento.es_retrabajo:
+        if evento.estado == "RETRABAJO":
             tipo = "RETRABAJO"
-            msg = f"Colchón OP-{evento.orden_fk} marcado como defecto de calidad."
+            msg = f"Orden OP-{evento.orden_fk or 'N/A'} marcada como defecto de calidad."
         else:
             tipo = "LENTITUD_EXTREMA"
-            msg = f"Colchón OP-{evento.orden_fk} superó el umbral de alerta ({evento.segundos_proceso} seg)."
+            msg = f"Orden OP-{evento.orden_fk or 'N/A'} superó el umbral de alerta ({round(evento.delta_t_segundos or 0, 1)} seg)."
             
         alertas.append(AlertaActiva(
             hora=evento.timestamp.strftime("%H:%M:%S"), estacion=estacion.nombre,

@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: 'read'
-      id-token: 'write'
+      id-token: 'write' # Requerido para Workload Identity Federation
 
     steps:
       - name: Checkout code
@@ -50,5 +50,10 @@ jobs:
             --project $PROJECT_ID \
             --add-cloudsql-instances $DB_INSTANCE \
             --set-secrets="DATABASE_URL=DEV_DATABASE_URL:latest" \
+            --set-env-vars="AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}" \
             --allow-unauthenticated \
+            --min-instances 0 \
+            --max-instances 5 \
+            --cpu 1 \
+            --memory 512Mi \
             --port 8080

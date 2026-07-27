@@ -3,13 +3,14 @@ import os
 from urllib.request import urlopen
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status, Query
+from fastapi import Depends, HTTPException, status, Query, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from jose import jwt
 from sqlmodel import Session, select
 
 from app.core.database import get_session
-from app.models.domain import UsuarioSaaS, RolUsuario
+from app.models.domain import UsuarioSaaS, RolUsuario, Planta
 
 # ==========================================
 # CONFIGURACIÓN DE AUTH0
@@ -55,7 +56,7 @@ def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(to
                 audience=AUTH0_AUDIENCE, 
                 issuer=f"https://{AUTH0_DOMAIN}/"
             )
-            return payload # Retorna los datos crudos del token
+            return payload
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
             
@@ -63,19 +64,15 @@ def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(to
 
 
 def get_usuario_actual(payload: dict = Depends(verificar_token_auth0), db: Session = Depends(get_session)) -> UsuarioSaaS:
-    """
-    Busca al usuario autenticado en nuestra base de datos para saber su 'tenant_id' y sus permisos.
-    """
+    """Busca al usuario autenticado en nuestra base de datos para saber su 'tenant_id' y sus permisos."""
     auth0_sub = payload.get("sub")
     
-    # Buscamos en nuestra tabla si este usuario está registrado en TYMEO
     usuario_db = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_sub)).first()
     
     if not usuario_db:
-        # Si entra alguien que Auth0 reconoce pero nosotros no, le prohibimos el acceso
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Usuario autenticado, pero no tiene una empresa asignada en TYMEO."
+            detail="Usuario autenticado, pero no tiene una empresa asignada en InspectIA OS."
         )
         
     if not usuario_db.activo:
@@ -85,24 +82,59 @@ def get_usuario_actual(payload: dict = Depends(verificar_token_auth0), db: Sessi
 
 
 # ==========================================
-# AISLAMIENTO Y "MODO DIOS" (IMPERSONATION)
+# CONTEXTO INSPECTIA OS (Multi-Planta & Modo Dios)
 # ==========================================
 
+class TenantContext(BaseModel):
+    tenant_id: str
+    sub_tenant_id: Optional[str] = None
+    is_superadmin: bool = False
+
+def obtener_contexto_tenant(
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+    x_sub_tenant_id: Optional[str] = Header(None, alias="X-Sub-Tenant-Id"),
+    impersonate_tenant: Optional[str] = Query(None, alias="tenant_id"),
+    db: Session = Depends(get_session)
+) -> TenantContext:
+    """
+    Resuelve el tenant maestro, el modo dios (impersonación) y la planta activa del OS Shell.
+    """
+    is_superadmin = (usuario.rol == RolUsuario.SUPERADMIN)
+    tenant_activo = usuario.tenant_id
+
+    # 1. Impersonación (Modo Dios del OS Shell)
+    if impersonate_tenant:
+        if not is_superadmin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Solo SuperAdmin puede usar el Modo Dios (?tenant_id=...)"
+            )
+        tenant_activo = impersonate_tenant
+
+    # 2. Validación de Planta Activa (Sub-Tenant)
+    if x_sub_tenant_id:
+        planta = db.exec(
+            select(Planta)
+            .where(Planta.id == x_sub_tenant_id, Planta.tenant_id == tenant_activo)
+        ).first()
+        
+        if not planta:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="La planta seleccionada no existe o no pertenece a esta empresa."
+            )
+
+    return TenantContext(
+        tenant_id=tenant_activo,
+        sub_tenant_id=x_sub_tenant_id,
+        is_superadmin=is_superadmin
+    )
+
 def obtener_tenant_aislado(
-    tenant_impersonado: Optional[str] = Query(
-        None, 
-        alias="tenant_id", 
-        description="Solo SuperAdmin: Permite ver los datos de otra empresa"
-    ),
+    tenant_impersonado: Optional[str] = Query(None, alias="tenant_id"),
     usuario: UsuarioSaaS = Depends(get_usuario_actual)
 ) -> str:
-    """
-    Resuelve el tenant_id garantizando el aislamiento estricto de datos B2B.
-    Si un SuperAdmin envía ?tenant_id=X en la URL, el sistema adopta esa identidad para soporte.
-    Para el resto de los mortales, ignora cualquier parámetro y fuerza el tenant real del usuario.
-    """
+    """(Legacy) Mantenido por retrocompatibilidad con endpoints viejos de Tymeo."""
     if usuario.rol == RolUsuario.SUPERADMIN and tenant_impersonado:
         return tenant_impersonado
-        
-    # Candado irrompible: forzamos el tenant_id real del usuario
     return usuario.tenant_id

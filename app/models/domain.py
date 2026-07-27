@@ -5,7 +5,7 @@ from typing import List, Optional
 from sqlmodel import SQLModel, Field, Relationship, Index
 
 # ==========================================
-# 1. ENUMS (Lógica de Negocio B2B)
+# 1. ENUMS (Lógica de Negocio OS Shell & B2B)
 # ==========================================
 class TipoParada(str, Enum):
     PLANIFICADA = "planificada"
@@ -33,8 +33,22 @@ class CategoriaParada(str, Enum):
     MICRO_MAYOR = "micro_parada_mayor"
 
 class TipoProduccion(str, Enum):
-    DISCRETA = "discreta"      # Springwall: 1 ping = 1 unidad. Trazabilidad explícita.
-    POR_LOTES = "por_lotes"    # New Garden: 1 ping = X unidades. Trazabilidad por estado.
+    DISCRETA = "discreta"      # Springwall: 1 ping = 1 unidad.
+    POR_LOTES = "por_lotes"    # Green Mills: 1 ping = X unidades.
+
+# Nuevos Enums obligatorios por OS Shell
+class TipoTenant(str, Enum):
+    EMPRESA = "empresa"
+    PLANTA = "planta"
+
+class ModoAsignacionOperarios(str, Enum):
+    MANUAL = "manual"
+    ESCANEO = "escaneo"
+
+class ModoAsignacionOperariosEstacion(str, Enum):
+    HEREDAR = "heredar"
+    MANUAL = "manual"
+    ESCANEO = "escaneo"
 
 # ==========================================
 # 2. MIXIN B2B MULTI-TENANT
@@ -49,35 +63,28 @@ class Tenant(SQLModel, table=True):
     
     id: str = Field(primary_key=True, description="Coincide con el tenant_id (ej: springwall)")
     nombre: str = Field(description="Nombre comercial o razón social de la empresa")
+    
+    # Soporte Jerárquico OS Shell
+    tipo: TipoTenant = Field(default=TipoTenant.EMPRESA)
+    parent_id: Optional[str] = Field(default=None, foreign_key="tenants_saas.id")
+    modulos_contratados: str = Field(default="tymeo", description="Array CSV de módulos. Ej: tymeo,oee-hub,vision")
+    theme_default: Optional[str] = None
+    
     logo_url: Optional[str] = Field(default=None, description="URL pública de la imagen del logo")
     color_primario: Optional[str] = Field(default=None, description="Color principal en formato HSL o HEX")
     locale_default: str = Field(default="es", description="Idioma por defecto de la interfaz")
-    modo_asignacion_operarios: str = Field(default="manual")
+    modo_asignacion_operarios: ModoAsignacionOperarios = Field(default=ModoAsignacionOperarios.MANUAL)
+    activo: bool = Field(default=True)
 
     # Tolerancias Dinámicas OEE (Configurables por Empresa)
-    tolerancia_lento_pct: float = Field(
-        default=1.15, 
-        description="Multiplicador. Ej: 1.15 significa que es LENTO si supera en 15% el tiempo óptimo del SKU"
-    )
-    tolerancia_alerta_pct: float = Field(
-        default=1.25, 
-        description="Multiplicador. Ej: 1.25 significa que es ALERTA si supera en 25% el tiempo óptimo del SKU"
-    )
+    tolerancia_lento_pct: float = Field(default=1.15)
+    tolerancia_alerta_pct: float = Field(default=1.25)
 
-    # --- Motor de Parseo Universal (Regex) ---
-    regex_parser_orden: Optional[str] = Field(
-        default=None, 
-        description="Regex con Grupo 1 para extraer la Orden. Ej Springwall: '^.{3}(.{8})'"
-    )
-    regex_parser_sku: Optional[str] = Field(
-        default=None, 
-        description="Regex con Grupo 1 para extraer el SKU. Ej Springwall: '^.{11}(.*)'"
-    )
-
-    origen_maestros: str = Field(
-        default="MANUAL", 
-        description="Define la fuente de verdad: 'MANUAL' (Permite CSV/UI) o 'ERP' (Bloquea UI, solo Webhooks)"
-    )
+    # Motor de Parseo Universal (Regex)
+    regex_parser_orden: Optional[str] = Field(default=None)
+    regex_parser_sku: Optional[str] = Field(default=None)
+    origen_maestros: str = Field(default="MANUAL")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
@@ -86,7 +93,7 @@ class UsuarioSaaS(SQLModel, table=True):
     __tablename__ = "usuarios_saas"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     auth0_id: str = Field(unique=True, index=True, description="ID exacto que viene del token de Auth0 (sub)")
-    tenant_id: str = Field(index=True, description="Ej: springwall, tyme_core")
+    tenant_id: str = Field(index=True, foreign_key="tenants_saas.id", description="Ej: springwall, tyme_core")
     email: Optional[str] = Field(default=None, description="Email del usuario")
     rol: RolUsuario = Field(default=RolUsuario.SUPERVISOR)
     activo: bool = Field(default=True)
@@ -105,12 +112,11 @@ class Planta(TenantBase, table=True):
 class Linea(TenantBase, table=True):
     __tablename__ = "dim_lineas"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    planta_id: Optional[uuid.UUID] = Field(default=None, foreign_key="plantas.id") # Jerarquía Planta -> Línea
+    planta_id: Optional[uuid.UUID] = Field(default=None, foreign_key="plantas.id")
     nombre: str
-    modo_asignacion_operarios: str = Field(
-        default="manual", 
-        description="Puede ser 'manual' o 'escaneo'"
-    )
+    
+    # Tipado estricto OS Shell
+    modo_asignacion_operarios: ModoAsignacionOperarios = Field(default=ModoAsignacionOperarios.MANUAL)
     tipo_produccion: TipoProduccion = Field(default=TipoProduccion.DISCRETA)
 
 class Supervisor(TenantBase, table=True):
@@ -125,7 +131,6 @@ class Estacion(TenantBase, table=True):
     nombre: str
     tipo: str  # Ej: "sensor", "escaneo_manual", "calidad"
     
-    # Configuración Dinámica OEE
     umbral_optimo: int = Field(default=240, description="Tiempo ideal en segundos")
     umbral_lento: int = Field(default=280, description="Límite de tiempo aceptable")
     umbral_alerta: int = Field(default=300, description="Tiempo que dispara alerta")
@@ -137,17 +142,12 @@ class Estacion(TenantBase, table=True):
     parent_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_estaciones.id")
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
 
-    codigo_plc: Optional[str] = Field(
-        default=None, 
-        index=True, 
-        description="ID que envía el hardware IoT (ej. armadora_1)"
-    )
-    modo_asignacion_operarios: str = Field(
-        default="heredar", 
-        description="Puede ser 'heredar', 'manual' o 'escaneo'"
-    )
+    codigo_plc: Optional[str] = Field(default=None, index=True)
+    
+    # Tipado estricto con soporte de Herencia OS Shell
+    modo_asignacion_operarios: ModoAsignacionOperariosEstacion = Field(default=ModoAsignacionOperariosEstacion.HEREDAR)
 
-    # Estado en Vivo (Crucial para Trazabilidad Implícita / Pings Ciegos)
+    # Estado en Vivo
     orden_activa_fk: Optional[str] = Field(default=None, description="La OP que se está corriendo ahora")
     sku_activo_fk: Optional[str] = Field(default=None, description="El SKU que se está corriendo ahora")
 
@@ -187,17 +187,13 @@ class MaestroSKU(TenantBase, table=True):
     tiempo_ciclo_teorico: float = Field(default=240.0, description="Segundos ideales por unidad")
     umbral_calidad: float = Field(default=1800.0, description="Tolerancia en estación de calidad")
     
-    unidades_por_ciclo: int = Field(default=1, description="Springwall: 1. New Garden: 4 o 5 moldes.")
+    linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id") # OS Shell requirement para uploads
+    unidades_por_ciclo: int = Field(default=1, description="Factor de lote (ej: 4 panes por molde)")
 
 class OrdenProduccion(TenantBase, table=True):
-    """
-    Representa 1 Lote u Orden de Fabricación vinculada a 1 Producto en 1 Línea.
-    Se aplanaron los datos de ItemOrden para optimizar los Dashboards.
-    """
     __tablename__ = "ordenes_produccion"
     id_orden: str = Field(primary_key=True, description="Número de OP del ERP")
     
-    # Nuevos vínculos estructurales
     sku_fk: Optional[str] = Field(default=None, foreign_key="maestro_skus.codigo_sku")
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
     
@@ -206,11 +202,7 @@ class OrdenProduccion(TenantBase, table=True):
     
     plan_fecha: Optional[str] = Field(default=None, description="Ej: YYYY-MM-DD")
     estado: EstadoOrden = Field(default=EstadoOrden.ABIERTA)
-
-    origen: str = Field(
-        default="UI", 
-        description="Huella de quién creó esto: 'ERP', 'CSV_TEMPLATE', 'CSV_MAPPED', 'UI_MANUAL'"
-    )
+    origen: str = Field(default="UI")
 
 class MotivoParada(TenantBase, table=True):
     __tablename__ = "dim_motivos_parada"
@@ -219,7 +211,7 @@ class MotivoParada(TenantBase, table=True):
     tipo_parada: TipoParada
 
 # ==========================================
-# 5. TRANSACCIONES LEGACY / OEE ESPECÍFICOS
+# 5. TRANSACCIONES LEGACY (Retenidas por retrocompatibilidad)
 # ==========================================
 class EventoEscaneo(TenantBase, table=True):
     """(Legacy) Endpoint original de Springwall."""
@@ -265,7 +257,6 @@ class CicloProduccion(TenantBase, table=True):
 class LiteEventoProduccion(TenantBase, table=True):
     """
     Tabla universal de eventos de alta velocidad para OEE Lite.
-    Soporta sensores ciegos (PLC) y lectores de códigos de barras indistintamente.
     """
     __tablename__ = "lite_eventos_produccion"
     
@@ -278,6 +269,9 @@ class LiteEventoProduccion(TenantBase, table=True):
     # Anclas de Trazabilidad Universal
     orden_fk: Optional[str] = Field(default=None, index=True)
     cantidad_producida: int = Field(default=1)
+    
+    # Impacto Green Mills: Snapshot Inmutable del Factor de Lote
+    unidades_procesadas: int = Field(default=1, description="Factor de lote al momento exacto del escaneo")
     
     # Timeline y Analítica
     timestamp: datetime = Field(default_factory=datetime.utcnow, index=True)
