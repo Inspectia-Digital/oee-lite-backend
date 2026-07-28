@@ -141,6 +141,13 @@ def actualizar_usuario(
     db.commit()
     return {"mensaje": "Usuario actualizado con éxito"}
 
+# ==========================================
+# RUTAS DE PERFIL (FRONTEND BOOTSTRAP)
+# ==========================================
+@router.get("/usuarios/me", tags=["Perfil"])
+def obtener_perfil_actual(usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    """Devuelve los datos del usuario logueado para que el Frontend arme el menú y los permisos."""
+    return usuario_actual
 
 # ==========================================
 # ENDPOINTS SUPERADMIN (SaaS Core)
