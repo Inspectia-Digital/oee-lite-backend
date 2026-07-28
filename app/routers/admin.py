@@ -1,352 +1,158 @@
-import base64
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
-from sqlalchemy import text, func
+from pydantic import BaseModel
+from typing import List, Optional
+import uuid
 
 from app.core.database import get_session
-from app.core.auth import get_usuario_actual
+from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant
-from app.core.auth0_service import crear_usuario_en_auth0
 
-router = APIRouter(prefix="/accesos")
-
-# ==========================================
-# GUARDIAS DE SEGURIDAD
-# ==========================================
-
-def get_superadmin(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
-    if usuario.rol != RolUsuario.SUPERADMIN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requiere privilegios de SuperAdmin.")
-    return usuario
-
-def get_admin_tenant(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
-    if usuario.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requiere privilegios de Gerencia o Producción.")
-    return usuario
-
+router = APIRouter(prefix="/accesos", tags=["Administración SaaS y RBAC"])
 
 # ==========================================
-# SCHEMAS (PYDANTIC)
+# MOLDES (SCHEMAS)
 # ==========================================
-
-class TenantCreate(BaseModel):
-    id: str
-    nombre: str
-
-class TenantUpdate(BaseModel):
-    nombre: Optional[str] = None
-    color_primario: Optional[str] = None
-    logo_url: Optional[str] = None
-    modo_asignacion_operarios: Optional[str] = None
-    
-    # --- NUEVO ---
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
-    regex_parser_orden: Optional[str] = None
-    regex_parser_sku: Optional[str] = None
-
-class NuevoUsuarioSaaS(BaseModel):
-    tenant_id: str
+class UsuarioCreate(BaseModel):
     email: str
-    rol: RolUsuario
     nombre: str
     apellido: str
+    rol: RolUsuario
+    auth0_id: Optional[str] = None  # Si el front no interactúa con Auth0 Management API aún
 
-class ActualizarUsuario(BaseModel):
+class UsuarioUpdate(BaseModel):
     rol: Optional[RolUsuario] = None
     nombre: Optional[str] = None
     apellido: Optional[str] = None
     activo: Optional[bool] = None
 
-class NuevoUsuarioInterno(BaseModel):
-    email: str
-    rol: RolUsuario  
-    nombre: str
-    apellido: str
-
 
 # ==========================================
-# RUTAS DE SETUP Y PERFIL
+# ENDPOINTS DE USUARIOS (Con Modo Dios)
 # ==========================================
 
-@router.get("/migrar-db-urgente", tags=["SuperAdmin (Global)"])
-def migrar_base_de_datos_urgente(db: Session = Depends(get_session)):
-    """Ruta temporal SIN GUARDIA para romper la paradoja del huevo y la gallina"""
-    try:
-        db.exec(text("ALTER TABLE usuarios_saas ADD COLUMN IF NOT EXISTS nombre VARCHAR;"))
-        db.exec(text("ALTER TABLE usuarios_saas ADD COLUMN IF NOT EXISTS apellido VARCHAR;"))
-        db.commit()
-        return {"status": "ok", "mensaje": "¡Columnas agregadas! Ya puedes usar el sistema."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error en migración: {str(e)}")
+@router.get("/mi-empresa/usuarios", response_model=List[dict])
+def listar_usuarios_tenant(
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant)
+):
+    """
+    Lista los usuarios. Si es SuperAdmin en Modo Dios, lista los del tenant impersonado.
+    """
+    # 1. Firewall de Roles: Solo niveles jerárquicos altos pueden ver la lista completa
+    if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.SUPERVISOR]:
+        raise HTTPException(status_code=403, detail="No tienes permisos para listar usuarios.")
 
-@router.get("/setup/init-tenants", tags=["Setup"])
-def inicializar_tenants_base(db: Session = Depends(get_session)):
-    """Ruta temporal para crear los tenants fundacionales y asignar al SuperAdmin."""
-    tenant_inspectia = db.exec(select(Tenant).where(Tenant.id == "inspectia_admin")).first()
-    if not tenant_inspectia:
-        tenant_inspectia = Tenant(id="inspectia_admin", nombre="Administrador InspectIA")
-        db.add(tenant_inspectia)
+    # 2. Búsqueda aislada mediante el Contexto
+    usuarios = db.exec(
+        select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == context.tenant_id)
+    ).all()
 
-    tenant_springwall = db.exec(select(Tenant).where(Tenant.id == "springwall")).first()
-    if not tenant_springwall:
-        tenant_springwall = Tenant(id="springwall", nombre="Springwall")
-        db.add(tenant_springwall)
-
-    db.commit()
-
-    superadmins = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.rol == RolUsuario.SUPERADMIN)).all()
-    admins_actualizados = 0
-    for admin in superadmins:
-        admin.tenant_id = "inspectia_admin"
-        db.add(admin)
-        admins_actualizados += 1
-
-    db.commit()
-    return {
-        "status": "ok",
-        "mensaje": "Tenants fundacionales inicializados correctamente",
-        "tenants_creados": ["inspectia_admin", "springwall"],
-        "superadmins_asignados": admins_actualizados
-    }
-
-@router.get("/usuarios/me", tags=["Perfil"])
-def obtener_perfil_actual(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
-    """Devuelve los datos del usuario logueado según la base de datos de TYMEO."""
-    return usuario
-
-
-# ==========================================
-# GESTIÓN DE TENANTS (SUPERADMIN)
-# ==========================================
-
-@router.get("/superadmin/tenants", tags=["SuperAdmin (Global)"])
-def listar_todos_los_tenants(db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    """Lista todas las empresas cliente con el conteo de sus usuarios activos."""
-    stmt = select(
-        Tenant.id,
-        Tenant.nombre,
-        Tenant.color_primario,
-        Tenant.logo_url,
-        func.count(UsuarioSaaS.id).label("total_usuarios")
-    ).outerjoin(UsuarioSaaS, Tenant.id == UsuarioSaaS.tenant_id).group_by(Tenant.id)
-    
-    resultados = db.exec(stmt).all()
     return [
         {
-            "id": r.id, 
-            "nombre": r.nombre, 
-            "color_primario": r.color_primario,
-            "logo_url": r.logo_url,
-            "total_usuarios": r.total_usuarios
-        } for r in resultados
+            "id": str(u.id),
+            "auth0_id": u.auth0_id,
+            "email": u.email,
+            "nombre": u.nombre,
+            "apellido": u.apellido,
+            "rol": u.rol.value,
+            "activo": u.activo
+        } for u in usuarios
     ]
 
-@router.post("/superadmin/tenants", tags=["SuperAdmin (Global)"])
-def crear_tenant(datos: TenantCreate, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    if db.exec(select(Tenant).where(Tenant.id == datos.id)).first():
-        raise HTTPException(status_code=400, detail="El ID del tenant ya existe.")
-        
-    nuevo_tenant = Tenant(id=datos.id, nombre=datos.nombre)
-    db.add(nuevo_tenant)
-    db.commit()
-    db.refresh(nuevo_tenant)
-    return {"mensaje": "Empresa creada exitosamente", "tenant": nuevo_tenant}
 
-@router.patch("/superadmin/tenants/{tenant_id}", tags=["SuperAdmin (Global)"])
-def actualizar_tenant_global(tenant_id: str, datos: TenantUpdate, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
-    if not tenant_db:
-        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
-        
-    update_data = datos.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(tenant_db, key, value)
-        
-    db.add(tenant_db)
-    db.commit()
-    db.refresh(tenant_db)
-    return {"mensaje": "Empresa actualizada", "tenant": tenant_db}
+@router.post("/mi-empresa/usuarios", status_code=status.HTTP_201_CREATED)
+def crear_usuario_tenant(
+    payload: UsuarioCreate,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant)
+):
+    """
+    Crea un usuario. Aplica reglas estrictas de RBAC y respeta el Modo Dios.
+    """
+    # 1. Reglas de Negocio de Creación
+    if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA]:
+        raise HTTPException(status_code=403, detail="Solo Gerencia o SuperAdmin pueden crear usuarios.")
 
-@router.patch("/superadmin/tenants/{tenant_id}/estado", tags=["SuperAdmin (Global)"])
-def cambiar_estado_empresa(tenant_id: str, activo: bool, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    """Kill Switch: Activa o desactiva a TODOS los usuarios de una organización."""
-    usuarios = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == tenant_id)).all()
-    if not usuarios:
-        raise HTTPException(status_code=404, detail="Tenant no encontrado o sin usuarios.")
-        
-    for usuario in usuarios:
-        usuario.activo = activo
-        db.add(usuario)
-        
-    db.commit()
-    return {"mensaje": f"Se ha {'activado' if activo else 'suspendido'} el acceso para {len(usuarios)} usuarios del tenant {tenant_id}."}
+    if usuario_actual.rol == RolUsuario.GERENCIA and payload.rol == RolUsuario.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="Infracción RBAC: Un Gerente no puede crear un SuperAdmin.")
 
+    # 2. Verificación de Duplicados a nivel global (Los emails SaaS son únicos)
+    if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == payload.email)).first():
+        raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado en el sistema.")
 
-# ==========================================
-# GESTIÓN GLOBAL DE USUARIOS (SUPERADMIN)
-# ==========================================
+    # 3. Creación (Mock del auth0_id temporal si no llega del Frontend)
+    mock_auth0_id = payload.auth0_id or f"auth0|mock_{uuid.uuid4().hex[:8]}"
 
-@router.post("/superadmin/usuarios", tags=["SuperAdmin (Global)"], response_model=dict)
-def crear_usuario_b2b(nuevo_usuario: NuevoUsuarioSaaS, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == nuevo_usuario.email)).first():
-        raise HTTPException(status_code=400, detail="Este email ya está registrado en TYMEO.")
-    
-    auth0_id_generado = crear_usuario_en_auth0(nuevo_usuario.email)
-    
-    db_usuario = UsuarioSaaS(
-        auth0_id=auth0_id_generado,
-        tenant_id=nuevo_usuario.tenant_id,
-        email=nuevo_usuario.email,
-        rol=nuevo_usuario.rol,
-        nombre=nuevo_usuario.nombre,
-        apellido=nuevo_usuario.apellido
+    nuevo_usuario = UsuarioSaaS(
+        auth0_id=mock_auth0_id,
+        tenant_id=context.tenant_id,  # 🟢 La Magia: Se inyecta 'green_mills' si estás impersonando
+        email=payload.email,
+        nombre=payload.nombre,
+        apellido=payload.apellido,
+        rol=payload.rol,
+        activo=True
     )
-    db.add(db_usuario)
-    db.commit()
-    db.refresh(db_usuario)
-    return {"mensaje": f"Se ha enviado un correo a {db_usuario.email} para configurar su acceso.", "usuario": db_usuario}
-
-@router.get("/superadmin/usuarios", tags=["SuperAdmin (Global)"])
-def listar_todos_los_usuarios(db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    return db.exec(select(UsuarioSaaS)).all()
-
-@router.patch("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
-def actualizar_usuario(auth0_id: str, datos: ActualizarUsuario, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    usuario_db = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
-    if not usuario_db: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     
-    update_data = datos.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(usuario_db, key, value)
-        
-    db.add(usuario_db)
+    db.add(nuevo_usuario)
     db.commit()
-    db.refresh(usuario_db)
-    return {"mensaje": "Usuario actualizado exitosamente", "usuario": usuario_db}
-
-@router.delete("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
-def eliminar_usuario_saas(auth0_id: str, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    """Eliminación física del usuario en la base de datos local."""
-    usuario_db = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
-    if not usuario_db:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
-        
-    db.delete(usuario_db)
-    db.commit()
-    return {"mensaje": "Usuario eliminado correctamente de la base de datos local."}
-
-@router.post("/superadmin/usuarios/{auth0_id}/reset-password", tags=["SuperAdmin (Global)"])
-def forzar_reseteo_password(auth0_id: str, db: Session = Depends(get_session), admin: UsuarioSaaS = Depends(get_superadmin)):
-    usuario_db = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
-    if not usuario_db:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    db.refresh(nuevo_usuario)
     
-    # Pendiente: auth0_service.enviar_reset_password(usuario_db.email)
-    return {"mensaje": f"Instrucción de reseteo registrada para {usuario_db.email}."}
+    return {"mensaje": "Usuario creado con éxito", "id": str(nuevo_usuario.id)}
 
 
-# ==========================================
-# GESTIÓN DE ACCESOS Y BRANDING (MI EMPRESA)
-# ==========================================
-
-@router.post("/mi-empresa/usuarios", tags=["Gestión de Accesos (Empresa)"])
-def crear_usuario_interno(nuevo_usuario: NuevoUsuarioInterno, db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    if nuevo_usuario.rol not in [RolUsuario.SUPERVISOR, RolUsuario.OPERARIO]:
-        raise HTTPException(status_code=403, detail="Solo puedes crear usuarios con rol de supervisor u operario.")
-        
-    if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == nuevo_usuario.email)).first():
-        raise HTTPException(status_code=400, detail="Este email ya está registrado.")
-        
-    auth0_id_generado = crear_usuario_en_auth0(nuevo_usuario.email)
-    
-    db_usuario = UsuarioSaaS(
-        auth0_id=auth0_id_generado,
-        tenant_id=admin_local.tenant_id,  
-        email=nuevo_usuario.email,
-        rol=nuevo_usuario.rol,
-        nombre=nuevo_usuario.nombre,
-        apellido=nuevo_usuario.apellido
-    )
-    db.add(db_usuario)
-    db.commit()
-    db.refresh(db_usuario)
-    return {"mensaje": f"Se envió un correo a {db_usuario.email}.", "usuario": db_usuario}
-
-@router.get("/mi-empresa/usuarios", tags=["Gestión de Accesos (Empresa)"])
-def listar_usuarios_internos(db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    return db.exec(select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == admin_local.tenant_id)).all()
-
-@router.patch("/mi-empresa/usuarios/{auth0_id}", tags=["Gestión de Accesos (Empresa)"])
-def actualizar_usuario_interno(auth0_id: str, datos: ActualizarUsuario, db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    usuario_db = db.exec(
+@router.patch("/mi-empresa/usuarios/{auth0_id_target}")
+def actualizar_usuario(
+    auth0_id_target: str,
+    payload: UsuarioUpdate,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant)
+):
+    """
+    Actualiza a un usuario asegurando que pertenezca al Tenant correcto.
+    """
+    usuario_target = db.exec(
         select(UsuarioSaaS).where(
-            UsuarioSaaS.auth0_id == auth0_id,
-            UsuarioSaaS.tenant_id == admin_local.tenant_id
+            UsuarioSaaS.auth0_id == auth0_id_target,
+            UsuarioSaaS.tenant_id == context.tenant_id # 🟢 Aislamiento estricto
         )
     ).first()
-    
-    if not usuario_db:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado en tu empresa.")
-        
-    if datos.rol == RolUsuario.SUPERADMIN:
-        if admin_local.rol != RolUsuario.SUPERADMIN:
-            raise HTTPException(status_code=403, detail="No tienes permiso para asignar este rol.")
-        
-    update_data = datos.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(usuario_db, key, value)
-        
-    db.add(usuario_db)
-    db.commit()
-    db.refresh(usuario_db)
-    return {"mensaje": "Personal actualizado exitosamente", "usuario": usuario_db}
 
-@router.get("/mi-empresa/tenant", tags=["Gestión de Accesos (Empresa)"])
-def obtener_mi_tenant(db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
-    if not tenant_db:
-        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
-    return tenant_db
+    if not usuario_target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado en esta organización.")
 
-@router.patch("/mi-empresa/tenant", tags=["Gestión de Accesos (Empresa)"])
-def actualizar_mi_tenant(datos: TenantUpdate, db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
-    if not tenant_db:
-         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
-    
-    update_data = datos.model_dump(exclude_unset=True)
-    update_data.pop("id", None) 
-    
-    for key, value in update_data.items():
-        setattr(tenant_db, key, value)
-        
-    db.add(tenant_db)
-    db.commit()
-    db.refresh(tenant_db)
-    return {"mensaje": "Branding actualizado", "tenant": tenant_db}
+    # Regla: Nadie puede modificarse a sí mismo para subir de privilegios
+    if usuario_actual.auth0_id == auth0_id_target and payload.rol and payload.rol != usuario_target.rol:
+        raise HTTPException(status_code=403, detail="No puedes auto-modificar tu rol.")
 
-@router.post("/mi-empresa/tenant/logo", tags=["Gestión de Accesos (Empresa)"])
-async def subir_mi_logo(file: UploadFile = File(...), db: Session = Depends(get_session), admin_local: UsuarioSaaS = Depends(get_admin_tenant)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="El archivo debe ser una imagen.")
-        
-    contenido = await file.read()
-    if len(contenido) > 2 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="La imagen es demasiado grande. Máximo 2MB.")
-        
-    base64_encoded = base64.b64encode(contenido).decode("utf-8")
-    logo_data_uri = f"data:{file.content_type};base64,{base64_encoded}"
-    
-    tenant_db = db.exec(select(Tenant).where(Tenant.id == admin_local.tenant_id)).first()
-    if not tenant_db:
-         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
-         
-    tenant_db.logo_url = logo_data_uri
-    db.add(tenant_db)
+    # Regla: Gerencia no puede degradar ni modificar a un SuperAdmin
+    if usuario_actual.rol == RolUsuario.GERENCIA and usuario_target.rol == RolUsuario.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="No tienes autoridad sobre un SuperAdmin.")
+
+    if payload.nombre is not None: usuario_target.nombre = payload.nombre
+    if payload.apellido is not None: usuario_target.apellido = payload.apellido
+    if payload.activo is not None: usuario_target.activo = payload.activo
+    if payload.rol is not None: usuario_target.rol = payload.rol
+
+    db.add(usuario_target)
     db.commit()
-    
-    return {"mensaje": "Logo actualizado exitosamente", "logo_url": logo_data_uri}
+    return {"mensaje": "Usuario actualizado con éxito"}
+
+
+# ==========================================
+# ENDPOINTS SUPERADMIN (SaaS Core)
+# ==========================================
+@router.get("/superadmin/usuarios")
+def listar_todos_los_usuarios_globales(
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)
+):
+    """Endpoint exclusivo para el panel maestro de InspectIA."""
+    if usuario_actual.rol != RolUsuario.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="Acceso denegado. Exclusivo InspectIA Core.")
+        
+    usuarios = db.exec(select(UsuarioSaaS)).all()
+    return usuarios
