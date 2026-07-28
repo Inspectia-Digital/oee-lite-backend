@@ -12,7 +12,7 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion, 
-    Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion
+    Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
