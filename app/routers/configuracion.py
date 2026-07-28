@@ -1,21 +1,52 @@
-from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from sqlmodel import Session, select
-from app.core.database import get_session
-from app.models.domain import Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion, Linea, Supervisor, TipoParada
-# 1. IMPORTAMOS LA NUEVA DEPENDENCIA MAGICA
-from app.core.auth import obtener_tenant_aislado
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 from datetime import time
 import uuid
 import pandas as pd
 import io
+from sqlalchemy.exc import IntegrityError
 
-router = APIRouter(tags=["Configuracion y Maestros"])
+from app.core.database import get_session
+from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
+from app.models.domain import (
+    Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion, 
+    Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion
+)
+
+router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
 
 # ==========================================
-# --- MOLDES UPDATE (Para Edición Parcial) ---
+# 🛡️ MIDDLEWARE LOCAL (RBAC)
 # ==========================================
+def requerir_gerencia(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
+    """Asegura que solo Gerencia o SuperAdmin puedan modificar la configuración de la planta."""
+    if usuario.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA]:
+        raise HTTPException(status_code=403, detail="Acceso denegado. Requiere privilegios de Gerencia.")
+    return usuario
+
+# ==========================================
+# 📦 SCHEMAS SEGUROS (Evitan inyección de IDs)
+# ==========================================
+class LineaCreate(BaseModel):
+    nombre: str
+    planta_id: uuid.UUID
+    modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = ModoAsignacionOperarios.MANUAL
+
+class EstacionCreate(BaseModel):
+    nombre: str
+    tipo: str
+    linea_id: Optional[uuid.UUID] = None
+    parent_id: Optional[uuid.UUID] = None
+    posicion_linea: int = 1
+    ramal: str = "Principal"
+    umbral_optimo: int = 240
+    umbral_lento: int = 280
+    umbral_alerta: int = 300
+    codigo_plc: Optional[str] = None
+    modo_asignacion_operarios: Optional[ModoAsignacionOperariosEstacion] = ModoAsignacionOperariosEstacion.HEREDAR
+
 class EstacionUpdate(BaseModel):
     nombre: Optional[str] = None
     tipo: Optional[str] = None
@@ -25,355 +56,204 @@ class EstacionUpdate(BaseModel):
     activa: Optional[bool] = None
     posicion_linea: Optional[int] = None
     ramal: Optional[str] = None
-    modo_asignacion_operarios: Optional[str] = None
     codigo_plc: Optional[str] = None
 
-class LineaUpdate(BaseModel):
-    nombre: Optional[str] = None
-    modo_asignacion_operarios: Optional[str] = None
+class MotivoParadaCreate(BaseModel):
+    nombre: str
+    tipo_parada: TipoParada
 
-class OperarioUpdate(BaseModel):
-    legajo: Optional[str] = None
-    nombre_completo: Optional[str] = None
-
-class SupervisorUpdate(BaseModel):
-    legajo: Optional[str] = None
-    nombre_completo: Optional[str] = None
-
-class TurnoUpdate(BaseModel):
-    nombre: Optional[str] = None
-    hora_inicio: Optional[time] = None
-    hora_fin: Optional[time] = None
+class TurnoCreate(BaseModel):
+    nombre: str
+    hora_inicio: time
+    hora_fin: time
+    descanso_minutos: int = 0
     linea_id: Optional[uuid.UUID] = None
-    descanso_minutos: Optional[int] = None
 
-class MotivoParadaUpdate(BaseModel):
-    nombre: Optional[str] = None
-    tipo_parada: Optional[TipoParada] = None
 
 # ==========================================
-# ABM DE ESTACIONES
+# 🏭 ABM DE LÍNEAS (Con Validación Cross-Tenant)
 # ==========================================
-@router.post("/estaciones/", response_model=Estacion)
-def crear_estacion(
-    estacion: Estacion, 
+@router.post("/lineas/", response_model=Linea, status_code=status.HTTP_201_CREATED)
+def crear_linea(
+    payload: LineaCreate, 
     db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    estacion.tenant_id = tenant_id
-    db.add(estacion)
+    # Cross-Tenant Validation: Evita asignar la línea a una planta de otra empresa
+    planta_db = db.exec(select(Planta).where(Planta.id == payload.planta_id, Planta.tenant_id == context.tenant_id)).first()
+    if not planta_db:
+        raise HTTPException(status_code=400, detail="La planta no existe o pertenece a otra organización.")
+
+    nueva_linea = Linea(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nueva_linea)
     db.commit()
-    db.refresh(estacion)
-    return estacion
+    db.refresh(nueva_linea)
+    return nueva_linea
 
-@router.get("/estaciones/", response_model=list[Estacion])
-def obtener_estaciones(
+@router.get("/lineas/", response_model=List[Linea])
+def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+    return db.exec(select(Linea).where(Linea.tenant_id == context.tenant_id)).all()
+
+
+# ==========================================
+# ⚙️ ABM DE ESTACIONES (Maquinas)
+# ==========================================
+@router.post("/estaciones/", response_model=Estacion, status_code=status.HTTP_201_CREATED)
+def crear_estacion(
+    payload: EstacionCreate, 
     db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    return db.exec(select(Estacion).where(Estacion.tenant_id == tenant_id)).all()
+    if payload.linea_id:
+        linea_db = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea_db: raise HTTPException(status_code=400, detail="Línea inválida.")
+
+    nueva_estacion = Estacion(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nueva_estacion)
+    db.commit()
+    db.refresh(nueva_estacion)
+    return nueva_estacion
+
+@router.get("/estaciones/", response_model=List[Estacion])
+def obtener_estaciones(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+    return db.exec(select(Estacion).where(Estacion.tenant_id == context.tenant_id)).all()
 
 @router.patch("/estaciones/{estacion_id}", response_model=Estacion)
 def actualizar_estacion(
-    estacion_id: uuid.UUID = Path(...),
-    datos_update: EstacionUpdate = None,
+    estacion_id: uuid.UUID,
+    payload: EstacionUpdate,
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    estacion_db = db.get(Estacion, estacion_id)
-    if not estacion_db or estacion_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Estación no encontrada")
+    estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion_db: raise HTTPException(status_code=404, detail="Estación no encontrada")
     
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(estacion_db, key, value)
+    update_data = payload.model_dump(exclude_unset=True) 
+    for key, value in update_data.items(): setattr(estacion_db, key, value)
         
     db.add(estacion_db)
     db.commit()
     db.refresh(estacion_db)
     return estacion_db
 
+@router.delete("/estaciones/{estacion_id}")
+def eliminar_estacion(
+    estacion_id: uuid.UUID, 
+    db: Session = Depends(get_session), 
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
+):
+    estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion_db: raise HTTPException(status_code=404, detail="Estación no encontrada")
+    try:
+        db.delete(estacion_db)
+        db.commit()
+        return {"mensaje": "Estación eliminada"}
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="No se puede eliminar la estación porque tiene escaneos o paradas asociadas.")
+
+
 # ==========================================
-# ABM DE MOTIVOS DE PARADA
+# 🛑 ABM DE MOTIVOS DE PARADA
 # ==========================================
-@router.post("/motivos-parada/", response_model=MotivoParada)
+@router.post("/motivos-parada/", response_model=MotivoParada, status_code=status.HTTP_201_CREATED)
 def crear_motivo_parada(
-    motivo: MotivoParada, 
+    payload: MotivoParadaCreate, 
     db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    motivo.tenant_id = tenant_id
-    db.add(motivo)
+    nuevo_motivo = MotivoParada(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nuevo_motivo)
     db.commit()
-    db.refresh(motivo)
-    return motivo
+    db.refresh(nuevo_motivo)
+    return nuevo_motivo
 
-@router.get("/motivos-parada/", response_model=list[MotivoParada])
-def obtener_motivos_parada(
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    return db.exec(select(MotivoParada).where(MotivoParada.tenant_id == tenant_id)).all()
+@router.get("/motivos-parada/", response_model=List[MotivoParada])
+def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+    return db.exec(select(MotivoParada).where(MotivoParada.tenant_id == context.tenant_id)).all()
 
-@router.patch("/motivos-parada/{motivo_id}", response_model=MotivoParada)
-def actualizar_motivo_parada(
-    motivo_id: uuid.UUID = Path(...),
-    datos_update: MotivoParadaUpdate = None,
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    motivo_db = db.get(MotivoParada, motivo_id)
-    if not motivo_db or motivo_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Motivo no encontrado")
-    
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(motivo_db, key, value)
-        
-    db.add(motivo_db)
-    db.commit()
-    db.refresh(motivo_db)
-    return motivo_db
 
 # ==========================================
-# ABM DE OPERARIOS
+# ⏱️ ABM DE TURNOS
 # ==========================================
-@router.post("/operarios/", response_model=Operario)
-def crear_operario(
-    operario: Operario, 
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    operario.tenant_id = tenant_id
-    db.add(operario)
-    db.commit()
-    db.refresh(operario)
-    return operario
-
-@router.get("/operarios/", response_model=list[Operario])
-def obtener_operarios(
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    return db.exec(select(Operario).where(Operario.tenant_id == tenant_id)).all()
-
-@router.patch("/operarios/{operario_id}", response_model=Operario)
-def actualizar_operario(
-    operario_id: uuid.UUID = Path(...),
-    datos_update: OperarioUpdate = None,
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    operario_db = db.get(Operario, operario_id)
-    if not operario_db or operario_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Operario no encontrado")
-    
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(operario_db, key, value)
-        
-    db.add(operario_db)
-    db.commit()
-    db.refresh(operario_db)
-    return operario_db
-
-# ==========================================
-# ABM DE TURNOS
-# ==========================================
-@router.post("/turnos/", response_model=Turno)
+@router.post("/turnos/", response_model=Turno, status_code=status.HTTP_201_CREATED)
 def crear_turno(
-    turno: Turno, 
+    payload: TurnoCreate, 
     db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    turno.tenant_id = tenant_id
-    db.add(turno)
+    nuevo_turno = Turno(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nuevo_turno)
     db.commit()
-    db.refresh(turno)
-    return turno
+    db.refresh(nuevo_turno)
+    return nuevo_turno
 
-@router.get("/turnos/", response_model=list[Turno])
+@router.get("/turnos/", response_model=List[Turno])
 def obtener_turnos(
     linea_id: Optional[uuid.UUID] = None, 
     db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+    context: TenantContext = Depends(obtener_contexto_tenant)
 ):
-    query = select(Turno).where(Turno.tenant_id == tenant_id)
-    if linea_id:
-        query = query.where(Turno.linea_id == linea_id)
+    query = select(Turno).where(Turno.tenant_id == context.tenant_id)
+    if linea_id: query = query.where(Turno.linea_id == linea_id)
     return db.exec(query).all()
 
-@router.patch("/turnos/{turno_id}", response_model=Turno)
-def actualizar_turno(
-    turno_id: uuid.UUID = Path(...),
-    datos_update: TurnoUpdate = None,
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
+
+# ==========================================
+# 📊 ERP INTEGRATION: IMPORTACIÓN MASIVA (CERO FRICCIÓN)
+# ==========================================
+@router.post("/erp/skus/bulk", tags=["Integración ERP"])
+async def importar_skus_csv(
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_session), 
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    turno_db = db.get(Turno, turno_id)
-    if not turno_db or turno_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Turno no encontrado")
+    """Importa o actualiza el Maestro de SKUs desde un CSV (codigo_sku, descripcion, tiempo_ciclo_teorico)."""
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Debe ser un archivo CSV")
     
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(turno_db, key, value)
-        
-    db.add(turno_db)
-    db.commit()
-    db.refresh(turno_db)
-    return turno_db
-
-# ==========================================
-# ABM DE LÍNEAS
-# ==========================================
-@router.post("/lineas/", response_model=Linea)
-def crear_linea(
-    linea: Linea, 
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    linea.tenant_id = tenant_id
-    db.add(linea)
-    db.commit()
-    db.refresh(linea)
-    return linea
-
-@router.get("/lineas/", response_model=list[Linea])
-def obtener_lineas(
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    return db.exec(select(Linea).where(Linea.tenant_id == tenant_id)).all()
-
-@router.patch("/lineas/{linea_id}", response_model=Linea)
-def actualizar_linea(
-    linea_id: uuid.UUID = Path(...),
-    datos_update: LineaUpdate = None,
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    linea_db = db.get(Linea, linea_id)
-    if not linea_db or linea_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Línea no encontrada")
-    
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(linea_db, key, value)
-        
-    db.add(linea_db)
-    db.commit()
-    db.refresh(linea_db)
-    return linea_db
-
-# ==========================================
-# ABM DE SUPERVISORES
-# ==========================================
-@router.post("/supervisores/", response_model=Supervisor)
-def crear_supervisor(
-    supervisor: Supervisor, 
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    supervisor.tenant_id = tenant_id
-    db.add(supervisor)
-    db.commit()
-    db.refresh(supervisor)
-    return supervisor
-
-@router.get("/supervisores/", response_model=list[Supervisor])
-def obtener_supervisores(
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    return db.exec(select(Supervisor).where(Supervisor.tenant_id == tenant_id)).all()
-
-@router.patch("/supervisores/{supervisor_id}", response_model=Supervisor)
-def actualizar_supervisor(
-    supervisor_id: uuid.UUID = Path(...),
-    datos_update: SupervisorUpdate = None,
-    db: Session = Depends(get_session),
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    supervisor_db = db.get(Supervisor, supervisor_id)
-    if not supervisor_db or supervisor_db.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Supervisor no encontrado")
-    
-    update_data = datos_update.model_dump(exclude_unset=True) 
-    for key, value in update_data.items():
-        setattr(supervisor_db, key, value)
-        
-    db.add(supervisor_db)
-    db.commit()
-    db.refresh(supervisor_db)
-    return supervisor_db
-
-# ==========================================
-# ENDPOINTS MANUALES Y UTILERÍA
-# ==========================================
-@router.post("/skus/", response_model=MaestroSKU)
-def crear_sku_manual(
-    sku: MaestroSKU, 
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    sku.tenant_id = tenant_id
-    db.add(sku)
-    db.commit()
-    db.refresh(sku)
-    return sku
-
-@router.post("/ordenes/", response_model=OrdenProduccion)
-def crear_orden_manual(
-    orden: OrdenProduccion, 
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    orden.tenant_id = tenant_id
-    db.add(orden)
-    db.commit()
-    db.refresh(orden)
-    return orden
-
-@router.post("/setup-springwall/")
-def setup_springwall(
-    db: Session = Depends(get_session), 
-    tenant_id: str = Depends(obtener_tenant_aislado) # <-- APLICADO
-):
-    viejas = db.exec(select(Estacion).where(Estacion.tenant_id == tenant_id)).all()
-    for v in viejas: db.delete(v)
-    db.commit()
-
-    e1 = Estacion(tenant_id=tenant_id, nombre="E1 - Pedalera (Ingreso)", tipo="sensor", posicion_linea=1, umbral_optimo=240, umbral_lento=280, umbral_alerta=300)
-    e2 = Estacion(tenant_id=tenant_id, nombre="E2 - Matelaceado", tipo="sensor", posicion_linea=2, umbral_optimo=240, umbral_lento=280, umbral_alerta=300)
-    e3 = Estacion(tenant_id=tenant_id, nombre="E3 - Forro/Escaneo", tipo="escaneo_manual", posicion_linea=3, umbral_optimo=240, umbral_lento=280, umbral_alerta=300)
-    db.add_all([e1, e2, e3])
-    db.commit()
-
-    cerradora_a_padre = Estacion(tenant_id=tenant_id, nombre="E4 - Cerradora A (Total)", tipo="escaneo_manual", posicion_linea=4, ramal="Línea A", umbral_optimo=240, umbral_lento=280, umbral_alerta=300)
-    db.add(cerradora_a_padre)
-    db.commit()
-    db.refresh(cerradora_a_padre)
-
-    sub_a1 = Estacion(tenant_id=tenant_id, nombre="E4.1 - Cerradora A (Etapa 1)", tipo="escaneo_manual", parent_id=cerradora_a_padre.id, posicion_linea=4, ramal="Línea A", umbral_optimo=120, umbral_lento=140, umbral_alerta=150)
-    sub_a2 = Estacion(tenant_id=tenant_id, nombre="E4.2 - Cerradora A (Etapa 2)", tipo="escaneo_manual", parent_id=cerradora_a_padre.id, posicion_linea=4, ramal="Línea A", umbral_optimo=120, umbral_lento=140, umbral_alerta=150)
-    db.add_all([sub_a1, sub_a2])
-
-    cerradora_b = Estacion(tenant_id=tenant_id, nombre="E5 - Cerradora B", tipo="escaneo_manual", posicion_linea=4, ramal="Línea B", umbral_optimo=240, umbral_lento=280, umbral_alerta=300)
-    calidad_a = Estacion(tenant_id=tenant_id, nombre="E6 - Calidad A", tipo="calidad", posicion_linea=5, ramal="Línea A", umbral_optimo=120, umbral_lento=180, umbral_alerta=181)
-    calidad_b = Estacion(tenant_id=tenant_id, nombre="E7 - Calidad B", tipo="calidad", posicion_linea=5, ramal="Línea B", umbral_optimo=120, umbral_lento=180, umbral_alerta=181)
-    
-    db.add_all([cerradora_b, calidad_a, calidad_b])
-    db.commit()
-
-    return {"status": "ok", "mensaje": "Línea Springwall cargada de forma segura."}
-
-@router.delete("/reset-db-danger/")
-def reset_base_de_datos():
-    from app.core.database import engine
-    from sqlmodel import SQLModel
+    contenido = await file.read()
     try:
-        SQLModel.metadata.drop_all(engine)
-        SQLModel.metadata.create_all(engine)
-        return {"status": "ok", "mensaje": "Base de datos reseteada."}
+        df = pd.read_csv(io.BytesIO(contenido))
+        requeridos = {'codigo_sku', 'descripcion', 'tiempo_ciclo_teorico'}
+        if not requeridos.issubset(df.columns):
+            raise ValueError(f"Faltan columnas requeridas: {requeridos - set(df.columns)}")
+            
+        skus_procesados = 0
+        for _, row in df.iterrows():
+            sku_db = db.exec(select(MaestroSKU).where(
+                MaestroSKU.codigo_sku == str(row['codigo_sku']), 
+                MaestroSKU.tenant_id == context.tenant_id
+            )).first()
+            
+            if sku_db:
+                sku_db.descripcion = str(row['descripcion'])
+                sku_db.tiempo_ciclo_teorico = float(row['tiempo_ciclo_teorico'])
+            else:
+                nuevo_sku = MaestroSKU(
+                    tenant_id=context.tenant_id,
+                    codigo_sku=str(row['codigo_sku']),
+                    descripcion=str(row['descripcion']),
+                    tiempo_ciclo_teorico=float(row['tiempo_ciclo_teorico'])
+                )
+                db.add(nuevo_sku)
+            skus_procesados += 1
+            
+        db.commit()
+        return {"mensaje": f"Se procesaron {skus_procesados} SKUs correctamente."}
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al resetear: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Error procesando CSV: {str(e)}")
+
+
+@router.get("/erp/skus", response_model=List[MaestroSKU], tags=["Integración ERP"])
+def listar_skus(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+    return db.exec(select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id)).all()
