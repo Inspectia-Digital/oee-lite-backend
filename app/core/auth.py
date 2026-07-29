@@ -20,10 +20,35 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # CONFIGURACIÓN DE AUTH0
 # ==========================================
-# Sin fallback hardcodeado: si falta configuración, falla explícito en el arranque
-# (settings.py ya exige AUTH0_DOMAIN/AUTH0_AUDIENCE en producción).
-AUTH0_DOMAIN = settings.AUTH0_DOMAIN.replace("https://", "").replace("http://", "").rstrip("/")
-AUTH0_AUDIENCE = settings.AUTH0_AUDIENCE
+# En producción, settings.py ya exige AUTH0_DOMAIN/AUTH0_AUDIENCE explícitos
+# (falla el arranque si faltan). Fuera de producción (development/staging),
+# se mantiene un fallback de transición para no romper logins existentes
+# en entornos que todavía no seteen estas variables explícitamente; se
+# loguea un warning fuerte para que se detecte y corrija.
+_FALLBACK_AUTH0_DOMAIN = "dev-bzem6wpwmlr14eha.us.auth0.com"
+_FALLBACK_AUTH0_AUDIENCE = "https://api.tymeo.com"
+
+_auth0_domain_raw = settings.AUTH0_DOMAIN
+_auth0_audience_raw = settings.AUTH0_AUDIENCE
+
+if not _auth0_domain_raw and not settings.is_production:
+    logger.warning(
+        "AUTH0_DOMAIN no está seteado como variable de entorno; usando fallback de "
+        "transición '%s'. Configurar explícitamente antes de promover a producción.",
+        _FALLBACK_AUTH0_DOMAIN,
+    )
+    _auth0_domain_raw = _FALLBACK_AUTH0_DOMAIN
+
+if not _auth0_audience_raw and not settings.is_production:
+    logger.warning(
+        "AUTH0_AUDIENCE no está seteado como variable de entorno; usando fallback de "
+        "transición '%s'. Configurar explícitamente antes de promover a producción.",
+        _FALLBACK_AUTH0_AUDIENCE,
+    )
+    _auth0_audience_raw = _FALLBACK_AUTH0_AUDIENCE
+
+AUTH0_DOMAIN = _auth0_domain_raw.replace("https://", "").replace("http://", "").rstrip("/")
+AUTH0_AUDIENCE = _auth0_audience_raw
 
 ALGORITHMS = ["RS256"]
 
