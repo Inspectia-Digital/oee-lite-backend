@@ -297,14 +297,18 @@ def actualizar_usuario_global(auth0_id: str, payload: UsuarioGlobalUpdate, db: S
 
 @router.delete("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
 def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    """Baja lógica (activo=False). Antes era DELETE físico -- violaba "cero
+    hard-deletes" y rompía la trazabilidad de auditoría/creaciones/eventos
+    asociados a ese usuario; corregido."""
     if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
     usuario_target = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
     if not usuario_target: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if usuario_actual.auth0_id == auth0_id: raise HTTPException(status_code=400, detail="Operación suicida bloqueada.")
 
-    db.delete(usuario_target)
+    usuario_target.activo = False
+    db.add(usuario_target)
     db.commit()
-    return {"mensaje": "Usuario eliminado físicamente de la base de datos."}
+    return {"mensaje": "Usuario desactivado."}
 
 
 # ==========================================
