@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext
+from app.core.auth import obtener_contexto_tenant_edge, TenantContext
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, Tenant, 
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
@@ -25,7 +25,7 @@ class ScanRequest(BaseModel):
 def validar_estacion_terminal(
     estacion_id: uuid.UUID,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_edge)
 ):
     """(Bootstrap) Kiosko solicita configuración de la estación y herencia de línea."""
     estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
@@ -49,7 +49,7 @@ def validar_estacion_terminal(
 def registrar_escaneo_rapido(
     scan: ScanRequest,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_edge)
 ):
     """
     Motor DTR Universal: Procesa pings en < 50ms[cite: 14].

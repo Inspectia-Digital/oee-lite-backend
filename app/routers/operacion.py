@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.models.domain import (
     ParadaDetectada, MotivoParada, EstadoParada, 
     Estacion, Linea, LiteEventoProduccion, Operario
@@ -36,7 +36,7 @@ def validar_planta(context: TenantContext):
 @router.get("/paradas-pendientes", response_model=list[ParadaDetectada])
 def obtener_paradas_pendientes(
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Obtiene paradas huérfanas filtradas estrictamente por la Planta activa[cite: 13]."""
     validar_planta(context)
@@ -58,7 +58,7 @@ def clasificar_parada(
     parada_id: uuid.UUID, 
     datos: ClasificarParada, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
@@ -80,7 +80,7 @@ def clasificar_parada(
 def registrar_parada_planificada(
     datos: ParadaPlanificadaCreate, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     estacion = db.get(Estacion, datos.estacion_fk)
     if not estacion or estacion.tenant_id != context.tenant_id:
@@ -115,7 +115,7 @@ def registrar_parada_planificada(
 def asignar_operario_retroactivo(
     datos: AsignacionRetroactiva, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """
     (Fallback) Si el operario olvidó escanear su legajo, el supervisor le asigna 

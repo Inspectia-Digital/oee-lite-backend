@@ -6,9 +6,9 @@ from sqlalchemy import func
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.core.rbac import requerir_gerencia_o_superadmin
-from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta
+from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant
 
 router = APIRouter(prefix="/accesos", tags=["Administración SaaS y RBAC"])
 
@@ -46,6 +46,9 @@ class TenantCreate(BaseModel):
     id: str
     nombre: str
 
+class TenantEstadoUpdate(BaseModel):
+    estado: EstadoTenant
+
 class TenantUpdate(BaseModel):
     nombre: Optional[str] = None
     color_primario: Optional[str] = None
@@ -79,7 +82,7 @@ def obtener_perfil_actual(usuario_actual: UsuarioSaaS = Depends(get_usuario_actu
 @router.get("/mi-empresa/tenant", tags=["Gestión de Accesos (Empresa)"])
 def obtener_mi_tenant(
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Devuelve la configuración de la empresa actual (Branding, umbrales)."""
     tenant_db = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
@@ -92,7 +95,7 @@ def actualizar_mi_tenant(
     datos: TenantUpdate, 
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Permite a la Gerencia actualizar el branding y reglas de su propia empresa."""
     if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA]:
@@ -117,7 +120,7 @@ def actualizar_mi_tenant(
 def listar_usuarios_tenant(
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.SUPERVISOR]:
         raise HTTPException(status_code=403, detail="No tienes permisos para listar usuarios.")
@@ -135,7 +138,7 @@ def crear_usuario_tenant(
     payload: UsuarioCreate,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA]:
         raise HTTPException(status_code=403, detail="Solo Gerencia o SuperAdmin pueden crear usuarios.")
@@ -161,7 +164,7 @@ def actualizar_usuario(
     payload: UsuarioUpdate,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     usuario_target = db.exec(select(UsuarioSaaS).where(
         UsuarioSaaS.auth0_id == auth0_id_target, UsuarioSaaS.tenant_id == context.tenant_id
@@ -205,19 +208,32 @@ def crear_tenant_global(datos: TenantCreate, db: Session = Depends(get_session),
     return {"mensaje": "Empresa cliente creada exitosamente", "tenant": nuevo_tenant}
 
 @router.patch("/superadmin/tenants/{tenant_id}/estado", tags=["SuperAdmin (Global)"])
-def cambiar_estado_empresa(tenant_id: str, activo: bool, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
-    """Kill Switch: Activa o desactiva a TODOS los usuarios de una organización."""
-    if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
-    
-    usuarios = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == tenant_id)).all()
-    if not usuarios: raise HTTPException(status_code=404, detail="Tenant no encontrado o sin usuarios.")
-        
-    for usuario in usuarios:
-        usuario.activo = activo
-        db.add(usuario)
-        
+def cambiar_estado_empresa(
+    tenant_id: str,
+    payload: TenantEstadoUpdate,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Cambia el estado de suspensión del tenant (ACTIVO/UI_SUSPENDIDA/SUSPENSION_TOTAL).
+
+    Reemplaza al kill-switch anterior, que desactivaba usuario por usuario
+    y nunca tocaba Tenant.estado. Sólo SuperAdmin puede cambiarlo.
+    - UI_SUSPENDIDA: los endpoints humanos (dashboards, configuración) devuelven
+      403, pero /me y el Edge/M2M siguen funcionando.
+    - SUSPENSION_TOTAL: además corta Edge/M2M.
+    """
+    if usuario_actual.rol != RolUsuario.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if not tenant_db:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+
+    tenant_db.estado = payload.estado
+    db.add(tenant_db)
     db.commit()
-    return {"mensaje": f"Se ha {'activado' if activo else 'suspendido'} el acceso para {len(usuarios)} usuarios de {tenant_id}."}
+    db.refresh(tenant_db)
+    return {"mensaje": f"Estado de '{tenant_id}' actualizado a '{payload.estado.value}'.", "tenant": tenant_db}
 
 @router.get("/superadmin/usuarios")
 def listar_todos_los_usuarios_globales(db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
@@ -276,7 +292,7 @@ def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), u
 def asignar_usuario_a_planta(
     payload: UsuarioPlantaCreate,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     usuario_target = db.exec(
@@ -323,7 +339,7 @@ def listar_asignaciones_usuario_planta(
     usuario_id: Optional[uuid.UUID] = None,
     planta_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     query = select(UsuarioPlanta).where(UsuarioPlanta.tenant_id == context.tenant_id, UsuarioPlanta.activo == True)  # noqa: E712
@@ -338,7 +354,7 @@ def listar_asignaciones_usuario_planta(
 def quitar_asignacion_usuario_planta(
     asignacion_id: uuid.UUID,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     asignacion = db.exec(
