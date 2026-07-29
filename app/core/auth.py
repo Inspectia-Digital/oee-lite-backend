@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 from app.core.config import settings
 from app.core.database import get_session
-from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
+from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant, EstadoTenant
 
 # Habilitamos el logger para evitar que los errores queden invisibles en Cloud Run
 logger = logging.getLogger(__name__)
@@ -216,3 +216,60 @@ def obtener_tenant_aislado(
     if usuario.rol == RolUsuario.SUPERADMIN and tenant_impersonado:
         return tenant_impersonado
     return usuario.tenant_id
+
+
+# ==========================================
+# SUSPENSIÓN DE TENANT (Fase D.2)
+# ==========================================
+def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
+    """Corta Edge/M2M sólo si el tenant está en SUSPENSION_TOTAL."""
+    if tenant and tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La empresa se encuentra en suspensión total.",
+        )
+
+
+def _verificar_acceso_humano_habilitado(tenant: Optional[Tenant]) -> None:
+    """Corta endpoints humanos si el tenant está UI_SUSPENDIDA o en SUSPENSION_TOTAL."""
+    if tenant and tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El acceso humano de esta empresa está suspendido.",
+        )
+
+
+def obtener_contexto_tenant_humano(
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    db: Session = Depends(get_session),
+) -> TenantContext:
+    """Igual que obtener_contexto_tenant, pero corta con 403 si la empresa
+    tiene el acceso humano suspendido (UI_SUSPENDIDA o SUSPENSION_TOTAL).
+    Usar en endpoints humanos (dashboards, configuración, administración).
+    No usar en endpoints de Edge/M2M: ahí la UI_SUSPENDIDA no debe cortar
+    la ingesta (ver obtener_contexto_tenant_edge / obtener_tenant_aislado_edge).
+    """
+    tenant = db.get(Tenant, context.tenant_id)
+    _verificar_acceso_humano_habilitado(tenant)
+    return context
+
+
+def obtener_contexto_tenant_edge(
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    db: Session = Depends(get_session),
+) -> TenantContext:
+    """Para endpoints de Edge/M2M: sólo corta en SUSPENSION_TOTAL, nunca en
+    UI_SUSPENDIDA (el hardware debe poder seguir mandando datos)."""
+    tenant = db.get(Tenant, context.tenant_id)
+    verificar_no_suspension_total(tenant)
+    return context
+
+
+def obtener_tenant_aislado_edge(
+    tenant_id: str = Depends(obtener_tenant_aislado),
+    db: Session = Depends(get_session),
+) -> str:
+    """Variante Edge/M2M de obtener_tenant_aislado: sólo corta en SUSPENSION_TOTAL."""
+    tenant = db.get(Tenant, tenant_id)
+    verificar_no_suspension_total(tenant)
+    return tenant_id

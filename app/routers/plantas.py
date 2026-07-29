@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.models.domain import Planta
 
 router = APIRouter(prefix="/accesos", tags=["Organización Física"])
@@ -15,7 +15,7 @@ class PlantaCreate(BaseModel):
 @router.get("/mi-empresa/sub-tenants")
 def listar_plantas(
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Devuelve las plantas (sub-tenants) pertenecientes a la empresa (tenant) logueada."""
     plantas = db.exec(
@@ -30,7 +30,7 @@ def listar_plantas(
 def crear_planta(
     payload: PlantaCreate,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Crea una nueva planta física aislada bajo el Tenant actual."""
     nueva_planta = Planta(

@@ -9,7 +9,7 @@ import io
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion, 
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS
@@ -77,7 +77,7 @@ class TurnoCreate(BaseModel):
 def crear_linea(
     payload: LineaCreate, 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     # Cross-Tenant Validation: Evita asignar la línea a una planta de otra empresa
@@ -92,7 +92,7 @@ def crear_linea(
     return nueva_linea
 
 @router.get("/lineas/", response_model=List[Linea])
-def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
     return db.exec(select(Linea).where(Linea.tenant_id == context.tenant_id)).all()
 
 
@@ -103,7 +103,7 @@ def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = 
 def crear_estacion(
     payload: EstacionCreate, 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     if payload.linea_id:
@@ -117,7 +117,7 @@ def crear_estacion(
     return nueva_estacion
 
 @router.get("/estaciones/", response_model=List[Estacion])
-def obtener_estaciones(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+def obtener_estaciones(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
     return db.exec(select(Estacion).where(Estacion.tenant_id == context.tenant_id)).all()
 
 @router.patch("/estaciones/{estacion_id}", response_model=Estacion)
@@ -125,7 +125,7 @@ def actualizar_estacion(
     estacion_id: uuid.UUID,
     payload: EstacionUpdate,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
@@ -143,7 +143,7 @@ def actualizar_estacion(
 def eliminar_estacion(
     estacion_id: uuid.UUID, 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
@@ -164,7 +164,7 @@ def eliminar_estacion(
 def crear_motivo_parada(
     payload: MotivoParadaCreate, 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     nuevo_motivo = MotivoParada(tenant_id=context.tenant_id, **payload.model_dump())
@@ -174,7 +174,7 @@ def crear_motivo_parada(
     return nuevo_motivo
 
 @router.get("/motivos-parada/", response_model=List[MotivoParada])
-def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
     return db.exec(select(MotivoParada).where(MotivoParada.tenant_id == context.tenant_id)).all()
 
 
@@ -185,7 +185,7 @@ def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantCo
 def crear_turno(
     payload: TurnoCreate, 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     nuevo_turno = Turno(tenant_id=context.tenant_id, **payload.model_dump())
@@ -198,7 +198,7 @@ def crear_turno(
 def obtener_turnos(
     linea_id: Optional[uuid.UUID] = None, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     query = select(Turno).where(Turno.tenant_id == context.tenant_id)
     if linea_id: query = query.where(Turno.linea_id == linea_id)
@@ -212,7 +212,7 @@ def obtener_turnos(
 async def importar_skus_csv(
     file: UploadFile = File(...), 
     db: Session = Depends(get_session), 
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     """Importa o actualiza el Maestro de SKUs desde un CSV (codigo_sku, descripcion, tiempo_ciclo_teorico)."""
@@ -255,5 +255,5 @@ async def importar_skus_csv(
 
 
 @router.get("/erp/skus", response_model=List[MaestroSKU], tags=["Integración ERP"])
-def listar_skus(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant)):
+def listar_skus(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
     return db.exec(select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id)).all()

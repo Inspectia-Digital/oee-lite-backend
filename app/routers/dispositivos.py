@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-from app.core.auth import TenantContext, obtener_contexto_tenant
+from app.core.auth import TenantContext, obtener_contexto_tenant_humano
 from app.core.database import get_session
 from app.core.rbac import requerir_gerencia_o_superadmin
 from app.models.domain import ApiKeyDispositivo, Estacion, UsuarioSaaS
@@ -61,7 +61,7 @@ def _hashear_secret(secret: str) -> str:
 def emitir_api_key(
     payload: ApiKeyCreate,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     estacion = db.exec(
@@ -115,7 +115,7 @@ def emitir_api_key(
 def listar_api_keys(
     estacion_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     query = select(ApiKeyDispositivo).where(ApiKeyDispositivo.tenant_id == context.tenant_id)
@@ -128,7 +128,7 @@ def listar_api_keys(
 def revocar_api_key(
     api_key_id: uuid.UUID,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     api_key = db.exec(

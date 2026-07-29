@@ -6,7 +6,7 @@ from typing import List, Optional
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada, 
     MotivoParada, Operario, Turno, Linea, TipoParada
@@ -94,7 +94,7 @@ def validar_planta(context: TenantContext):
 def obtener_dashboard_estaciones(
     skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -167,7 +167,7 @@ def obtener_oee_general(
     fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -275,7 +275,7 @@ def obtener_oee_general(
 def obtener_reporte_springwall(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -342,7 +342,7 @@ def obtener_reporte_springwall(
 def obtener_pareto_paradas(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -395,7 +395,7 @@ def obtener_pareto_paradas(
 def obtener_cuellos_botella(
     skip: int = 0, limit: int = 1000, fecha: date = None, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -442,7 +442,7 @@ def obtener_cuellos_botella(
 def tendencia_oee_diaria(
     linea_id: Optional[uuid.UUID] = None, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)
@@ -465,7 +465,7 @@ def tendencia_oee_diaria(
 def obtener_alertas_vivas(
     skip: int = 0, limit: int = 1000, 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     try:
         validar_planta(context)

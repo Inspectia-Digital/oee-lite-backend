@@ -8,7 +8,7 @@ import json
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant, TenantContext
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.models.domain import OrdenProduccion, MaestroSKU, Tenant, Linea
 
 router = APIRouter(prefix="/api/lite/importaciones", tags=["Importación y Exportación (UI)"])
@@ -67,7 +67,7 @@ async def subir_plan(
     file: UploadFile = File(...),
     map_json: Optional[str] = Form(None, description='Opcional. Ej: {"Tango_ID": "id_orden"}'), 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     # 1. Validaciones Core (ERP & Planta)
     verificar_permiso_carga_y_linea(db, context, linea_id)
@@ -164,7 +164,7 @@ async def subir_skus(
     file: UploadFile = File(...),
     map_json: Optional[str] = Form(None), 
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant)
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     verificar_permiso_carga_y_linea(db, context, linea_id)
 
