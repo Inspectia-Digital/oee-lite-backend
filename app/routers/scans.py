@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from sqlmodel import Session, select
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import uuid
 
 from app.core.database import get_session
@@ -11,7 +11,7 @@ from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, Tenant,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
-    ModoAsignacionOperariosEstacion
+    ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno
 )
 
 router = APIRouter(prefix="/api/lite", tags=["Ingesta de Datos (Terminales y PLC)"])
@@ -144,5 +144,81 @@ def registrar_escaneo_rapido(
     
     db.add(nuevo_evento)
     db.commit()
-    
+
     return {"status": "ok", "evento_id": nuevo_evento.id, "unidades": unidades_a_sumar, "desempeno": desempeno}
+
+
+# ==========================================
+# LOGIN DE OPERARIO POR ESCANEO (Fase D.4b)
+# ==========================================
+class OperarioLoginRequest(BaseModel):
+    legajo: str = Field(..., description="Legajo escaneado del operario")
+    turno_fk: uuid.UUID = Field(
+        ...,
+        description=(
+            "Turno vigente. Se pide explícito y no se auto-resuelve por hora: "
+            "resolverlo correctamente requiere timezone de planta (Fase E1, "
+            "todavía no implementada)."
+        ),
+    )
+
+
+@router.post("/operario/login", status_code=status.HTTP_200_OK)
+def login_operario_terminal(
+    payload: OperarioLoginRequest,
+    db: Session = Depends(get_session),
+    dispositivo: ContextoDispositivo = Depends(autenticar_dispositivo),
+):
+    """
+    El dispositivo (terminal de mano) ya se autenticó vía API key
+    (X-Device-Key, Fase D.4a). El operario se identifica escaneando su
+    legajo una vez por sesión/turno. Esto NO toca eventos históricos: crea
+    o actualiza la fila de AsignacionTurno para tenant + estación (la de la
+    credencial) + turno + fecha de hoy. Los reportes resuelven el operario
+    de cada evento en tiempo de lectura, cruzando por estación + momento.
+    """
+    operario = db.exec(
+        select(Operario).where(
+            Operario.tenant_id == dispositivo.tenant_id,
+            Operario.legajo == payload.legajo,
+            Operario.activo == True,  # noqa: E712
+        )
+    ).first()
+    if not operario:
+        raise HTTPException(status_code=404, detail="Legajo no encontrado o inactivo.")
+
+    turno = db.exec(
+        select(Turno).where(Turno.id == payload.turno_fk, Turno.tenant_id == dispositivo.tenant_id)
+    ).first()
+    if not turno:
+        raise HTTPException(status_code=404, detail="Turno no encontrado.")
+
+    hoy = date.today()
+    asignacion = db.exec(
+        select(AsignacionTurno).where(
+            AsignacionTurno.tenant_id == dispositivo.tenant_id,
+            AsignacionTurno.estacion_fk == uuid.UUID(dispositivo.estacion_id),
+            AsignacionTurno.turno_fk == payload.turno_fk,
+            AsignacionTurno.fecha == hoy,
+        )
+    ).first()
+
+    if asignacion:
+        asignacion.operario_fk = operario.id
+        db.add(asignacion)
+    else:
+        asignacion = AsignacionTurno(
+            tenant_id=dispositivo.tenant_id,
+            fecha=hoy,
+            estacion_fk=uuid.UUID(dispositivo.estacion_id),
+            operario_fk=operario.id,
+            turno_fk=payload.turno_fk,
+        )
+        db.add(asignacion)
+
+    db.commit()
+    db.refresh(asignacion)
+    return {
+        "mensaje": f"Operario '{operario.nombre_completo}' logueado en esta terminal para el turno actual.",
+        "asignacion_id": asignacion.id,
+    }
