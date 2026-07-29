@@ -14,6 +14,7 @@ env:
   REGION: us-central1
   SERVICE_NAME: api-oeelite-dev
   DB_INSTANCE: oee-control:us-central1:oeelite-db-dev
+  CLOUD_SQL_PROXY_VERSION: 2.14.0
 
 jobs:
   deploy:
@@ -46,25 +47,63 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Set up Cloud SQL Auth Proxy
-        uses: google-github-actions/setup-cloud-sql-proxy@v2
-        with:
-          instances: ${{ env.DB_INSTANCE }}
-
-      - name: Run database migration (Fase C1 y siguientes, expand-only)
+      # NOTA: no existe una GitHub Action oficial de Google para esto
+      # (google-github-actions/setup-cloud-sql-proxy no existe — error real
+      # visto en un deploy). Se descarga el binario oficial directamente
+      # desde storage.googleapis.com (eso sí es oficial y está verificado).
+      #
+      # El proxy se arranca, se espera y se usa TODO en el mismo step,
+      # a propósito: un proceso backgroundeado con "&" en un step de
+      # GitHub Actions no sobrevive de forma confiable al step siguiente
+      # (cada step corre en su propia shell); separarlo en dos steps fue
+      # la causa real del primer fallo ("connection refused" / "server
+      # closed the connection unexpectedly").
+      - name: Set up Cloud SQL Auth Proxy and run migration
         env:
           RAW_DB_URL: ${{ secrets.DEV_DATABASE_URL_TCP }}
         run: |
           if [ -z "$RAW_DB_URL" ]; then
-            echo "ERROR: falta el secret DEV_DATABASE_URL_TCP (usuario:password:dbname para conectar vía el proxy en 127.0.0.1:5432)."
+            echo "ERROR: falta el secret DEV_DATABASE_URL_TCP (usuario:password@127.0.0.1:5432/db para conectar vía el proxy)."
             echo "No es lo mismo que DEV_DATABASE_URL (esa apunta a un socket Unix, no sirve para TCP local)."
             exit 1
           fi
+
+          curl -sSL -o cloud-sql-proxy \
+            "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          chmod +x cloud-sql-proxy
+
+          ./cloud-sql-proxy "$DB_INSTANCE" --port 5432 > cloud-sql-proxy.log 2>&1 &
+          PROXY_PID=$!
+          disown
+
+          echo "Esperando a que el proxy levante (PID $PROXY_PID)..."
+          LISTO=""
+          for i in $(seq 1 15); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then
+              echo "Proxy escuchando en 127.0.0.1:5432."
+              LISTO="si"
+              break
+            fi
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "ERROR: el proceso del proxy murió antes de levantar. Log:"
+              cat cloud-sql-proxy.log
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ -z "$LISTO" ]; then
+            echo "ERROR: timeout esperando al proxy. Log:"
+            cat cloud-sql-proxy.log
+            exit 1
+          fi
+
           export DATABASE_URL="$RAW_DB_URL"
           export ENVIRONMENT="development"
           export CORS_ORIGINS="*"
           python -m alembic current
           python -m alembic upgrade head
+
+          kill "$PROXY_PID" 2>/dev/null || true
 
       - name: Authorize Docker push
         run: gcloud auth configure-docker us-central1-docker.pkg.dev
