@@ -1,7 +1,10 @@
+import logging
 from typing import List
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -31,7 +34,18 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> List[str]:
-        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        origenes = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        if not origenes and not self.is_production:
+            # Fallback de transición: si CORS_ORIGINS no está seteado fuera de
+            # producción, no bloquear silenciosamente al frontend. En producción
+            # esto sigue siendo obligatorio (ver _validar_configuracion_de_produccion).
+            logger.warning(
+                "CORS_ORIGINS no está seteado como variable de entorno; "
+                "permitiendo todos los orígenes ('*') como fallback de transición. "
+                "Configurar explícitamente antes de promover a producción."
+            )
+            return ["*"]
+        return origenes
 
     @field_validator("ENVIRONMENT")
     @classmethod
