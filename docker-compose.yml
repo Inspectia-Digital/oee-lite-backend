@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: oeelite_password
       POSTGRES_DB: oeelite_db
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U oeelite_user -d oeelite_db"]
       interval: 5s

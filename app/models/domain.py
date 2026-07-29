@@ -134,13 +134,17 @@ class Planta(TenantBase, table=True):
 class Linea(TenantBase, table=True):
     __tablename__ = "dim_lineas"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    # NOTA: sigue Optional a nivel Python durante la migración expand (C1);
-    # el NOT NULL real se impone en Postgres recién tras el saneamiento de huérfanos.
-    planta_id: Optional[uuid.UUID] = Field(default=None, foreign_key="plantas.id")
+    # NOT NULL: la migración C1 sanea huérfanos con "Planta Default" antes de imponerlo.
+    planta_id: uuid.UUID = Field(foreign_key="plantas.id")
     nombre: str
 
     # Tipado estricto OS Shell
-    modo_asignacion_operarios: ModoAsignacionOperarios = Field(default=ModoAsignacionOperarios.MANUAL)
+    # (values_callable: el tipo Postgres 'modoasignacionoperarios' guarda valores en
+    # minúscula; sin esto SQLAlchemy manda el .name del enum y falla el INSERT)
+    modo_asignacion_operarios: ModoAsignacionOperarios = Field(
+        default=ModoAsignacionOperarios.MANUAL,
+        sa_column=Column(SaEnum(ModoAsignacionOperarios, values_callable=lambda obj: [e.value for e in obj]))
+    )
     tipo_produccion: TipoProduccion = Field(default=TipoProduccion.DISCRETA)
     metodo_calidad: MetodoCalidadLinea = Field(default=MetodoCalidadLinea.POR_RECHAZO)
     activo: bool = Field(default=True)
@@ -167,14 +171,17 @@ class Estacion(TenantBase, table=True):
     ramal: str = Field(default="Principal", description="Ej: Principal, Ramal A, Ramal B")
     
     parent_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_estaciones.id")
-    # NOTA: sigue Optional a nivel Python durante la migración expand (C1);
-    # el NOT NULL real se impone en Postgres recién tras el saneamiento de huérfanos.
-    linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
+    # NOT NULL: la migración C1 sanea huérfanos con "Línea Default" antes de imponerlo.
+    linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
 
     codigo_plc: Optional[str] = Field(default=None, index=True)
     
     # Tipado estricto con soporte de Herencia OS Shell
-    modo_asignacion_operarios: ModoAsignacionOperariosEstacion = Field(default=ModoAsignacionOperariosEstacion.HEREDAR)
+    # (values_callable: mismo motivo que en Linea.modo_asignacion_operarios)
+    modo_asignacion_operarios: ModoAsignacionOperariosEstacion = Field(
+        default=ModoAsignacionOperariosEstacion.HEREDAR,
+        sa_column=Column(SaEnum(ModoAsignacionOperariosEstacion, values_callable=lambda obj: [e.value for e in obj]))
+    )
 
     # Estado en Vivo
     orden_activa_fk: Optional[str] = Field(default=None, description="La OP que se está corriendo ahora")
