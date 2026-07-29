@@ -157,6 +157,44 @@ def listar_usuarios_tenant(
         } for u in usuarios
     ]
 
+@router.get("/mi-empresa/usuarios/{auth0_id_target}", response_model=dict)
+def obtener_usuario_tenant(
+    auth0_id_target: str,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.SUPERVISOR]:
+        raise HTTPException(status_code=403, detail="No tienes permisos para ver usuarios.")
+
+    u = db.exec(select(UsuarioSaaS).where(
+        UsuarioSaaS.auth0_id == auth0_id_target, UsuarioSaaS.tenant_id == context.tenant_id
+    )).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    if usuario_actual.rol == RolUsuario.SUPERVISOR and u.rol not in (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN):
+        # Mismo alcance geolocalizado que el listado (Fase D.3): sólo si comparten planta.
+        comparten_planta = db.exec(
+            select(UsuarioPlanta).where(
+                UsuarioPlanta.usuario_id == usuario_actual.id,
+                UsuarioPlanta.activo == True,  # noqa: E712
+                UsuarioPlanta.planta_id.in_(
+                    select(UsuarioPlanta.planta_id).where(
+                        UsuarioPlanta.usuario_id == u.id, UsuarioPlanta.activo == True  # noqa: E712
+                    )
+                ),
+            )
+        ).first()
+        if not comparten_planta:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    return {
+        "id": str(u.id), "auth0_id": u.auth0_id, "email": u.email,
+        "nombre": u.nombre, "apellido": u.apellido, "rol": u.rol.value, "activo": u.activo
+    }
+
+
 @router.post("/mi-empresa/usuarios", status_code=status.HTTP_201_CREATED)
 def crear_usuario_tenant(
     payload: UsuarioCreate,
@@ -231,6 +269,30 @@ def crear_tenant_global(datos: TenantCreate, db: Session = Depends(get_session),
     db.refresh(nuevo_tenant)
     return {"mensaje": "Empresa cliente creada exitosamente", "tenant": nuevo_tenant}
 
+@router.get("/superadmin/tenants/{tenant_id}", tags=["SuperAdmin (Global)"])
+def obtener_tenant_global(tenant_id: str, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+    tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    return tenant
+
+@router.patch("/superadmin/tenants/{tenant_id}", tags=["SuperAdmin (Global)"])
+def actualizar_tenant_global(tenant_id: str, payload: TenantUpdate, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    """Actualiza branding/tolerancias de cualquier tenant (no el estado de
+    suspensión, que tiene su propio endpoint dedicado más abajo)."""
+    if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+    tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(tenant, key, value)
+    db.add(tenant)
+    db.commit()
+    db.refresh(tenant)
+    return tenant
+
 @router.patch("/superadmin/tenants/{tenant_id}/estado", tags=["SuperAdmin (Global)"])
 def cambiar_estado_empresa(
     tenant_id: str,
@@ -263,6 +325,14 @@ def cambiar_estado_empresa(
 def listar_todos_los_usuarios_globales(db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
     if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
     return db.exec(select(UsuarioSaaS)).all()
+
+@router.get("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
+def obtener_usuario_global(auth0_id: str, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+    usuario = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    return usuario
 
 @router.post("/superadmin/usuarios", status_code=status.HTTP_201_CREATED)
 def crear_usuario_b2b(nuevo_usuario: NuevoUsuarioSaaS, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
@@ -297,14 +367,18 @@ def actualizar_usuario_global(auth0_id: str, payload: UsuarioGlobalUpdate, db: S
 
 @router.delete("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
 def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
+    """Baja lógica (activo=False). Antes era DELETE físico -- violaba "cero
+    hard-deletes" y rompía la trazabilidad de auditoría/creaciones/eventos
+    asociados a ese usuario; corregido."""
     if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
     usuario_target = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
     if not usuario_target: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if usuario_actual.auth0_id == auth0_id: raise HTTPException(status_code=400, detail="Operación suicida bloqueada.")
 
-    db.delete(usuario_target)
+    usuario_target.activo = False
+    db.add(usuario_target)
     db.commit()
-    return {"mensaje": "Usuario eliminado físicamente de la base de datos."}
+    return {"mensaje": "Usuario desactivado."}
 
 
 # ==========================================

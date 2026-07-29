@@ -40,11 +40,36 @@ Recomendación: en `dev`/`prod` con datos reales, preferir **roll-forward**
 (corregir hacia adelante con una nueva migración) antes que downgrade,
 salvo que se confirme que ninguna fila real depende de lo agregado.
 
-## Fase C2 (contract) — no incluida en este PR
+## Migraciones D.1 y E2 — mismo criterio, expand puro
 
-Este PR es sólo C1 (expand). La fase C2 (retirar `codigo_sku`/`id_orden`
-como PK, retirar columnas legacy, retirar `es_retrabajo`) todavía no
-existe. No hay nada que revertir de C2 porque no se implementó.
+```bash
+python -m alembic downgrade d40754a1ed06   # revierte E2 (tiempo_ideal_seg)
+python -m alembic downgrade 9261c6f3fe42   # revierte también D.1 y C1
+```
+
+- `c941d511ae50` (D.1): elimina `usuario_planta.activo` y su índice único
+  parcial. Si ya hay asignaciones usuario-planta reales cargadas, revisar
+  antes: el downgrade no borra las filas de `usuario_planta`, sólo la
+  columna `activo` (quedan sin forma de distinguir activas/inactivas hasta
+  volver a migrar).
+- `3dfb6eb20b53` (E2): elimina `lite_eventos_produccion.tiempo_ideal_seg`.
+  Sin esta columna, el motor OEE (`analytics.py`) rompe al calcular
+  Rendimiento — hacer downgrade de esta migración implica también revertir
+  el código de Fase E2, no sólo el esquema.
+
+## Fase C2 (contract) — no incluida en esta tanda
+
+La fase C2 (retirar `codigo_sku`/`id_orden` como PK, retirar columnas
+legacy, retirar `es_retrabajo`) todavía no existe. No hay nada que
+revertir de C2 porque no se implementó.
+
+## CI/CD — riesgo nuevo a tener en cuenta
+
+Desde Fase D en adelante, `.github/workflows/deploy-dev.yml` corre la
+migración **automáticamente** contra Cloud SQL real en cada push a `dev`
+(o `workflow_dispatch`). Si un rollback de código implica también revertir
+el esquema, hacerlo manualmente con los comandos de arriba **antes** de
+que el próximo deploy automático vuelva a intentar migrar hacia adelante.
 
 ## Checklist antes de mergear a `dev`
 
@@ -55,7 +80,11 @@ existe. No hay nada que revertir de C2 porque no se implementó.
       ver `app/core/auth.py`).
 - [ ] `CORS_ORIGINS` confirmado con los orígenes reales del frontend, o
       se acepta el fallback permisivo de transición (loguea warning).
-- [ ] Migración corrida contra Cloud SQL real con el proxy, evidencia
-      guardada (conteos de saneamiento impresos).
+- [ ] Secret de GitHub `DEV_DATABASE_URL_TCP` configurado (necesario para
+      que la migración automática de CI funcione).
 - [ ] Login real probado post-deploy (usuario normal + superadmin).
 - [ ] `/health/ready` del servicio responde 200 post-deploy.
+- [ ] Supervisores/operarios reales asignados a su planta vía
+      `POST /accesos/mi-empresa/usuario-planta` **antes** de que prueben
+      las pantallas operativas (si no, van a recibir 403 nuevos — ver
+      `docs/CAMBIOS_FRONTEND_REQUERIDOS.md`).

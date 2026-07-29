@@ -381,3 +381,10 @@ class LiteEventoProduccion(TenantBase, table=True):
     # Snapshot inmutable: incluido_oee = estacion.activa al momento del evento.
     # No se recalcula si la estación cambia de estado después.
     incluido_oee: bool = Field(default=True)
+
+    # Snapshot inmutable (Fase E2): tiempo ideal POR UNIDAD usado al momento
+    # del escaneo (umbral del SKU activo si había uno, si no el de la
+    # estación). Necesario porque estacion.sku_activo_fk es mutable y no
+    # podemos saber retroactivamente qué SKU corría al momento de un evento
+    # pasado. tiempo_ideal_evento = tiempo_ideal_seg * unidades_procesadas.
+    tiempo_ideal_seg: float = Field(default=0.0)

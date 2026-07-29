@@ -6,12 +6,11 @@ from datetime import time
 import uuid
 import pandas as pd
 import io
-from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.models.domain import (
-    Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion, 
+    Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS
 )
 
@@ -26,6 +25,12 @@ def requerir_gerencia(usuario: UsuarioSaaS = Depends(get_usuario_actual)):
         raise HTTPException(status_code=403, detail="Acceso denegado. Requiere privilegios de Gerencia.")
     return usuario
 
+
+def _requerir_permiso_inactivos(incluir_inactivos: bool, usuario: UsuarioSaaS):
+    """GET normal excluye inactivos; incluir_inactivos=true sólo Gerencia/SuperAdmin."""
+    if incluir_inactivos and usuario.rol not in (RolUsuario.SUPERADMIN, RolUsuario.GERENCIA):
+        raise HTTPException(status_code=403, detail="Sólo Gerencia o SuperAdmin pueden ver registros inactivos.")
+
 # ==========================================
 # 📦 SCHEMAS SEGUROS (Evitan inyección de IDs)
 # ==========================================
@@ -33,6 +38,13 @@ class LineaCreate(BaseModel):
     nombre: str
     planta_id: uuid.UUID
     modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = ModoAsignacionOperarios.MANUAL
+
+class LineaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = None
+    tipo_produccion: Optional[str] = None
+    metodo_calidad: Optional[str] = None
+    activo: Optional[bool] = None
 
 class EstacionCreate(BaseModel):
     nombre: str
@@ -62,6 +74,11 @@ class MotivoParadaCreate(BaseModel):
     nombre: str
     tipo_parada: TipoParada
 
+class MotivoParadaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    tipo_parada: Optional[TipoParada] = None
+    activo: Optional[bool] = None
+
 class TurnoCreate(BaseModel):
     nombre: str
     hora_inicio: time
@@ -69,14 +86,21 @@ class TurnoCreate(BaseModel):
     descanso_minutos: int = 0
     linea_id: Optional[uuid.UUID] = None
 
+class TurnoUpdate(BaseModel):
+    nombre: Optional[str] = None
+    hora_inicio: Optional[time] = None
+    hora_fin: Optional[time] = None
+    descanso_minutos: Optional[int] = None
+    activo: Optional[bool] = None
+
 
 # ==========================================
 # 🏭 ABM DE LÍNEAS (Con Validación Cross-Tenant)
 # ==========================================
 @router.post("/lineas/", response_model=Linea, status_code=status.HTTP_201_CREATED)
 def crear_linea(
-    payload: LineaCreate, 
-    db: Session = Depends(get_session), 
+    payload: LineaCreate,
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
@@ -92,8 +116,63 @@ def crear_linea(
     return nueva_linea
 
 @router.get("/lineas/", response_model=List[Linea])
-def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
-    return db.exec(select(Linea).where(Linea.tenant_id == context.tenant_id)).all()
+def obtener_lineas(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(Linea).where(Linea.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(Linea.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+@router.get("/lineas/{linea_id}", response_model=Linea)
+def obtener_linea(
+    linea_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    linea = db.exec(select(Linea).where(Linea.id == linea_id, Linea.tenant_id == context.tenant_id)).first()
+    if not linea:
+        raise HTTPException(status_code=404, detail="Línea no encontrada.")
+    return linea
+
+@router.patch("/lineas/{linea_id}", response_model=Linea)
+def actualizar_linea(
+    linea_id: uuid.UUID,
+    payload: LineaUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    linea = db.exec(select(Linea).where(Linea.id == linea_id, Linea.tenant_id == context.tenant_id)).first()
+    if not linea:
+        raise HTTPException(status_code=404, detail="Línea no encontrada.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(linea, key, value)
+    db.add(linea)
+    db.commit()
+    db.refresh(linea)
+    return linea
+
+@router.delete("/lineas/{linea_id}")
+def desactivar_linea(
+    linea_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    """Baja lógica. Nunca hard-delete: hay estaciones y eventos históricos que dependen de esta línea."""
+    linea = db.exec(select(Linea).where(Linea.id == linea_id, Linea.tenant_id == context.tenant_id)).first()
+    if not linea:
+        raise HTTPException(status_code=404, detail="Línea no encontrada.")
+    linea.activo = False
+    db.add(linea)
+    db.commit()
+    return {"mensaje": "Línea desactivada."}
 
 
 # ==========================================
@@ -101,8 +180,8 @@ def obtener_lineas(db: Session = Depends(get_session), context: TenantContext = 
 # ==========================================
 @router.post("/estaciones/", response_model=Estacion, status_code=status.HTTP_201_CREATED)
 def crear_estacion(
-    payload: EstacionCreate, 
-    db: Session = Depends(get_session), 
+    payload: EstacionCreate,
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
@@ -117,8 +196,28 @@ def crear_estacion(
     return nueva_estacion
 
 @router.get("/estaciones/", response_model=List[Estacion])
-def obtener_estaciones(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
-    return db.exec(select(Estacion).where(Estacion.tenant_id == context.tenant_id)).all()
+def obtener_estaciones(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(Estacion).where(Estacion.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(Estacion.activa == True)  # noqa: E712
+    return db.exec(query).all()
+
+@router.get("/estaciones/{estacion_id}", response_model=Estacion)
+def obtener_estacion(
+    estacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion:
+        raise HTTPException(status_code=404, detail="Estación no encontrada.")
+    return estacion
 
 @router.patch("/estaciones/{estacion_id}", response_model=Estacion)
 def actualizar_estacion(
@@ -130,10 +229,10 @@ def actualizar_estacion(
 ):
     estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
     if not estacion_db: raise HTTPException(status_code=404, detail="Estación no encontrada")
-    
-    update_data = payload.model_dump(exclude_unset=True) 
+
+    update_data = payload.model_dump(exclude_unset=True)
     for key, value in update_data.items(): setattr(estacion_db, key, value)
-        
+
     db.add(estacion_db)
     db.commit()
     db.refresh(estacion_db)
@@ -141,20 +240,20 @@ def actualizar_estacion(
 
 @router.delete("/estaciones/{estacion_id}")
 def eliminar_estacion(
-    estacion_id: uuid.UUID, 
-    db: Session = Depends(get_session), 
+    estacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
+    """Baja lógica (activa=False). Antes era DELETE físico (con un try/except
+    IntegrityError como único freno) -- violaba "cero hard-deletes"; corregido."""
     estacion_db = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
     if not estacion_db: raise HTTPException(status_code=404, detail="Estación no encontrada")
-    try:
-        db.delete(estacion_db)
-        db.commit()
-        return {"mensaje": "Estación eliminada"}
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="No se puede eliminar la estación porque tiene escaneos o paradas asociadas.")
+
+    estacion_db.activa = False
+    db.add(estacion_db)
+    db.commit()
+    return {"mensaje": "Estación desactivada."}
 
 
 # ==========================================
@@ -162,8 +261,8 @@ def eliminar_estacion(
 # ==========================================
 @router.post("/motivos-parada/", response_model=MotivoParada, status_code=status.HTTP_201_CREATED)
 def crear_motivo_parada(
-    payload: MotivoParadaCreate, 
-    db: Session = Depends(get_session), 
+    payload: MotivoParadaCreate,
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
@@ -174,8 +273,62 @@ def crear_motivo_parada(
     return nuevo_motivo
 
 @router.get("/motivos-parada/", response_model=List[MotivoParada])
-def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
-    return db.exec(select(MotivoParada).where(MotivoParada.tenant_id == context.tenant_id)).all()
+def obtener_motivos_parada(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(MotivoParada).where(MotivoParada.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(MotivoParada.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+@router.get("/motivos-parada/{motivo_id}", response_model=MotivoParada)
+def obtener_motivo_parada(
+    motivo_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    motivo = db.exec(select(MotivoParada).where(MotivoParada.id == motivo_id, MotivoParada.tenant_id == context.tenant_id)).first()
+    if not motivo:
+        raise HTTPException(status_code=404, detail="Motivo no encontrado.")
+    return motivo
+
+@router.patch("/motivos-parada/{motivo_id}", response_model=MotivoParada)
+def actualizar_motivo_parada(
+    motivo_id: uuid.UUID,
+    payload: MotivoParadaUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    motivo = db.exec(select(MotivoParada).where(MotivoParada.id == motivo_id, MotivoParada.tenant_id == context.tenant_id)).first()
+    if not motivo:
+        raise HTTPException(status_code=404, detail="Motivo no encontrado.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(motivo, key, value)
+    db.add(motivo)
+    db.commit()
+    db.refresh(motivo)
+    return motivo
+
+@router.delete("/motivos-parada/{motivo_id}")
+def desactivar_motivo_parada(
+    motivo_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    motivo = db.exec(select(MotivoParada).where(MotivoParada.id == motivo_id, MotivoParada.tenant_id == context.tenant_id)).first()
+    if not motivo:
+        raise HTTPException(status_code=404, detail="Motivo no encontrado.")
+    motivo.activo = False
+    db.add(motivo)
+    db.commit()
+    return {"mensaje": "Motivo de parada desactivado."}
 
 
 # ==========================================
@@ -183,11 +336,16 @@ def obtener_motivos_parada(db: Session = Depends(get_session), context: TenantCo
 # ==========================================
 @router.post("/turnos/", response_model=Turno, status_code=status.HTTP_201_CREATED)
 def crear_turno(
-    payload: TurnoCreate, 
-    db: Session = Depends(get_session), 
+    payload: TurnoCreate,
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
+    if payload.linea_id:
+        linea_db = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea_db:
+            raise HTTPException(status_code=400, detail="Línea inválida o de otra organización.")
+
     nuevo_turno = Turno(tenant_id=context.tenant_id, **payload.model_dump())
     db.add(nuevo_turno)
     db.commit()
@@ -196,13 +354,63 @@ def crear_turno(
 
 @router.get("/turnos/", response_model=List[Turno])
 def obtener_turnos(
-    linea_id: Optional[uuid.UUID] = None, 
+    linea_id: Optional[uuid.UUID] = None,
+    incluir_inactivos: bool = False,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant_humano)
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(Turno).where(Turno.tenant_id == context.tenant_id)
     if linea_id: query = query.where(Turno.linea_id == linea_id)
+    if not incluir_inactivos:
+        query = query.where(Turno.activo == True)  # noqa: E712
     return db.exec(query).all()
+
+@router.get("/turnos/{turno_id}", response_model=Turno)
+def obtener_turno(
+    turno_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    turno = db.exec(select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)).first()
+    if not turno:
+        raise HTTPException(status_code=404, detail="Turno no encontrado.")
+    return turno
+
+@router.patch("/turnos/{turno_id}", response_model=Turno)
+def actualizar_turno(
+    turno_id: uuid.UUID,
+    payload: TurnoUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    turno = db.exec(select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)).first()
+    if not turno:
+        raise HTTPException(status_code=404, detail="Turno no encontrado.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(turno, key, value)
+    db.add(turno)
+    db.commit()
+    db.refresh(turno)
+    return turno
+
+@router.delete("/turnos/{turno_id}")
+def desactivar_turno(
+    turno_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    turno = db.exec(select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)).first()
+    if not turno:
+        raise HTTPException(status_code=404, detail="Turno no encontrado.")
+    turno.activo = False
+    db.add(turno)
+    db.commit()
+    return {"mensaje": "Turno desactivado."}
 
 
 # ==========================================
@@ -210,29 +418,29 @@ def obtener_turnos(
 # ==========================================
 @router.post("/erp/skus/bulk", tags=["Integración ERP"])
 async def importar_skus_csv(
-    file: UploadFile = File(...), 
-    db: Session = Depends(get_session), 
+    file: UploadFile = File(...),
+    db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
     """Importa o actualiza el Maestro de SKUs desde un CSV (codigo_sku, descripcion, tiempo_ciclo_teorico)."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Debe ser un archivo CSV")
-    
+
     contenido = await file.read()
     try:
         df = pd.read_csv(io.BytesIO(contenido))
         requeridos = {'codigo_sku', 'descripcion', 'tiempo_ciclo_teorico'}
         if not requeridos.issubset(df.columns):
             raise ValueError(f"Faltan columnas requeridas: {requeridos - set(df.columns)}")
-            
+
         skus_procesados = 0
         for _, row in df.iterrows():
             sku_db = db.exec(select(MaestroSKU).where(
-                MaestroSKU.codigo_sku == str(row['codigo_sku']), 
+                MaestroSKU.codigo_sku == str(row['codigo_sku']),
                 MaestroSKU.tenant_id == context.tenant_id
             )).first()
-            
+
             if sku_db:
                 sku_db.descripcion = str(row['descripcion'])
                 sku_db.tiempo_ciclo_teorico = float(row['tiempo_ciclo_teorico'])
@@ -245,15 +453,188 @@ async def importar_skus_csv(
                 )
                 db.add(nuevo_sku)
             skus_procesados += 1
-            
+
         db.commit()
         return {"mensaje": f"Se procesaron {skus_procesados} SKUs correctamente."}
-        
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"Error procesando CSV: {str(e)}")
 
 
 @router.get("/erp/skus", response_model=List[MaestroSKU], tags=["Integración ERP"])
-def listar_skus(db: Session = Depends(get_session), context: TenantContext = Depends(obtener_contexto_tenant_humano)):
-    return db.exec(select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id)).all()
+def listar_skus(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(MaestroSKU.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+
+@router.get("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
+def obtener_sku(
+    codigo_sku: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU no encontrado.")
+    return sku
+
+
+@router.patch("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
+def actualizar_sku(
+    codigo_sku: str,
+    activo: Optional[bool] = None,
+    descripcion: Optional[str] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU no encontrado.")
+    if activo is not None:
+        sku.activo = activo
+    if descripcion is not None:
+        sku.descripcion = descripcion
+    db.add(sku)
+    db.commit()
+    db.refresh(sku)
+    return sku
+
+
+# ==========================================
+# 📋 ABM DE ÓRDENES DE PRODUCCIÓN
+# Antes no existía ningún CRUD vivo (el único código que las manejaba,
+# app/routers/erp.py, no está registrado en main.py -- código muerto).
+# id_orden sigue como PK legacy hasta la fase contract (C2).
+# ==========================================
+class OrdenProduccionCreate(BaseModel):
+    id_orden: str
+    sku_fk: Optional[str] = None
+    linea_id: Optional[uuid.UUID] = None
+    cantidad_esperada: int = 0
+    plan_fecha: Optional[str] = None
+    origen: str = "UI"
+
+class OrdenProduccionUpdate(BaseModel):
+    sku_fk: Optional[str] = None
+    linea_id: Optional[uuid.UUID] = None
+    cantidad_esperada: Optional[int] = None
+    cantidad_producida: Optional[int] = None
+    plan_fecha: Optional[str] = None
+    estado: Optional[str] = None
+    activo: Optional[bool] = None
+
+
+@router.post("/ordenes/", response_model=OrdenProduccion, status_code=status.HTTP_201_CREATED)
+def crear_orden(
+    payload: OrdenProduccionCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    existente = db.exec(
+        select(OrdenProduccion).where(
+            OrdenProduccion.tenant_id == context.tenant_id,
+            OrdenProduccion.id_orden == payload.id_orden,
+            OrdenProduccion.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail=f"Ya existe una orden activa con id_orden '{payload.id_orden}'.")
+
+    if payload.sku_fk:
+        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == payload.sku_fk, MaestroSKU.tenant_id == context.tenant_id)).first()
+        if not sku:
+            raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    if payload.linea_id:
+        linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+
+    nueva = OrdenProduccion(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nueva)
+    db.commit()
+    db.refresh(nueva)
+    return nueva
+
+
+@router.get("/ordenes/", response_model=List[OrdenProduccion])
+def listar_ordenes(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(OrdenProduccion).where(OrdenProduccion.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(OrdenProduccion.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+
+@router.get("/ordenes/{id_orden}", response_model=OrdenProduccion)
+def obtener_orden(
+    id_orden: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+    return orden
+
+
+@router.patch("/ordenes/{id_orden}", response_model=OrdenProduccion)
+def actualizar_orden(
+    id_orden: str,
+    payload: OrdenProduccionUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+
+    datos = payload.model_dump(exclude_unset=True)
+    if "linea_id" in datos and datos["linea_id"]:
+        linea = db.exec(select(Linea).where(Linea.id == datos["linea_id"], Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+    if "sku_fk" in datos and datos["sku_fk"]:
+        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == datos["sku_fk"], MaestroSKU.tenant_id == context.tenant_id)).first()
+        if not sku:
+            raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    for key, value in datos.items():
+        setattr(orden, key, value)
+    db.add(orden)
+    db.commit()
+    db.refresh(orden)
+    return orden
+
+
+@router.delete("/ordenes/{id_orden}")
+def desactivar_orden(
+    id_orden: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+    orden.activo = False
+    db.add(orden)
+    db.commit()
+    return {"mensaje": "Orden desactivada."}
