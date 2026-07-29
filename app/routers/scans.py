@@ -1,25 +1,78 @@
+import hashlib
+import json
+import logging
 import re
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from sqlmodel import Session, select
-from datetime import datetime, timezone, date
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 import uuid
 
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.models.domain import (
-    Estacion, Linea, MaestroSKU, Tenant,
+    Estacion, Linea, MaestroSKU, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
-    ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno
+    ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
+    Maquina, MaquinaEstacion
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/lite", tags=["Ingesta de Datos (Terminales y PLC)"])
 
+TOLERANCIA_FUTURO = timedelta(minutes=5)
+TOLERANCIA_ANTIGUEDAD = timedelta(days=7)
+TIMEZONE_DEFAULT = "America/Buenos_Aires"
+
+
 class ScanRequest(BaseModel):
+    event_id: uuid.UUID = Field(..., description="UUIDv4 estable generado por el emisor, para idempotencia (Fase E1)")
     id_estacion: uuid.UUID = Field(..., description="UUID de la estación o máquina")
     codigo_pieza: Optional[str] = Field(None, description="Código de barras escaneado o nulo si es PLC")
     timestamp: Optional[datetime] = None
+    maquina_id: Optional[uuid.UUID] = Field(None, description="Máquina física, si el hardware la reporta")
+
+
+def _normalizar_timestamp_utc(ts: Optional[datetime], planta_timezone: Optional[str]) -> datetime:
+    """Persistimos siempre UTC naive. Si el timestamp viene naive (sin offset),
+    se interpreta en el timezone de la planta; si trae offset, se convierte."""
+    if ts is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if ts.tzinfo is None:
+        try:
+            tz = ZoneInfo(planta_timezone or TIMEZONE_DEFAULT)
+        except Exception:
+            tz = ZoneInfo(TIMEZONE_DEFAULT)
+        ts_utc = ts.replace(tzinfo=tz).astimezone(timezone.utc)
+    else:
+        ts_utc = ts.astimezone(timezone.utc)
+
+    return ts_utc.replace(tzinfo=None)
+
+
+def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:
+    ahora = datetime.now(timezone.utc).replace(tzinfo=None)
+    if ts_utc_naive > ahora + TOLERANCIA_FUTURO:
+        raise HTTPException(status_code=400, detail="Timestamp más de 5 minutos en el futuro; rechazado.")
+    if ts_utc_naive < ahora - TOLERANCIA_ANTIGUEDAD:
+        raise HTTPException(status_code=400, detail="Timestamp con más de 7 días de antigüedad; rechazado.")
+
+
+def _calcular_payload_hash(scan: ScanRequest) -> str:
+    """Hash canónico de los campos relevantes del payload (Fase E1, idempotencia)."""
+    canonico = {
+        "id_estacion": str(scan.id_estacion),
+        "codigo_pieza": scan.codigo_pieza,
+        "timestamp": scan.timestamp.isoformat() if scan.timestamp else None,
+        "maquina_id": str(scan.maquina_id) if scan.maquina_id else None,
+    }
+    payload_json = json.dumps(canonico, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
 @router.get("/estaciones/{estacion_id}/validar", response_model=Dict[str, Any])
 def validar_estacion_terminal(
@@ -67,8 +120,25 @@ def registrar_escaneo_rapido(
     if not estacion:
         raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
 
+    # 0. IDEMPOTENCIA (Fase E1): mismo event_id + mismo hash -> 200 con el
+    # evento existente, sin duplicar. Mismo event_id + hash distinto -> 409.
+    payload_hash = _calcular_payload_hash(scan)
+    evento_existente = db.exec(
+        select(LiteEventoProduccion).where(LiteEventoProduccion.event_id == scan.event_id)
+    ).first()
+    if evento_existente:
+        if evento_existente.payload_hash == payload_hash:
+            # HANDOFF: mismo event_id + mismo hash -> 200 (no 201, no se crea nada nuevo).
+            return JSONResponse(status_code=status.HTTP_200_OK, content={
+                "status": "ok", "evento_id": str(evento_existente.id),
+                "unidades": evento_existente.unidades_procesadas, "desempeno": evento_existente.estado,
+                "idempotente": True,
+            })
+        raise HTTPException(status_code=409, detail="event_id ya usado con un payload diferente.")
+
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
     tenant_config = db.get(Tenant, dispositivo.tenant_id)
+    planta = db.get(Planta, linea.planta_id) if linea else None
 
     # 1. RESOLUCIÓN DE TRAZABILIDAD (Regex Dinámico vs PLC Ciego)[cite: 14]
     orden_final = estacion.orden_activa_fk
@@ -98,7 +168,10 @@ def registrar_escaneo_rapido(
             t_alerta = t_optimo * (tenant_config.tolerancia_alerta_pct if tenant_config else 1.25)
 
     # 3. CÁLCULO OEE DEDUCTIVO (Time-Based DTR)
-    evento_timestamp = scan.timestamp or datetime.now(timezone.utc).replace(tzinfo=None)
+    # Timezone (Fase E1): timestamp naive se interpreta con el timezone de la
+    # planta; con offset se convierte. Siempre se persiste UTC naive.
+    evento_timestamp = _normalizar_timestamp_utc(scan.timestamp, planta.timezone if planta else None)
+    _validar_rango_timestamp(evento_timestamp)
     delta_t_segundos = 0.0
     desempeno = "OPTIMO"
 
@@ -129,19 +202,47 @@ def registrar_escaneo_rapido(
         elif delta_t_segundos > t_lento:
             desempeno = "LENTO"
 
+    # 3.5 MÁQUINA (Fase E1): si el hardware informa una máquina no asociada a
+    # la estación, se acepta el evento igual con maquina_id=NULL + warning
+    # estructurado (nunca se rechaza el evento por esto).
+    maquina_id_final = None
+    if scan.maquina_id:
+        asociacion = db.exec(
+            select(MaquinaEstacion).where(
+                MaquinaEstacion.maquina_id == scan.maquina_id,
+                MaquinaEstacion.estacion_id == estacion.id,
+                MaquinaEstacion.tenant_id == dispositivo.tenant_id,
+                MaquinaEstacion.activo == True,  # noqa: E712
+            )
+        ).first()
+        if asociacion:
+            maquina_id_final = scan.maquina_id
+        else:
+            logger.warning(
+                "maquina_id inconsistente: %s no está asociada a la estación %s (tenant %s). "
+                "Evento aceptado con maquina_id=NULL.",
+                scan.maquina_id, estacion.id, dispositivo.tenant_id,
+            )
+
     # 4. Persistencia Edge-Priority[cite: 14]
     nuevo_evento = LiteEventoProduccion(
         tenant_id=dispositivo.tenant_id,
         id_estacion=str(estacion.id),
         codigo_pieza=scan.codigo_pieza,
         orden_fk=orden_final,
-        cantidad_producida=1, 
+        cantidad_producida=1,
         unidades_procesadas=unidades_a_sumar, # Multiplicador guardado inmutable
         timestamp=evento_timestamp,
         delta_t_segundos=delta_t_segundos,
-        estado=desempeno
+        estado=desempeno,
+        maquina_id=maquina_id_final,
+        event_id=scan.event_id,
+        payload_hash=payload_hash,
+        # Snapshot inmutable (Fase E1): refleja el estado de la estación en
+        # el momento del evento; no se recalcula si la estación cambia después.
+        incluido_oee=estacion.activa,
     )
-    
+
     db.add(nuevo_evento)
     db.commit()
 
@@ -157,8 +258,10 @@ class OperarioLoginRequest(BaseModel):
         ...,
         description=(
             "Turno vigente. Se pide explícito y no se auto-resuelve por hora: "
-            "resolverlo correctamente requiere timezone de planta (Fase E1, "
-            "todavía no implementada)."
+            "aunque Fase E1 ya normaliza timestamps con timezone de planta, "
+            "auto-resolver 'qué turno corresponde ahora' (turnos nocturnos que "
+            "cruzan medianoche, empates en los bordes) es una decisión de "
+            "producto aparte, no incluida todavía."
         ),
     )
 
