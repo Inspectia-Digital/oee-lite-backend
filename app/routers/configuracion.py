@@ -476,6 +476,18 @@ def listar_skus(
     return db.exec(query).all()
 
 
+@router.get("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
+def obtener_sku(
+    codigo_sku: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU no encontrado.")
+    return sku
+
+
 @router.patch("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
 def actualizar_sku(
     codigo_sku: str,
@@ -496,3 +508,133 @@ def actualizar_sku(
     db.commit()
     db.refresh(sku)
     return sku
+
+
+# ==========================================
+# 📋 ABM DE ÓRDENES DE PRODUCCIÓN
+# Antes no existía ningún CRUD vivo (el único código que las manejaba,
+# app/routers/erp.py, no está registrado en main.py -- código muerto).
+# id_orden sigue como PK legacy hasta la fase contract (C2).
+# ==========================================
+class OrdenProduccionCreate(BaseModel):
+    id_orden: str
+    sku_fk: Optional[str] = None
+    linea_id: Optional[uuid.UUID] = None
+    cantidad_esperada: int = 0
+    plan_fecha: Optional[str] = None
+    origen: str = "UI"
+
+class OrdenProduccionUpdate(BaseModel):
+    sku_fk: Optional[str] = None
+    linea_id: Optional[uuid.UUID] = None
+    cantidad_esperada: Optional[int] = None
+    cantidad_producida: Optional[int] = None
+    plan_fecha: Optional[str] = None
+    estado: Optional[str] = None
+    activo: Optional[bool] = None
+
+
+@router.post("/ordenes/", response_model=OrdenProduccion, status_code=status.HTTP_201_CREATED)
+def crear_orden(
+    payload: OrdenProduccionCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    existente = db.exec(
+        select(OrdenProduccion).where(
+            OrdenProduccion.tenant_id == context.tenant_id,
+            OrdenProduccion.id_orden == payload.id_orden,
+            OrdenProduccion.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail=f"Ya existe una orden activa con id_orden '{payload.id_orden}'.")
+
+    if payload.sku_fk:
+        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == payload.sku_fk, MaestroSKU.tenant_id == context.tenant_id)).first()
+        if not sku:
+            raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    if payload.linea_id:
+        linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+
+    nueva = OrdenProduccion(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nueva)
+    db.commit()
+    db.refresh(nueva)
+    return nueva
+
+
+@router.get("/ordenes/", response_model=List[OrdenProduccion])
+def listar_ordenes(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(OrdenProduccion).where(OrdenProduccion.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(OrdenProduccion.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+
+@router.get("/ordenes/{id_orden}", response_model=OrdenProduccion)
+def obtener_orden(
+    id_orden: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+    return orden
+
+
+@router.patch("/ordenes/{id_orden}", response_model=OrdenProduccion)
+def actualizar_orden(
+    id_orden: str,
+    payload: OrdenProduccionUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+
+    datos = payload.model_dump(exclude_unset=True)
+    if "linea_id" in datos and datos["linea_id"]:
+        linea = db.exec(select(Linea).where(Linea.id == datos["linea_id"], Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+    if "sku_fk" in datos and datos["sku_fk"]:
+        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == datos["sku_fk"], MaestroSKU.tenant_id == context.tenant_id)).first()
+        if not sku:
+            raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    for key, value in datos.items():
+        setattr(orden, key, value)
+    db.add(orden)
+    db.commit()
+    db.refresh(orden)
+    return orden
+
+
+@router.delete("/ordenes/{id_orden}")
+def desactivar_orden(
+    id_orden: str,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    orden = db.exec(select(OrdenProduccion).where(OrdenProduccion.id_orden == id_orden, OrdenProduccion.tenant_id == context.tenant_id)).first()
+    if not orden:
+        raise HTTPException(status_code=404, detail="Orden no encontrada.")
+    orden.activo = False
+    db.add(orden)
+    db.commit()
+    return {"mensaje": "Orden desactivada."}
