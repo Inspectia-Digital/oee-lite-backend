@@ -32,10 +32,10 @@ class MetricasEstacion(BaseModel):
 class OeeGeneralCard(BaseModel):
     disponibilidad_pct: float
     rendimiento_pct: float
-    calidad_pct: float
+    calidad_pct: Optional[float] = None  # None = N/A (Fase E2): sin datos de calidad, no se reemplaza por 100% ni 0%.
     oee_general_pct: float
     total_unidades: int
-    unidades_con_retrabajo: int
+    unidades_con_retrabajo: int  # Repurposed (Fase E2): suma de unidades_rechazadas (el estado "RETRABAJO" nunca lo setea el motor real).
     minutos_desvio_calidad: float
 
 class ReporteOperarioSpringwall(BaseModel):
@@ -169,10 +169,44 @@ def obtener_oee_general(
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
+    """
+    Motor OEE (Fase E2). Fórmulas:
+    - Rendimiento = (tiempo_ideal_seg * unidades_procesadas, sumado) / tiempo_operativo.
+      tiempo_ideal_seg es un snapshot inmutable tomado al momento del
+      escaneo (umbral del SKU activo si había uno, si no el de la
+      estación) -- no se puede reconstruir retroactivamente qué SKU
+      corría en un evento pasado, por eso el snapshot.
+    - Disponibilidad = tiempo_operativo / tiempo_planificado_neto. Los
+      "huecos" ya vienen correctamente recortados desde el escaneo
+      (Fase E1/E2 en scans.py): ParadaDetectada.duracion_segundos es el
+      EXCEDENTE sobre la tolerancia, no el delta completo.
+    - Calidad combina dos métodos según Linea.metodo_calidad:
+      POR_RECHAZO (unidades buenas / procesadas) y POR_TIEMPO (unidades
+      dentro del umbral / inspeccionadas, sólo en estaciones tipo
+      "calidad"). Si no hay datos de ningún método, calidad=N/A
+      (None) y se excluye del producto OEE -- nunca se reemplaza por
+      100% ni 0%.
+
+    Limitación conocida y documentada: para Calidad por tiempo, "el
+    umbral SKU prevalece sobre el umbral de estación" está pendiente
+    -- hoy usa siempre estacion.umbral_alerta. Implementarlo bien
+    requeriría otro snapshot inmutable por evento (igual que
+    tiempo_ideal_seg), y hoy ningún dato real ejercita este camino
+    (no hay estaciones tipo "calidad" en los tenants existentes).
+    """
     try:
         validar_planta(context)
+    except ValueError:
+        # Estado legítimo de "sin datos" (no hay planta seleccionada aún),
+        # no es un error interno -- se mantiene la tarjeta vacía.
+        return OeeGeneralCard(
+            disponibilidad_pct=0.0, rendimiento_pct=0.0, calidad_pct=None, oee_general_pct=0.0,
+            total_unidades=0, unidades_con_retrabajo=0, minutos_desvio_calidad=0.0
+        )
+
+    try:
         inicio, fin = obtener_rango_dia(fecha_desde)
-        
+
         query = (
             select(LiteEventoProduccion, Estacion, Linea)
             .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
@@ -181,7 +215,8 @@ def obtener_oee_general(
                 LiteEventoProduccion.tenant_id == context.tenant_id,
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio,
-                LiteEventoProduccion.timestamp <= fin
+                LiteEventoProduccion.timestamp <= fin,
+                LiteEventoProduccion.incluido_oee == True,  # noqa: E712
             )
         )
         if linea_id: query = query.where(Linea.id == linea_id)
@@ -189,13 +224,13 @@ def obtener_oee_general(
 
         if not eventos:
             return OeeGeneralCard(
-                disponibilidad_pct=0.0, rendimiento_pct=0.0, calidad_pct=0.0, oee_general_pct=0.0,
+                disponibilidad_pct=0.0, rendimiento_pct=0.0, calidad_pct=None, oee_general_pct=0.0,
                 total_unidades=0, unidades_con_retrabajo=0, minutos_desvio_calidad=0.0
             )
 
         total_unidades = sum(e.unidades_procesadas for e, _, _ in eventos)
         dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
-        
+
         q_turnos = select(Turno).join(Linea, Turno.linea_id == Linea.id).where(
             Turno.tenant_id == context.tenant_id,
             Linea.planta_id == context.sub_tenant_id
@@ -203,19 +238,19 @@ def obtener_oee_general(
         if linea_id: q_turnos = q_turnos.where(Turno.linea_id == linea_id)
         if turno_id: q_turnos = q_turnos.where(Turno.id == turno_id)
         turnos = db.exec(q_turnos).all()
-        
+
         tiempo_planificado_seg = 0
         for t in turnos:
             inicio_dt = datetime.combine(date.today(), t.hora_inicio)
             fin_dt = datetime.combine(date.today(), t.hora_fin)
-            if fin_dt < inicio_dt: fin_dt += timedelta(days=1) 
-            
+            if fin_dt < inicio_dt: fin_dt += timedelta(days=1)
+
             duracion_turno_seg = (fin_dt - inicio_dt).total_seconds()
             duracion_neta_seg = duracion_turno_seg - (t.descanso_minutos * 60)
             tiempo_planificado_seg += (duracion_neta_seg * dias_consulta)
-            
+
         if tiempo_planificado_seg == 0:
-            tiempo_planificado_seg = 28800 * dias_consulta 
+            tiempo_planificado_seg = 28800 * dias_consulta
 
         q_paradas = (
             select(ParadaDetectada, MotivoParada)
@@ -225,50 +260,75 @@ def obtener_oee_general(
             .where(
                 ParadaDetectada.tenant_id == context.tenant_id,
                 Linea.planta_id == context.sub_tenant_id,
-                ParadaDetectada.inicio >= inicio, 
+                ParadaDetectada.inicio >= inicio,
                 ParadaDetectada.inicio <= fin
             )
         )
         if linea_id: q_paradas = q_paradas.where(Estacion.linea_id == linea_id)
         paradas_db = db.exec(q_paradas).all()
-        
+
         t_paradas_no_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if not m or m.tipo_parada == TipoParada.NO_PLANIFICADA)
         t_paradas_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if m and m.tipo_parada == TipoParada.PLANIFICADA)
-                    
+
         tiempo_planificado_neto = max(1, tiempo_planificado_seg - t_paradas_planificadas)
         tiempo_operativo_seg = max(1, tiempo_planificado_neto - t_paradas_no_planificadas)
-        
+
         disponibilidad = min(tiempo_operativo_seg / tiempo_planificado_neto, 1.0)
 
-        t_ideal_total = sum(est.umbral_optimo for _, est, _ in eventos)
-        rendimiento = min((t_ideal_total / tiempo_operativo_seg) if tiempo_operativo_seg > 0 else 0.0, 1.0)
+        # RENDIMIENTO (Fase E2): tiempo_ideal_seg es snapshot por evento
+        # (umbral SKU si había uno activo), multiplicado por unidades_procesadas.
+        tiempo_ideal_total = sum(e.tiempo_ideal_seg * e.unidades_procesadas for e, _, _ in eventos)
+        rendimiento = min((tiempo_ideal_total / tiempo_operativo_seg) if tiempo_operativo_seg > 0 else 0.0, 1.0)
 
-        eventos_calidad = [(e, est) for e, est, _ in eventos if est.tipo.lower() == "calidad"]
-        retrabajos = sum(e.unidades_procesadas for e, _ in eventos_calidad if e.estado == "RETRABAJO")
-        
-        if len(eventos_calidad) > 0:
-            t_ideal_calidad = sum(est.umbral_optimo for _, est in eventos_calidad)
-            t_real_calidad = sum((e.delta_t_segundos or 0) for e, _ in eventos_calidad)
-            calidad = min((t_ideal_calidad / t_real_calidad) if t_real_calidad > 0 else 1.0, 1.0)
-            minutos_desvio = max(0, t_real_calidad - t_ideal_calidad) / 60
+        # CALIDAD (Fase E2): combina POR_RECHAZO y POR_TIEMPO según
+        # Linea.metodo_calidad de cada evento. Fallback explícito a N/A.
+        unidades_buenas_total = 0
+        unidades_calidad_total = 0
+        total_rechazadas = sum(e.unidades_rechazadas for e, _, _ in eventos)
+
+        for evento, estacion, linea in eventos:
+            if linea.metodo_calidad == "por_rechazo":
+                unidades_calidad_total += evento.unidades_procesadas
+                unidades_buenas_total += (evento.unidades_procesadas - evento.unidades_rechazadas)
+            elif linea.metodo_calidad == "por_tiempo" and estacion.tipo.lower() == "calidad":
+                # Limitación documentada arriba: umbral de estación, no de SKU.
+                umbral_calidad_aplicable = estacion.umbral_alerta
+                unidades_calidad_total += evento.unidades_procesadas
+                if (evento.delta_t_segundos or 0) <= umbral_calidad_aplicable:
+                    unidades_buenas_total += evento.unidades_procesadas
+
+        if unidades_calidad_total > 0:
+            calidad = unidades_buenas_total / unidades_calidad_total
+            calidad_pct = round(calidad * 100, 1)
         else:
-            calidad = 1.0
-            minutos_desvio = 0.0
+            # Sin datos de rechazo ni inspecciones de calidad: N/A, no 100%.
+            calidad = None
+            calidad_pct = None
+
+        minutos_desvio = 0.0  # Ver limitación de calidad-por-tiempo arriba.
+
+        oee_factores = [disponibilidad, rendimiento] + ([calidad] if calidad is not None else [])
+        oee_general = 1.0
+        for f in oee_factores:
+            oee_general *= f
 
         return OeeGeneralCard(
             disponibilidad_pct=round(disponibilidad * 100, 1),
             rendimiento_pct=round(rendimiento * 100, 1),
-            calidad_pct=round(calidad * 100, 1),
-            oee_general_pct=round((disponibilidad * rendimiento * calidad) * 100, 1),
+            calidad_pct=calidad_pct,
+            oee_general_pct=round(oee_general * 100, 1),
             total_unidades=total_unidades,
-            unidades_con_retrabajo=retrabajos,
+            unidades_con_retrabajo=total_rechazadas,
             minutos_desvio_calidad=round(minutos_desvio, 1)
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error OEE General: {e}")
-        return OeeGeneralCard(disponibilidad_pct=0, rendimiento_pct=0, calidad_pct=0, oee_general_pct=0, total_unidades=0, unidades_con_retrabajo=0, minutos_desvio_calidad=0)
+        # Fase E2: un error interno NUNCA debe verse igual que "sin datos".
+        # Antes esto devolvía una tarjeta en cero, indistinguible de un
+        # tenant sin producción -- podía esconder fallas reales del negocio.
+        logger.error(f"Error interno calculando OEE general: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="No se pudo calcular el OEE general en este momento.")
 
 
 @router.get("/analytics/reporte-operarios/", response_model=list[ReporteOperarioSpringwall])

@@ -35,6 +35,7 @@ class ScanRequest(BaseModel):
     codigo_pieza: Optional[str] = Field(None, description="Código de barras escaneado o nulo si es PLC")
     timestamp: Optional[datetime] = None
     maquina_id: Optional[uuid.UUID] = Field(None, description="Máquina física, si el hardware la reporta")
+    unidades_rechazadas: int = Field(0, ge=0, description="Calidad por rechazo (Fase E2): 0 <= rechazadas <= unidades_procesadas")
 
 
 def _normalizar_timestamp_utc(ts: Optional[datetime], planta_timezone: Optional[str]) -> datetime:
@@ -70,6 +71,7 @@ def _calcular_payload_hash(scan: ScanRequest) -> str:
         "codigo_pieza": scan.codigo_pieza,
         "timestamp": scan.timestamp.isoformat() if scan.timestamp else None,
         "maquina_id": str(scan.maquina_id) if scan.maquina_id else None,
+        "unidades_rechazadas": scan.unidades_rechazadas,
     }
     payload_json = json.dumps(canonico, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -167,12 +169,20 @@ def registrar_escaneo_rapido(
             t_lento = t_optimo * (tenant_config.tolerancia_lento_pct if tenant_config else 1.15)
             t_alerta = t_optimo * (tenant_config.tolerancia_alerta_pct if tenant_config else 1.25)
 
+    # 2.5 CALIDAD POR RECHAZO (Fase E2): 0 <= rechazadas <= procesadas.
+    if scan.unidades_rechazadas > unidades_a_sumar:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unidades_rechazadas ({scan.unidades_rechazadas}) no puede superar unidades_procesadas ({unidades_a_sumar}).",
+        )
+
     # 3. CÁLCULO OEE DEDUCTIVO (Time-Based DTR)
     # Timezone (Fase E1): timestamp naive se interpreta con el timezone de la
     # planta; con offset se convierte. Siempre se persiste UTC naive.
     evento_timestamp = _normalizar_timestamp_utc(scan.timestamp, planta.timezone if planta else None)
     _validar_rango_timestamp(evento_timestamp)
     delta_t_segundos = 0.0
+    tiempo_perdido_segundos = 0.0
     desempeno = "OPTIMO"
 
     ultimo_evento = db.exec(
@@ -183,22 +193,27 @@ def registrar_escaneo_rapido(
 
     if ultimo_evento:
         delta_t_segundos = (evento_timestamp - ultimo_evento.timestamp).total_seconds()
-        
+
         if delta_t_segundos > t_alerta:
             desempeno = "ALERTA"
+            # Disponibilidad (Fase E2): sólo el EXCEDENTE sobre la tolerancia
+            # cuenta como tiempo perdido -- no el delta completo, para no
+            # penalizar dos veces (Disponibilidad Y Rendimiento) por el mismo hueco.
+            tiempo_perdido_segundos = delta_t_segundos - t_alerta
+
             # Disparar Parada Automática[cite: 13]
             nueva_parada = ParadaDetectada(
                 tenant_id=dispositivo.tenant_id,
                 estacion_fk=estacion.id,
                 inicio=ultimo_evento.timestamp,
                 fin=evento_timestamp,
-                duracion_segundos=delta_t_segundos,
+                duracion_segundos=tiempo_perdido_segundos,
                 estado=EstadoParada.PENDIENTE
             )
             db.add(nueva_parada)
             # Cap de Rendimiento: Limitamos delta_t a t_optimo para no penalizar el OEE de Rendimiento
-            delta_t_segundos = t_optimo 
-            
+            delta_t_segundos = t_optimo
+
         elif delta_t_segundos > t_lento:
             desempeno = "LENTO"
 
@@ -234,10 +249,16 @@ def registrar_escaneo_rapido(
         unidades_procesadas=unidades_a_sumar, # Multiplicador guardado inmutable
         timestamp=evento_timestamp,
         delta_t_segundos=delta_t_segundos,
+        tiempo_perdido_segundos=tiempo_perdido_segundos,
         estado=desempeno,
         maquina_id=maquina_id_final,
         event_id=scan.event_id,
         payload_hash=payload_hash,
+        unidades_rechazadas=scan.unidades_rechazadas,
+        # Snapshot inmutable (Fase E2): tiempo ideal POR UNIDAD vigente en
+        # este momento (SKU activo si había uno, si no el de la estación).
+        # Rendimiento = tiempo_ideal_seg * unidades_procesadas.
+        tiempo_ideal_seg=t_optimo,
         # Snapshot inmutable (Fase E1): refleja el estado de la estación en
         # el momento del evento; no se recalcula si la estación cambia después.
         incluido_oee=estacion.activa,
