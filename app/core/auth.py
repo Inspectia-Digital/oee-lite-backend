@@ -221,7 +221,7 @@ def obtener_tenant_aislado(
 # ==========================================
 # SUSPENSIÓN DE TENANT (Fase D.2)
 # ==========================================
-def _verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
+def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
     """Corta Edge/M2M sólo si el tenant está en SUSPENSION_TOTAL."""
     if tenant and tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
         raise HTTPException(
@@ -261,7 +261,7 @@ def obtener_contexto_tenant_edge(
     """Para endpoints de Edge/M2M: sólo corta en SUSPENSION_TOTAL, nunca en
     UI_SUSPENDIDA (el hardware debe poder seguir mandando datos)."""
     tenant = db.get(Tenant, context.tenant_id)
-    _verificar_no_suspension_total(tenant)
+    verificar_no_suspension_total(tenant)
     return context
 
 
@@ -271,5 +271,5 @@ def obtener_tenant_aislado_edge(
 ) -> str:
     """Variante Edge/M2M de obtener_tenant_aislado: sólo corta en SUSPENSION_TOTAL."""
     tenant = db.get(Tenant, tenant_id)
-    _verificar_no_suspension_total(tenant)
+    verificar_no_suspension_total(tenant)
     return tenant_id

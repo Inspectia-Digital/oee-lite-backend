@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant_edge, TenantContext
+from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.models.domain import (
-    Estacion, Linea, MaestroSKU, Tenant, 
+    Estacion, Linea, MaestroSKU, Tenant,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion
 )
@@ -25,12 +25,16 @@ class ScanRequest(BaseModel):
 def validar_estacion_terminal(
     estacion_id: uuid.UUID,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant_edge)
+    dispositivo: ContextoDispositivo = Depends(autenticar_dispositivo)
 ):
-    """(Bootstrap) Kiosko solicita configuración de la estación y herencia de línea."""
-    estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    """(Bootstrap) Terminal/PLC solicita configuración de la estación y herencia de línea.
+    Requiere API key M2M (Fase D.4a); ya no acepta JWT humano."""
+    if str(estacion_id) != dispositivo.estacion_id:
+        raise HTTPException(status_code=403, detail="Esta credencial no está autorizada para esa estación.")
+
+    estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == dispositivo.tenant_id)).first()
     if not estacion:
-        raise HTTPException(status_code=404, detail="Estación no encontrada o no autorizada")
+        raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
         
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
 
@@ -49,18 +53,22 @@ def validar_estacion_terminal(
 def registrar_escaneo_rapido(
     scan: ScanRequest,
     db: Session = Depends(get_session),
-    context: TenantContext = Depends(obtener_contexto_tenant_edge)
+    dispositivo: ContextoDispositivo = Depends(autenticar_dispositivo)
 ):
     """
     Motor DTR Universal: Procesa pings en < 50ms[cite: 14].
     Calcula Rendimiento, detecta micro-paradas y soporta lotes (Green Mills).
+    Requiere API key M2M (Fase D.4a); ya no acepta JWT humano.
     """
-    estacion = db.exec(select(Estacion).where(Estacion.id == scan.id_estacion, Estacion.tenant_id == context.tenant_id)).first()
+    if str(scan.id_estacion) != dispositivo.estacion_id:
+        raise HTTPException(status_code=403, detail="Esta credencial no está autorizada para esa estación.")
+
+    estacion = db.exec(select(Estacion).where(Estacion.id == scan.id_estacion, Estacion.tenant_id == dispositivo.tenant_id)).first()
     if not estacion:
-        raise HTTPException(status_code=404, detail="Estación inválida")
-        
+        raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
+
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
-    tenant_config = db.get(Tenant, context.tenant_id)
+    tenant_config = db.get(Tenant, dispositivo.tenant_id)
 
     # 1. RESOLUCIÓN DE TRAZABILIDAD (Regex Dinámico vs PLC Ciego)[cite: 14]
     orden_final = estacion.orden_activa_fk
@@ -79,7 +87,7 @@ def registrar_escaneo_rapido(
     t_optimo, t_lento, t_alerta = estacion.umbral_optimo, estacion.umbral_lento, estacion.umbral_alerta
 
     if sku_final:
-        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == context.tenant_id)).first()
+        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == dispositivo.tenant_id)).first()
         if sku:
             if linea and linea.tipo_produccion == "por_lotes":
                 unidades_a_sumar = sku.unidades_por_ciclo
@@ -107,7 +115,7 @@ def registrar_escaneo_rapido(
             desempeno = "ALERTA"
             # Disparar Parada Automática[cite: 13]
             nueva_parada = ParadaDetectada(
-                tenant_id=context.tenant_id,
+                tenant_id=dispositivo.tenant_id,
                 estacion_fk=estacion.id,
                 inicio=ultimo_evento.timestamp,
                 fin=evento_timestamp,
@@ -123,7 +131,7 @@ def registrar_escaneo_rapido(
 
     # 4. Persistencia Edge-Priority[cite: 14]
     nuevo_evento = LiteEventoProduccion(
-        tenant_id=context.tenant_id,
+        tenant_id=dispositivo.tenant_id,
         id_estacion=str(estacion.id),
         codigo_pieza=scan.codigo_pieza,
         orden_fk=orden_final,
