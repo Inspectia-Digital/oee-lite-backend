@@ -1,13 +1,72 @@
+from typing import List
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
+
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "OEE Lite API"
     VERSION: str = "1.0.0"
-    
-    # URL de conexión a PostgreSQL extraída del archivo .env
+
+    # "development" | "staging" | "production"
+    ENVIRONMENT: str = "development"
+
     DATABASE_URL: str
+    DATABASE_ECHO: bool = False
+    AUTO_CREATE_TABLES: bool = False
+
+    AUTH0_DOMAIN: str = ""
+    AUTH0_AUDIENCE: str = ""
+    AUTH0_JWKS_TIMEOUT_SECONDS: float = 5.0
+
+    # Lista separada por comas, ej: "https://app.midominio.com,https://admin.midominio.com"
+    CORS_ORIGINS: str = ""
 
     class Config:
         env_file = ".env"
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.lower() == "production"
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @field_validator("ENVIRONMENT")
+    @classmethod
+    def _normalizar_environment(cls, v: str) -> str:
+        v_normalizado = v.strip().lower()
+        if v_normalizado not in {"development", "staging", "production"}:
+            raise ValueError(
+                "ENVIRONMENT debe ser 'development', 'staging' o 'production'"
+            )
+        return v_normalizado
+
+    @model_validator(mode="after")
+    def _validar_configuracion_de_produccion(self) -> "Settings":
+        if not self.is_production:
+            return self
+
+        errores = []
+        if not self.cors_origins_list:
+            errores.append("CORS_ORIGINS no puede estar vacío en producción.")
+        if "*" in self.cors_origins_list:
+            errores.append("CORS_ORIGINS no puede incluir '*' en producción.")
+        if self.DATABASE_ECHO:
+            errores.append("DATABASE_ECHO debe ser false en producción.")
+        if self.AUTO_CREATE_TABLES:
+            errores.append("AUTO_CREATE_TABLES debe ser false en producción (usar Alembic).")
+        if not self.AUTH0_DOMAIN:
+            errores.append("AUTH0_DOMAIN es obligatorio en producción.")
+        if not self.AUTH0_AUDIENCE:
+            errores.append("AUTH0_AUDIENCE es obligatorio en producción.")
+
+        if errores:
+            raise ValueError(
+                "Configuración de producción inválida:\n- " + "\n- ".join(errores)
+            )
+        return self
+
 
 settings = Settings()

@@ -1,12 +1,12 @@
-import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import Session, select, SQLModel
 
-from app.core.database import get_session, engine
-from app.core.auth import verificar_token_auth0, get_usuario_actual
-from app.models.domain import UsuarioSaaS, RolUsuario
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlmodel import SQLModel
+
+from app.core.config import settings
+from app.core.database import engine
 
 # ==========================================
 # IMPORTACIÓN DE ROUTERS
@@ -25,10 +25,11 @@ from app.routers import analytics, configuracion, admin, jerarquia, plantas
 async def lifespan(app: FastAPI):
     """
     Controla el arranque y apagado del contenedor en Google Cloud Run.
-    Evita el bloqueo de hilos reemplazando la llamada global antigua[cite: 7].
+    AUTO_CREATE_TABLES sólo debe usarse en desarrollo descartable; el esquema
+    real se gestiona con Alembic (ver alembic/).
     """
-    # Escanea tus modelos y crea las tablas que falten en Postgres
-    SQLModel.metadata.create_all(engine)
+    if settings.AUTO_CREATE_TABLES:
+        SQLModel.metadata.create_all(engine)
     yield
     # (Espacio reservado para cerrar conexiones de base de datos o Redis de forma segura)
 
@@ -43,21 +44,13 @@ app = FastAPI(
 )
 
 # ==========================================
-# SEGURIDAD CORS (VITAL PARA EL FRONTEND)
+# SEGURIDAD CORS
 # ==========================================
-origins = [
-    "http://localhost:5173",       
-    "http://localhost:8080",       
-    "https://*.lovable.app",       
-    "*"  # Permitido temporalmente para desarrollo. Restringir a dominios exactos en Prod.
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, 
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
-    # Exponemos explícitamente el header de la Planta para el OS Shell
     allow_headers=["*", "Authorization", "X-Sub-Tenant-Id"],
     expose_headers=["X-Sub-Tenant-Id"]
 )
@@ -75,7 +68,7 @@ app.include_router(operacion.router)
 # 3. Cargas Masivas (Excel/CSV protegidas por Planta)
 app.include_router(importaciones.router)
 
-# 4. Módulos Heredados (Tymeo)[cite: 7]
+# 4. Módulos Heredados (Tymeo)
 app.include_router(admin.router)
 app.include_router(configuracion.router)
 app.include_router(analytics.router)
@@ -88,78 +81,35 @@ app.include_router(plantas.router)
 # ==========================================
 @app.get("/", tags=["Infraestructura"])
 def read_root():
-    """Mantenido por retrocompatibilidad[cite: 7]"""
+    """Mantenido por retrocompatibilidad"""
     return {"message": "InspectIA OS API is running"}
 
+
+@app.get("/health/live", tags=["Infraestructura"])
+def health_live():
+    """Liveness: sólo confirma que el proceso responde HTTP, sin dependencias externas."""
+    return {"status": "ok", "version": "2.0.0"}
+
+
+@app.get("/health/ready", tags=["Infraestructura"])
+def health_ready():
+    """Readiness: confirma que la app puede atender tráfico real (DB accesible)."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Base de datos no disponible.")
+    return {"status": "ok", "version": "2.0.0"}
+
+
 @app.get("/health", tags=["Infraestructura"])
-def health_check():
-    """Endpoint vital para el Load Balancer de Google Cloud Run[cite: 7]"""
-    return {
-        "status": "ok", 
-        "version": "2.0.0", 
-        "mensaje": "¡El motor de InspectIA OS está encendido y refactorizado!"
-    }
-
+def health_check_alias():
+    """Alias temporal de compatibilidad; equivale a /health/ready."""
+    return health_ready()
 
 # ==========================================
-# ENDPOINTS DE EMERGENCIA / BOOTSTRAP[cite: 7]
-# CTO Warning: Asegurar de deshabilitar esto en producción estable.
+# NOTA: se eliminaron las rutas de emergencia/bootstrap
+# (/ruta-secreta, /ascender-estanislao, /setup/primer-admin).
+# El bootstrap de un SuperAdmin local se hace ahora fuera del repo,
+# ver InspectIA/scripts-emergencia-fuera-de-repo/bootstrap_superadmin.py
 # ==========================================
-@app.get("/ruta-secreta", tags=["Emergencia"])
-def ver_secreto(usuario_validado: dict = Depends(get_usuario_actual)):
-    return {
-        "mensaje": "¡Entraste a la bóveda de InspectIA OS!",
-        "datos_del_token": usuario_validado
-    }
-
-@app.get("/ascender-estanislao", tags=["Emergencia"])
-def ascender_estanislao(db: Session = Depends(get_session)):
-    """Ruta temporal de emergencia para ascender o CREAR al usuario de Google OAuth[cite: 7]"""
-    id_google = "google-oauth2|103641955647524616968"
-    
-    mi_usuario = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == id_google)).first()
-    
-    if mi_usuario:
-        mi_usuario.rol = RolUsuario.SUPERADMIN
-        mi_usuario.tenant_id = "tymeo_core"
-        db.add(mi_usuario)
-        db.commit()
-        return {"status": "ÉXITO", "mensaje": "¡Usuario actualizado a SUPERADMIN!"}
-    else:
-        nuevo_admin = UsuarioSaaS(
-            auth0_id=id_google,
-            email="estanislao@inspectia.ai",
-            tenant_id="tymeo_core",  
-            rol=RolUsuario.SUPERADMIN,
-            activo=True
-        )
-        db.add(nuevo_admin)
-        db.commit()
-        return {"status": "ÉXITO", "mensaje": "¡Usuario CREADO desde cero y coronado como SUPERADMIN!"}
-
-@app.post("/setup/primer-admin", tags=["Emergencia"])
-def crear_primer_superadmin(
-    payload: dict = Depends(verificar_token_auth0), 
-    db: Session = Depends(get_session)
-):
-    """Ruta temporal: Registra el token de Auth0 actual como SUPERADMIN[cite: 7]."""
-    auth0_sub = payload.get("sub")
-    
-    usuario_existente = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_sub)).first()
-    if usuario_existente:
-        return {"mensaje": "Ya estás registrado en la base de datos.", "usuario": usuario_existente}
-        
-    nuevo_admin = UsuarioSaaS(
-        auth0_id=auth0_sub,
-        tenant_id="tymeo_core",  
-        rol=RolUsuario.SUPERADMIN
-    )
-    
-    db.add(nuevo_admin)
-    db.commit()
-    db.refresh(nuevo_admin)
-    
-    return {
-        "mensaje": "¡Nacimiento de InspectIA OS exitoso! Has sido coronado como SuperAdmin.",
-        "usuario": nuevo_admin
-    }
