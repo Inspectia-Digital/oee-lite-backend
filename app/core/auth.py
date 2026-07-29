@@ -1,5 +1,4 @@
 import json
-import os
 import logging
 from urllib.request import urlopen
 from typing import Optional
@@ -11,6 +10,7 @@ from pydantic import BaseModel
 from jose import jwt
 from sqlmodel import Session, select
 
+from app.core.config import settings
 from app.core.database import get_session
 from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 
@@ -18,21 +18,37 @@ from app.models.domain import UsuarioSaaS, RolUsuario, Planta, Tenant
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURACIÓN DE AUTH0 (Bulletproof)
+# CONFIGURACIÓN DE AUTH0
 # ==========================================
-# 1. Leemos la variable. Si no existe o GCP inyectó un string vacío, el strip() la deja limpia.
-_raw_domain = os.getenv("AUTH0_DOMAIN", "").strip()
+# En producción, settings.py ya exige AUTH0_DOMAIN/AUTH0_AUDIENCE explícitos
+# (falla el arranque si faltan). Fuera de producción (development/staging),
+# se mantiene un fallback de transición para no romper logins existentes
+# en entornos que todavía no seteen estas variables explícitamente; se
+# loguea un warning fuerte para que se detecte y corrija.
+_FALLBACK_AUTH0_DOMAIN = "dev-bzem6wpwmlr14eha.us.auth0.com"
+_FALLBACK_AUTH0_AUDIENCE = "https://api.tymeo.com"
 
-# 2. Si vino vacía desde GCP, forzamos el hardcode de forma segura
-if not _raw_domain:
-    _raw_domain = "dev-bzem6wpwmlr14eha.us.auth0.com"
+_auth0_domain_raw = settings.AUTH0_DOMAIN
+_auth0_audience_raw = settings.AUTH0_AUDIENCE
 
-# 3. Limpiamos cualquier protocolo mal inyectado (Soporta errores de configuración manual en .env)
-AUTH0_DOMAIN = _raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
+if not _auth0_domain_raw and not settings.is_production:
+    logger.warning(
+        "AUTH0_DOMAIN no está seteado como variable de entorno; usando fallback de "
+        "transición '%s'. Configurar explícitamente antes de promover a producción.",
+        _FALLBACK_AUTH0_DOMAIN,
+    )
+    _auth0_domain_raw = _FALLBACK_AUTH0_DOMAIN
 
-# Hacemos lo mismo con el Audience
-_raw_audience = os.getenv("AUTH0_AUDIENCE", "").strip()
-AUTH0_AUDIENCE = _raw_audience if _raw_audience else "https://api.tymeo.com"
+if not _auth0_audience_raw and not settings.is_production:
+    logger.warning(
+        "AUTH0_AUDIENCE no está seteado como variable de entorno; usando fallback de "
+        "transición '%s'. Configurar explícitamente antes de promover a producción.",
+        _FALLBACK_AUTH0_AUDIENCE,
+    )
+    _auth0_audience_raw = _FALLBACK_AUTH0_AUDIENCE
+
+AUTH0_DOMAIN = _auth0_domain_raw.replace("https://", "").replace("http://", "").rstrip("/")
+AUTH0_AUDIENCE = _auth0_audience_raw
 
 ALGORITHMS = ["RS256"]
 
@@ -41,13 +57,17 @@ token_auth_scheme = HTTPBearer()
 @lru_cache(maxsize=1)
 def get_auth0_jwks():
     """Obtiene y CACHEA las llaves públicas de Auth0 en RAM."""
+    if not AUTH0_DOMAIN:
+        logger.error("AUTH0_DOMAIN no está configurado.")
+        raise HTTPException(status_code=503, detail="Autenticación no disponible temporalmente.")
+
     url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
     try:
-        return json.loads(urlopen(url).read())
+        return json.loads(urlopen(url, timeout=settings.AUTH0_JWKS_TIMEOUT_SECONDS).read())
     except Exception as e:
-        # Forzamos el log explícito en GCP antes de lanzar la excepción web
+        # Log detallado interno, pero respuesta pública sanitizada (sin URL/stack trace)
         logger.error(f"Falla crítica contactando Auth0 en {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error de red al contactar Auth0 JWKS en {url}: {str(e)}")
+        raise HTTPException(status_code=503, detail="Autenticación no disponible temporalmente.")
 
 
 def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
@@ -82,7 +102,8 @@ def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(to
             )
             return payload
         except Exception as e:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+            logger.warning(f"Token JWT rechazado: {str(e)}")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido o expirado.")
             
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No se encontró llave pública.")
 

@@ -1,31 +1,57 @@
+import os
+
 from sqlmodel import Session, select
 from app.core.database import engine
 from app.models.domain import Tenant, Planta, Linea, Estacion, TipoProduccion, UsuarioSaaS, RolUsuario
 
+# Estructura base repetible (para resets de dev/local). El superadmin real
+# se toma de variables de entorno, nunca hardcodeado en el código:
+#   SUPERADMIN_AUTH0_ID, SUPERADMIN_EMAIL, SUPERADMIN_TENANT_ID (default "inspectia")
+# Si no se setean, cae a un usuario simulado sólo apto para dev local puro
+# (no permite login real contra Auth0).
+SUPERADMIN_TENANT_ID = os.environ.get("SUPERADMIN_TENANT_ID", "inspectia")
+SUPERADMIN_AUTH0_ID = os.environ.get("SUPERADMIN_AUTH0_ID", "auth0|inspectia_superadmin_dev")
+SUPERADMIN_EMAIL = os.environ.get("SUPERADMIN_EMAIL", "admin@inspectia.com")
+
+
 def seed_data():
     print("Iniciando sembrado de datos multi-tenant (InspectIA + Clientes)...")
     with Session(engine) as db:
-        
+
         # ==========================================
-        # 1. TENANT MASTER: INSPECTIA (Plataforma / Admin)
+        # 1. TENANT MASTER (Plataforma / Admin) + SuperAdmin real
         # ==========================================
-        inspectia_tenant = db.get(Tenant, "inspectia")
-        if not inspectia_tenant:
-            inspectia_tenant = Tenant(
-                id="inspectia",
+        tenant_master = db.get(Tenant, SUPERADMIN_TENANT_ID)
+        if not tenant_master:
+            tenant_master = Tenant(
+                id=SUPERADMIN_TENANT_ID,
                 nombre="InspectIA Platform Admin",
                 origen_maestros="MANUAL",
                 tolerancia_lento_pct=1.15,
                 tolerancia_alerta_pct=1.25
             )
-            db.add(inspectia_tenant)
+            db.add(tenant_master)
             db.commit()
+            print(f"✅ Tenant master '{SUPERADMIN_TENANT_ID}' creado.")
+        else:
+            print(f"ℹ️ Tenant master '{SUPERADMIN_TENANT_ID}' ya existe.")
 
-            # Crear el usuario Superadmin global para InspectIA
+        # Idempotente: crea o promueve al SuperAdmin, sin pisar otros usuarios.
+        superadmin = db.exec(
+            select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == SUPERADMIN_AUTH0_ID)
+        ).first()
+        if superadmin:
+            superadmin.rol = RolUsuario.SUPERADMIN
+            superadmin.tenant_id = SUPERADMIN_TENANT_ID
+            superadmin.activo = True
+            db.add(superadmin)
+            db.commit()
+            print(f"✅ Usuario SUPERADMIN ({SUPERADMIN_AUTH0_ID}) actualizado.")
+        else:
             superadmin = UsuarioSaaS(
-                auth0_id="auth0|inspectia_superadmin_dev", # ID simulado para dev local
-                tenant_id="inspectia",
-                email="admin@inspectia.com",
+                auth0_id=SUPERADMIN_AUTH0_ID,
+                tenant_id=SUPERADMIN_TENANT_ID,
+                email=SUPERADMIN_EMAIL,
                 rol=RolUsuario.SUPERADMIN,
                 activo=True,
                 nombre="Master",
@@ -33,9 +59,7 @@ def seed_data():
             )
             db.add(superadmin)
             db.commit()
-            print("✅ Tenant master 'inspectia' y usuario SUPERADMIN creados con éxito.")
-        else:
-            print("ℹ️ Tenant master 'inspectia' ya existe.")
+            print(f"✅ Usuario SUPERADMIN ({SUPERADMIN_AUTH0_ID}) creado.")
 
         # ==========================================
         # 2. CLIENTE 1: SPRINGWALL (Producción Discreta)

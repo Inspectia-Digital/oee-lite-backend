@@ -4,12 +4,17 @@ on:
   push:
     branches:
       - dev
+  workflow_dispatch: {}
+    # Permite disparar el workflow a mano desde la pestaña Actions de GitHub,
+    # útil para probar el paso de migración de forma aislada antes de que
+    # dependa de un push real a dev.
 
 env:
   PROJECT_ID: oee-control
   REGION: us-central1
   SERVICE_NAME: api-oeelite-dev
   DB_INSTANCE: oee-control:us-central1:oeelite-db-dev
+  CLOUD_SQL_PROXY_VERSION: 2.14.0
 
 jobs:
   deploy:
@@ -31,6 +36,49 @@ jobs:
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install migration dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Cloud SQL Auth Proxy
+        run: |
+          curl -sSL -o cloud-sql-proxy \
+            "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          chmod +x cloud-sql-proxy
+
+      - name: Start Cloud SQL Auth Proxy
+        run: |
+          ./cloud-sql-proxy "$DB_INSTANCE" --port 5432 &
+          echo "Esperando a que el proxy levante..."
+          for i in $(seq 1 15); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then
+              echo "Proxy listo."
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run database migration (Fase C1 y siguientes, expand-only)
+        env:
+          RAW_DB_URL: ${{ secrets.DEV_DATABASE_URL_TCP }}
+        run: |
+          if [ -z "$RAW_DB_URL" ]; then
+            echo "ERROR: falta el secret DEV_DATABASE_URL_TCP (usuario:password:dbname para conectar vía el proxy en 127.0.0.1:5432)."
+            echo "No es lo mismo que DEV_DATABASE_URL (esa apunta a un socket Unix, no sirve para TCP local)."
+            exit 1
+          fi
+          export DATABASE_URL="$RAW_DB_URL"
+          export ENVIRONMENT="development"
+          export CORS_ORIGINS="*"
+          python -m alembic current
+          python -m alembic upgrade head
 
       - name: Authorize Docker push
         run: gcloud auth configure-docker us-central1-docker.pkg.dev
