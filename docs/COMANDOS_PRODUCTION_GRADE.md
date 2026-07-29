@@ -80,12 +80,21 @@ Las últimas dos deben devolver `404` (rutas de emergencia eliminadas).
 
 ## 5. Tests
 
+Requiere Postgres real con las migraciones aplicadas (pasos 1-2 de arriba).
+44 tests, nunca mocks para RBAC/triggers/reglas de negocio.
+
 ```bash
 python -m pytest -q
 ```
 
-(No hay suite de tests todavía — QA-01 sigue abierto, es la fase pendiente
-"test: add production-grade regression suite" del HANDOFF.)
+Verificado: dos corridas consecutivas sobre la misma base (44 passed ambas)
+y una corrida completa desde cero (`docker compose down -v` → `alembic
+upgrade head` desde vacío → `pytest -q`, 44 passed) — confirma que la suite
+no depende de estado dejado por sesiones anteriores.
+
+Cada test usa un `tenant_id` único (no interfiere con `springwall`/
+`green_mills` ni con otros tests). No hace falta limpiar nada entre
+corridas.
 
 ## 6. Migración contra la base REAL de dev (Cloud SQL)
 
@@ -125,7 +134,27 @@ docker build --pull -t oee-lite-backend:hardening .
 docker run --rm --env-file .env -p 8080:8080 oee-lite-backend:hardening
 ```
 
-## 8. Pendiente / no ejecutado en este entorno (warning explícito)
+## 8. CI/CD — deploy automático a dev
+
+El workflow `.github/workflows/deploy-dev.yml` corre `alembic upgrade head`
+contra Cloud SQL (vía Cloud SQL Auth Proxy oficial, descargado directo del
+binario de Google) **antes** de construir y desplegar la imagen. Confirmado
+funcionando con un `workflow_dispatch` real.
+
+Requiere el secret de GitHub `DEV_DATABASE_URL_TCP` (mismas credenciales
+que `DEV_DATABASE_URL`, reformateadas para TCP vía el proxy:
+`postgresql+psycopg2://usuario:password@127.0.0.1:5432/db`).
+
+Para probar el workflow sin depender de un push real a `dev`:
+GitHub → pestaña Actions → "Deploy Backend DEV" → "Run workflow" → elegir
+la rama (`main` para probar el código más nuevo sin mergear a `dev` todavía).
+
+**No incluido**: la suite de pytest no corre en CI. Crearía datos de prueba
+contra la base compartida de `dev`; conectarla requiere una base de test
+efímera separada (trabajo de infraestructura aparte, no incluido en esta
+tanda).
+
+## 9. Pendiente / no ejecutado en este entorno (warning explícito)
 
 - `pip-audit` (SCA de dependencias): no está instalado en este entorno, no
   se instaló sin permiso. Pendiente de correr antes de producción real.
