@@ -125,7 +125,31 @@ def listar_usuarios_tenant(
     if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.SUPERVISOR]:
         raise HTTPException(status_code=403, detail="No tienes permisos para listar usuarios.")
 
-    usuarios = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == context.tenant_id)).all()
+    query = select(UsuarioSaaS).where(UsuarioSaaS.tenant_id == context.tenant_id)
+
+    if usuario_actual.rol == RolUsuario.SUPERVISOR:
+        # RBAC geolocalizado (Fase D.3): un Supervisor sólo ve usuarios que
+        # comparten al menos una planta con él, más Gerencia/SuperAdmin
+        # (que no están acotados por planta). Antes veía el tenant entero.
+        mis_plantas = db.exec(
+            select(UsuarioPlanta.planta_id).where(
+                UsuarioPlanta.usuario_id == usuario_actual.id,
+                UsuarioPlanta.activo == True,  # noqa: E712
+            )
+        ).all()
+        usuarios_compartidos_ids = set(db.exec(
+            select(UsuarioPlanta.usuario_id).where(
+                UsuarioPlanta.planta_id.in_(mis_plantas),
+                UsuarioPlanta.activo == True,  # noqa: E712
+            )
+        ).all()) if mis_plantas else set()
+
+        query = query.where(
+            UsuarioSaaS.id.in_(usuarios_compartidos_ids)
+            | UsuarioSaaS.rol.in_([RolUsuario.GERENCIA, RolUsuario.SUPERADMIN])
+        )
+
+    usuarios = db.exec(query).all()
     return [
         {
             "id": str(u.id), "auth0_id": u.auth0_id, "email": u.email,
