@@ -17,6 +17,9 @@ from app.routers import scans, operacion, importaciones
 # Routers legacy que aún mantienen su ubicación original
 from app.routers import analytics, configuracion, admin, jerarquia, plantas
 
+# Fase D — M2M y RBAC geolocalizado
+from app.routers import dispositivos
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -74,6 +77,9 @@ app.include_router(configuracion.router)
 app.include_router(analytics.router)
 app.include_router(jerarquia.router)
 app.include_router(plantas.router)
+
+# 5. Fase D — M2M y RBAC geolocalizado
+app.include_router(dispositivos.router)
 
 
 # ==========================================

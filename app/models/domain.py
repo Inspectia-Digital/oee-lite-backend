@@ -283,6 +283,7 @@ class UsuarioPlanta(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
     planta_id: uuid.UUID = Field(foreign_key="plantas.id")
+    activo: bool = Field(default=True)
 
 class ApiKeyDispositivo(TenantBase, table=True):
     """Credencial M2M para hardware fijo. Formato entregado al cliente: key_id.secret."""
