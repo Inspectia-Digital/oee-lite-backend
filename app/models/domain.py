@@ -52,6 +52,16 @@ class ModoAsignacionOperariosEstacion(str, Enum):
     MANUAL = "manual"
     ESCANEO = "escaneo"
 
+# Enums de hardening production-grade (HANDOFF_STG_PRODUCTION_GRADE.md)
+class EstadoTenant(str, Enum):
+    ACTIVO = "activo"
+    UI_SUSPENDIDA = "ui_suspendida"
+    SUSPENSION_TOTAL = "suspension_total"
+
+class MetodoCalidadLinea(str, Enum):
+    POR_TIEMPO = "por_tiempo"
+    POR_RECHAZO = "por_rechazo"
+
 # ==========================================
 # 2. MIXIN B2B MULTI-TENANT
 # ==========================================
@@ -90,6 +100,12 @@ class Tenant(SQLModel, table=True):
     origen_maestros: str = Field(default="MANUAL")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # Suspensión de tenant (Fase D). Sólo SuperAdmin puede cambiarlo.
+    estado: EstadoTenant = Field(
+        default=EstadoTenant.ACTIVO,
+        sa_column=Column(SaEnum(EstadoTenant, values_callable=lambda obj: [e.value for e in obj]))
+    )
+
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
 # ==========================================
@@ -112,22 +128,29 @@ class Planta(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     nombre: str = Field(description="Ej: Planta Garín, Planta Pilar")
     ubicacion: Optional[str] = None
-    
+    timezone: str = Field(default="America/Buenos_Aires", description="Timezone IANA de la planta")
+    activo: bool = Field(default=True)
+
 class Linea(TenantBase, table=True):
     __tablename__ = "dim_lineas"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # NOTA: sigue Optional a nivel Python durante la migración expand (C1);
+    # el NOT NULL real se impone en Postgres recién tras el saneamiento de huérfanos.
     planta_id: Optional[uuid.UUID] = Field(default=None, foreign_key="plantas.id")
     nombre: str
-    
+
     # Tipado estricto OS Shell
     modo_asignacion_operarios: ModoAsignacionOperarios = Field(default=ModoAsignacionOperarios.MANUAL)
     tipo_produccion: TipoProduccion = Field(default=TipoProduccion.DISCRETA)
+    metodo_calidad: MetodoCalidadLinea = Field(default=MetodoCalidadLinea.POR_RECHAZO)
+    activo: bool = Field(default=True)
 
 class Supervisor(TenantBase, table=True):
     __tablename__ = "dim_supervisores"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     legajo: str = Field(index=True)
     nombre_completo: str
+    activo: bool = Field(default=True)
 
 class Estacion(TenantBase, table=True):
     __tablename__ = "dim_estaciones"
@@ -144,6 +167,8 @@ class Estacion(TenantBase, table=True):
     ramal: str = Field(default="Principal", description="Ej: Principal, Ramal A, Ramal B")
     
     parent_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_estaciones.id")
+    # NOTA: sigue Optional a nivel Python durante la migración expand (C1);
+    # el NOT NULL real se impone en Postgres recién tras el saneamiento de huérfanos.
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
 
     codigo_plc: Optional[str] = Field(default=None, index=True)
@@ -160,6 +185,7 @@ class Operario(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     legajo: str = Field(index=True)
     nombre_completo: str
+    activo: bool = Field(default=True)
 
 class Turno(TenantBase, table=True):
     __tablename__ = "dim_turnos"
@@ -169,6 +195,7 @@ class Turno(TenantBase, table=True):
     hora_fin: time
     descanso_minutos: int = Field(default=0, description="Minutos a descontar de la Disponibilidad")
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
+    activo: bool = Field(default=True)
 
 class AsignacionTurno(TenantBase, table=True):
     __tablename__ = "asignaciones_turno"
@@ -183,36 +210,84 @@ class AsignacionTurno(TenantBase, table=True):
 # ==========================================
 class MaestroSKU(TenantBase, table=True):
     __tablename__ = "maestro_skus"
+    # NOTA (C1/C2): codigo_sku sigue siendo PK legacy durante la fase expand.
+    # 'id' es la nueva identidad interna UUID; las FKs nuevas deben apuntar a
+    # 'id', no a codigo_sku. codigo_sku deja de ser PK recién en la fase contract (C2).
     codigo_sku: str = Field(primary_key=True, description="El código real del ERP")
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, index=True, unique=True, description="Identidad interna UUID (reemplaza a codigo_sku como PK en C2)")
     descripcion: str
-    modelo: Optional[str] = None   
-    medida: Optional[str] = None   
-    
+    modelo: Optional[str] = None
+    medida: Optional[str] = None
+
     tiempo_ciclo_teorico: float = Field(default=240.0, description="Segundos ideales por unidad")
     umbral_calidad: float = Field(default=1800.0, description="Tolerancia en estación de calidad")
-    
+
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id") # OS Shell requirement para uploads
     unidades_por_ciclo: int = Field(default=1, description="Factor de lote (ej: 4 panes por molde)")
+    activo: bool = Field(default=True)
 
 class OrdenProduccion(TenantBase, table=True):
     __tablename__ = "ordenes_produccion"
+    # NOTA (C1/C2): id_orden sigue siendo PK legacy durante la fase expand.
+    # 'id' es la nueva identidad interna UUID; las FKs nuevas deben apuntar a
+    # 'id', no a id_orden. id_orden deja de ser PK recién en la fase contract (C2).
     id_orden: str = Field(primary_key=True, description="Número de OP del ERP")
-    
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, index=True, unique=True, description="Identidad interna UUID (reemplaza a id_orden como PK en C2)")
+
     sku_fk: Optional[str] = Field(default=None, foreign_key="maestro_skus.codigo_sku")
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
-    
+
     cantidad_esperada: int = Field(default=0)
     cantidad_producida: int = Field(default=0)
-    
+
     plan_fecha: Optional[str] = Field(default=None, description="Ej: YYYY-MM-DD")
     estado: EstadoOrden = Field(default=EstadoOrden.ABIERTA)
     origen: str = Field(default="UI")
+    activo: bool = Field(default=True)
 
 class MotivoParada(TenantBase, table=True):
     __tablename__ = "dim_motivos_parada"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     nombre: str
     tipo_parada: TipoParada
+    activo: bool = Field(default=True)
+
+# ==========================================
+# 4.5 MÁQUINAS, DISPOSITIVOS M2M Y ALCANCE POR PLANTA
+# ==========================================
+class Maquina(TenantBase, table=True):
+    __tablename__ = "dim_maquinas"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    codigo_externo: str = Field(index=True, description="Identificador físico del equipo")
+    nombre: Optional[str] = None
+    activo: bool = Field(default=True)
+
+class MaquinaEstacion(TenantBase, table=True):
+    """Asociación N:N tenant-aware entre Maquina y Estacion."""
+    __tablename__ = "maquina_estacion"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    maquina_id: uuid.UUID = Field(foreign_key="dim_maquinas.id")
+    estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id")
+    activo: bool = Field(default=True)
+
+class UsuarioPlanta(TenantBase, table=True):
+    """Alcance geolocalizado: aplica sólo a roles SUPERVISOR y OPERARIO (Fase D)."""
+    __tablename__ = "usuario_planta"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
+    planta_id: uuid.UUID = Field(foreign_key="plantas.id")
+
+class ApiKeyDispositivo(TenantBase, table=True):
+    """Credencial M2M para hardware fijo. Formato entregado al cliente: key_id.secret."""
+    __tablename__ = "api_keys_dispositivo"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    key_id: str = Field(index=True, unique=True, description="Parte pública/indexada de la key")
+    secret_hash: str = Field(description="Hash bcrypt del secret; el secret nunca se persiste en claro")
+    estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id")
+    activo: bool = Field(default=True)
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    revoked_at: Optional[datetime] = Field(default=None)
 
 # ==========================================
 # 5. TRANSACCIONES LEGACY (Retenidas por retrocompatibilidad)
@@ -283,3 +358,18 @@ class LiteEventoProduccion(TenantBase, table=True):
     estado: str = Field(default="PENDIENTE", index=True) # OPTIMO, LENTO, ALERTA, PARADA
     es_parada_detectada: bool = Field(default=False)
     tiempo_perdido_segundos: float = Field(default=0.0)
+
+    # Máquina física (opcional; NULL si el hardware informa una máquina
+    # no asociada a la estación — se acepta el evento igual, ver Fase E1).
+    maquina_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_maquinas.id")
+
+    # Calidad por rechazo (reemplaza a es_retrabajo de EventoEscaneo).
+    unidades_rechazadas: int = Field(default=0, description="0 <= unidades_rechazadas <= unidades_procesadas")
+
+    # Idempotencia Edge (Fase E1).
+    event_id: Optional[uuid.UUID] = Field(default=None, index=True, unique=True, description="UUIDv4 estable enviado por el productor")
+    payload_hash: Optional[str] = Field(default=None, description="Hash canónico del payload relevante")
+
+    # Snapshot inmutable: incluido_oee = estacion.activa al momento del evento.
+    # No se recalcula si la estación cambia de estado después.
+    incluido_oee: bool = Field(default=True)
