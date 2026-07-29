@@ -20,6 +20,9 @@ from app.routers import analytics, configuracion, admin, jerarquia, plantas
 # Fase D — M2M y RBAC geolocalizado
 from app.routers import dispositivos
 
+# Fase API/CRUD completo
+from app.routers import personas
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -80,6 +83,9 @@ app.include_router(plantas.router)
 
 # 5. Fase D — M2M y RBAC geolocalizado
 app.include_router(dispositivos.router)
+
+# 6. Fase API/CRUD completo
+app.include_router(personas.router)
 
 
 # ==========================================
