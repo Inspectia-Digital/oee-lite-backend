@@ -7,7 +7,8 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant, TenantContext, get_usuario_actual
-from app.models.domain import UsuarioSaaS, RolUsuario, Tenant
+from app.core.rbac import requerir_gerencia_o_superadmin
+from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta
 
 router = APIRouter(prefix="/accesos", tags=["Administración SaaS y RBAC"])
 
@@ -51,6 +52,16 @@ class TenantUpdate(BaseModel):
     logo_url: Optional[str] = None
     tolerancia_lento_pct: Optional[float] = None
     tolerancia_alerta_pct: Optional[float] = None
+
+class UsuarioPlantaCreate(BaseModel):
+    usuario_id: uuid.UUID
+    planta_id: uuid.UUID
+
+class UsuarioPlantaResponse(BaseModel):
+    id: uuid.UUID
+    usuario_id: uuid.UUID
+    planta_id: uuid.UUID
+    activo: bool
 
 
 # ==========================================
@@ -250,7 +261,93 @@ def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), u
     usuario_target = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
     if not usuario_target: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if usuario_actual.auth0_id == auth0_id: raise HTTPException(status_code=400, detail="Operación suicida bloqueada.")
-        
+
     db.delete(usuario_target)
     db.commit()
     return {"mensaje": "Usuario eliminado físicamente de la base de datos."}
+
+
+# ==========================================
+# RBAC GEOLOCALIZADO: ASIGNACIÓN USUARIO-PLANTA (Fase D.1)
+# Aplica sólo a roles SUPERVISOR y OPERARIO; Gerencia/SuperAdmin ven
+# todo el tenant sin necesitar asignación.
+# ==========================================
+@router.post("/mi-empresa/usuario-planta", response_model=UsuarioPlantaResponse, status_code=status.HTTP_201_CREATED, tags=["RBAC Geolocalizado"])
+def asignar_usuario_a_planta(
+    payload: UsuarioPlantaCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    usuario_target = db.exec(
+        select(UsuarioSaaS).where(UsuarioSaaS.id == payload.usuario_id, UsuarioSaaS.tenant_id == context.tenant_id)
+    ).first()
+    if not usuario_target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado en este tenant.")
+
+    if usuario_target.rol not in [RolUsuario.SUPERVISOR, RolUsuario.OPERARIO]:
+        raise HTTPException(
+            status_code=400,
+            detail="El alcance por planta sólo aplica a usuarios SUPERVISOR u OPERARIO.",
+        )
+
+    planta_target = db.exec(
+        select(Planta).where(Planta.id == payload.planta_id, Planta.tenant_id == context.tenant_id)
+    ).first()
+    if not planta_target:
+        raise HTTPException(status_code=404, detail="Planta no encontrada en este tenant.")
+
+    existente = db.exec(
+        select(UsuarioPlanta).where(
+            UsuarioPlanta.usuario_id == payload.usuario_id,
+            UsuarioPlanta.planta_id == payload.planta_id,
+            UsuarioPlanta.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail="Ese usuario ya está asignado a esa planta.")
+
+    nueva_asignacion = UsuarioPlanta(
+        tenant_id=context.tenant_id,
+        usuario_id=payload.usuario_id,
+        planta_id=payload.planta_id,
+    )
+    db.add(nueva_asignacion)
+    db.commit()
+    db.refresh(nueva_asignacion)
+    return nueva_asignacion
+
+
+@router.get("/mi-empresa/usuario-planta", response_model=List[UsuarioPlantaResponse], tags=["RBAC Geolocalizado"])
+def listar_asignaciones_usuario_planta(
+    usuario_id: Optional[uuid.UUID] = None,
+    planta_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    query = select(UsuarioPlanta).where(UsuarioPlanta.tenant_id == context.tenant_id, UsuarioPlanta.activo == True)  # noqa: E712
+    if usuario_id:
+        query = query.where(UsuarioPlanta.usuario_id == usuario_id)
+    if planta_id:
+        query = query.where(UsuarioPlanta.planta_id == planta_id)
+    return db.exec(query).all()
+
+
+@router.delete("/mi-empresa/usuario-planta/{asignacion_id}", tags=["RBAC Geolocalizado"])
+def quitar_asignacion_usuario_planta(
+    asignacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    asignacion = db.exec(
+        select(UsuarioPlanta).where(UsuarioPlanta.id == asignacion_id, UsuarioPlanta.tenant_id == context.tenant_id)
+    ).first()
+    if not asignacion:
+        raise HTTPException(status_code=404, detail="Asignación no encontrada.")
+
+    asignacion.activo = False
+    db.add(asignacion)
+    db.commit()
+    return {"mensaje": "Asignación desactivada."}

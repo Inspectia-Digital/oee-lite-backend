@@ -14,7 +14,6 @@ env:
   REGION: us-central1
   SERVICE_NAME: api-oeelite-dev
   DB_INSTANCE: oee-control:us-central1:oeelite-db-dev
-  CLOUD_SQL_PROXY_VERSION: 2.14.0
 
 jobs:
   deploy:
@@ -47,23 +46,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Install Cloud SQL Auth Proxy
-        run: |
-          curl -sSL -o cloud-sql-proxy \
-            "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
-          chmod +x cloud-sql-proxy
-
-      - name: Start Cloud SQL Auth Proxy
-        run: |
-          ./cloud-sql-proxy "$DB_INSTANCE" --port 5432 &
-          echo "Esperando a que el proxy levante..."
-          for i in $(seq 1 15); do
-            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then
-              echo "Proxy listo."
-              break
-            fi
-            sleep 2
-          done
+      - name: Set up Cloud SQL Auth Proxy
+        uses: google-github-actions/setup-cloud-sql-proxy@v2
+        with:
+          instances: ${{ env.DB_INSTANCE }}
 
       - name: Run database migration (Fase C1 y siguientes, expand-only)
         env:
