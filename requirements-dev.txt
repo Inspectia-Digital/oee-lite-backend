@@ -1,0 +1,7 @@
+# Dependencias sólo para desarrollo/CI (tests). No se instalan en la
+# imagen de producción (Fase K, auditoría QA #15): antes vivían mezcladas
+# en requirements.txt y terminaban dentro del build de Docker sin usarse
+# en runtime.
+-r requirements.txt
+httpx==0.27.2
+pytest==9.1.1
