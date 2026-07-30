@@ -178,9 +178,15 @@ def obtener_contexto_tenant(
     if impersonate_tenant:
         if not is_superadmin:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, 
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="Solo SuperAdmin puede usar el Modo Dios"
             )
+        if not db.get(Tenant, impersonate_tenant):
+            # Fail-closed (Fase K): antes se seguía de largo con un tenant_id
+            # fantasma -- el resto de la app asumía que "existe" por venir
+            # de un query param validado, y terminaba operando en silencio
+            # sobre un tenant que no está en la base.
+            raise HTTPException(status_code=404, detail="El tenant a impersonar no existe.")
         tenant_activo = impersonate_tenant
 
     if x_sub_tenant_id:
@@ -195,12 +201,14 @@ def obtener_contexto_tenant(
             planta = db.exec(
                 select(Planta).where(Planta.nombre.ilike(f"%{x_sub_tenant_id}%"), Planta.tenant_id == tenant_activo)
             ).first()
-        
+
         if not planta:
-            # Si no existe la planta mock, limpiamos el header para que cargue la vista global
-            x_sub_tenant_id = None
-        else:
-            x_sub_tenant_id = str(planta.id)
+            # Fail-closed (Fase K): antes esto degradaba silenciosamente a
+            # "vista global" (sub_tenant_id=None) -- una planta inválida o
+            # de otra empresa terminaba ampliando el alcance de la consulta
+            # en vez de cortar. Ahora se rechaza explícitamente.
+            raise HTTPException(status_code=404, detail="Planta no encontrada en esta empresa.")
+        x_sub_tenant_id = str(planta.id)
 
     return TenantContext(
         tenant_id=tenant_activo,
@@ -222,8 +230,15 @@ def obtener_tenant_aislado(
 # SUSPENSIÓN DE TENANT (Fase D.2)
 # ==========================================
 def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
-    """Corta Edge/M2M sólo si el tenant está en SUSPENSION_TOTAL."""
-    if tenant and tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
+    """Corta Edge/M2M si el tenant está en SUSPENSION_TOTAL, o si no existe.
+
+    Fail-closed (Fase K): antes, tenant=None (no encontrado en la base)
+    dejaba pasar sin cortar -- un tenant_id inválido o huérfano terminaba
+    operando sin ninguna restricción en vez de ser rechazado.
+    """
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant no encontrado.")
+    if tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La empresa se encuentra en suspensión total.",
@@ -231,8 +246,12 @@ def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
 
 
 def _verificar_acceso_humano_habilitado(tenant: Optional[Tenant]) -> None:
-    """Corta endpoints humanos si el tenant está UI_SUSPENDIDA o en SUSPENSION_TOTAL."""
-    if tenant and tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
+    """Corta endpoints humanos si el tenant está UI_SUSPENDIDA, en
+    SUSPENSION_TOTAL, o si no existe (fail-closed, ver nota en
+    verificar_no_suspension_total)."""
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant no encontrado.")
+    if tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="El acceso humano de esta empresa está suspendido.",
