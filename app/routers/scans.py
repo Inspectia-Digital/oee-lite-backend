@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from sqlmodel import Session, select
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 import uuid
@@ -121,6 +122,17 @@ def registrar_escaneo_rapido(
     estacion = db.exec(select(Estacion).where(Estacion.id == scan.id_estacion, Estacion.tenant_id == dispositivo.tenant_id)).first()
     if not estacion:
         raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
+
+    # Fase K (auditoría QA #5): serializa el procesamiento por estación.
+    # Antes, la deduplicación por event_id y la lectura de "el último
+    # evento" para calcular delta_t eran check-then-act sin lock: dos
+    # requests concurrentes (reintentos de red del mismo PLC) podían pasar
+    # ambas la comprobación de event_id y chocar recién en el commit
+    # (IntegrityError -> 500 sin manejar), o leer el mismo "último evento"
+    # y calcular deltas/paradas duplicadas. FOR UPDATE bloquea la fila de
+    # la Estacion hasta el commit de este request; el siguiente que llegue
+    # para la misma estación espera y ya ve el evento recién insertado.
+    db.exec(select(Estacion).where(Estacion.id == estacion.id).with_for_update()).first()
 
     # 0. IDEMPOTENCIA (Fase E1): mismo event_id + mismo hash -> 200 con el
     # evento existente, sin duplicar. Mismo event_id + hash distinto -> 409.
@@ -265,7 +277,25 @@ def registrar_escaneo_rapido(
     )
 
     db.add(nuevo_evento)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Red de seguridad además del FOR UPDATE de arriba: si de todos
+        # modos hubo una colisión de event_id (p.ej. dos requests que
+        # entraron a la sección crítica antes de que el lock surtiera
+        # efecto), no se cuelga en un 500 -- se resuelve como el mismo
+        # caso idempotente de la comprobación inicial.
+        db.rollback()
+        evento_existente = db.exec(
+            select(LiteEventoProduccion).where(LiteEventoProduccion.event_id == scan.event_id)
+        ).first()
+        if evento_existente and evento_existente.payload_hash == payload_hash:
+            return JSONResponse(status_code=status.HTTP_200_OK, content={
+                "status": "ok", "evento_id": str(evento_existente.id),
+                "unidades": evento_existente.unidades_procesadas, "desempeno": evento_existente.estado,
+                "idempotente": True,
+            })
+        raise HTTPException(status_code=409, detail="event_id ya usado con un payload diferente.")
 
     return {"status": "ok", "evento_id": nuevo_evento.id, "unidades": unidades_a_sumar, "desempeno": desempeno}
 
