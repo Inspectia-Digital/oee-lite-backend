@@ -7,6 +7,7 @@ from sqlmodel import SQLModel
 
 from app.core.config import settings
 from app.core.database import engine
+from app.core.observabilidad import RequestIDMiddleware
 
 # ==========================================
 # IMPORTACIÓN DE ROUTERS
@@ -58,8 +59,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "Authorization", "X-Sub-Tenant-Id"],
-    expose_headers=["X-Sub-Tenant-Id"]
+    expose_headers=["X-Sub-Tenant-Id", "X-Request-Id"]
 )
+
+# Observabilidad mínima (Fase K, auditoría QA #17): request-id correlacionable
+# + log de acceso estructurado por request. Se agrega último para que quede
+# como capa más externa y mida la duración total real del request.
+app.add_middleware(RequestIDMiddleware)
 
 # ==========================================
 # REGISTRO DE MÓDULOS (ROUTERS)
