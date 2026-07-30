@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from sqlmodel import Session, select
 from pydantic import BaseModel
@@ -6,6 +8,8 @@ from datetime import time
 import uuid
 import pandas as pd
 import io
+
+logger = logging.getLogger(__name__)
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
@@ -16,6 +20,10 @@ from app.models.domain import (
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
+
+# Fase K (auditoría QA #7): mismo criterio que en importaciones.py.
+MAX_UPLOAD_BYTES_ERP = 5 * 1024 * 1024  # 5 MiB
+MAX_FILAS_IMPORT_ERP = 20_000
 
 # ==========================================
 # 🛡️ MIDDLEWARE LOCAL (RBAC)
@@ -440,9 +448,21 @@ async def importar_skus_csv(
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Debe ser un archivo CSV")
 
-    contenido = await file.read()
+    # Fase K (auditoría QA #7): límite de tamaño -- lee como máximo un byte
+    # de más en vez de bufferizar un archivo arbitrariamente grande entero.
+    contenido = await file.read(MAX_UPLOAD_BYTES_ERP + 1)
+    if len(contenido) > MAX_UPLOAD_BYTES_ERP:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el límite de {MAX_UPLOAD_BYTES_ERP // (1024 * 1024)} MiB.",
+        )
     try:
         df = pd.read_csv(io.BytesIO(contenido))
+        if len(df) > MAX_FILAS_IMPORT_ERP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El archivo tiene {len(df)} filas; el máximo soportado por carga es {MAX_FILAS_IMPORT_ERP}.",
+            )
         requeridos = {'codigo_sku', 'descripcion', 'tiempo_ciclo_teorico'}
         if not requeridos.issubset(df.columns):
             raise ValueError(f"Faltan columnas requeridas: {requeridos - set(df.columns)}")
@@ -470,9 +490,16 @@ async def importar_skus_csv(
         db.commit()
         return {"mensaje": f"Se procesaron {skus_procesados} SKUs correctamente."}
 
-    except Exception as e:
+    except HTTPException:
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"Error procesando CSV: {str(e)}")
+        raise
+    except Exception as e:
+        # Fase K (auditoría QA #8): no se refleja el texto crudo de la
+        # excepción (puede incluir detalles internos de pandas/DB); se
+        # loguea completo del lado del servidor.
+        db.rollback()
+        logger.warning(f"Error procesando CSV de SKUs (tenant {context.tenant_id}): {e}")
+        raise HTTPException(status_code=400, detail="Error procesando el archivo. Verificá el formato y los datos.")
 
 
 @router.get("/erp/skus", response_model=List[MaestroSKU], tags=["Integración ERP"])

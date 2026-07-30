@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     AUTH0_DOMAIN: str = ""
     AUTH0_AUDIENCE: str = ""
     AUTH0_JWKS_TIMEOUT_SECONDS: float = 5.0
+    # TTL de la caché de JWKS (Fase K, auditoría QA #12). Antes era un
+    # @lru_cache sin vencimiento: si Auth0 rotaba claves, un kid nuevo
+    # quedaba rechazado hasta reiniciar la instancia.
+    AUTH0_JWKS_TTL_SECONDS: float = 3600.0
 
     # App M2M separada, autorizada contra la Management API (scope
     # create:user_tickets) para el reset de password (Fase J). Opcional: si

@@ -1,28 +1,22 @@
-name: Deploy Backend DEV
+name: Deploy Backend PROD
 
 on:
   push:
     branches:
-      - dev
+      - prod
   workflow_dispatch: {}
-    # Permite disparar el workflow a mano desde la pestaña Actions de GitHub,
-    # útil para probar el paso de migración de forma aislada antes de que
-    # dependa de un push real a dev.
+    # Permite disparar el workflow a mano desde la pestaña Actions de GitHub.
 
 env:
   PROJECT_ID: oee-control
   REGION: us-central1
-  SERVICE_NAME: api-oeelite-dev
-  DB_INSTANCE: oee-control:us-central1:oeelite-db-dev
+  SERVICE_NAME: api-oeelite-prod
+  DB_INSTANCE: oee-control:us-central1:oeelite-db-prod
   CLOUD_SQL_PROXY_VERSION: 2.14.0
 
 jobs:
-  # Fase K (auditoría QA #9): antes el único workflow desplegaba directo,
-  # sin correr ninguno de los tests que ya existen en el repo. Un push a
-  # dev podía llevar una regresión real a producción sin que nada lo
-  # frenara. Este job corre pytest contra un Postgres real (mismo
-  # criterio que localmente: nunca mocks para RBAC/triggers) antes de que
-  # el job de deploy pueda arrancar.
+  # Mismo gate que dev (Fase K): nada se despliega a producción sin que
+  # pase el suite de tests completo contra un Postgres real.
   test:
     runs-on: ubuntu-latest
     services:
@@ -73,6 +67,12 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    # Declara un GitHub Environment "production": permite configurar en
+    # Settings > Environments > production un paso de aprobación manual
+    # (required reviewers) sin tocar este archivo. No viene activado por
+    # default -- lo configurás vos si lo querés.
+    environment:
+      name: production
     permissions:
       contents: 'read'
       id-token: 'write' # Requerido para Workload Identity Federation
@@ -80,6 +80,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Validar secretos de producción requeridos
+        env:
+          RAW_DB_URL: ${{ secrets.PROD_DATABASE_URL_TCP }}
+          CORS_ORIGINS: ${{ secrets.PROD_CORS_ORIGINS }}
+          AUTH0_DOMAIN: ${{ secrets.PROD_AUTH0_DOMAIN }}
+          AUTH0_AUDIENCE: ${{ secrets.PROD_AUTH0_AUDIENCE }}
+        run: |
+          faltantes=""
+          [ -z "$RAW_DB_URL" ] && faltantes="$faltantes PROD_DATABASE_URL_TCP"
+          [ -z "$CORS_ORIGINS" ] && faltantes="$faltantes PROD_CORS_ORIGINS"
+          [ "$CORS_ORIGINS" = "*" ] && faltantes="$faltantes PROD_CORS_ORIGINS(no_puede_ser_*)"
+          [ -z "$AUTH0_DOMAIN" ] && faltantes="$faltantes PROD_AUTH0_DOMAIN"
+          [ -z "$AUTH0_AUDIENCE" ] && faltantes="$faltantes PROD_AUTH0_AUDIENCE"
+          if [ -n "$faltantes" ]; then
+            echo "ERROR: faltan (o son inválidos) estos secrets de GitHub para producción:$faltantes"
+            echo "Configurarlos en Settings > Secrets and variables > Actions antes de desplegar a prod."
+            exit 1
+          fi
 
       - name: Google Auth
         id: auth
@@ -101,27 +120,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # NOTA: no existe una GitHub Action oficial de Google para esto
-      # (google-github-actions/setup-cloud-sql-proxy no existe — error real
-      # visto en un deploy). Se descarga el binario oficial directamente
-      # desde storage.googleapis.com (eso sí es oficial y está verificado).
-      #
-      # El proxy se arranca, se espera y se usa TODO en el mismo step,
-      # a propósito: un proceso backgroundeado con "&" en un step de
-      # GitHub Actions no sobrevive de forma confiable al step siguiente
-      # (cada step corre en su propia shell); separarlo en dos steps fue
-      # la causa real del primer fallo ("connection refused" / "server
-      # closed the connection unexpectedly").
+      # Mismo enfoque que deploy-dev.yml: el proxy se arranca, se espera y
+      # se usa todo en el mismo step (ver esa nota ahí para el porqué).
       - name: Set up Cloud SQL Auth Proxy and run migration
         env:
-          RAW_DB_URL: ${{ secrets.DEV_DATABASE_URL_TCP }}
+          RAW_DB_URL: ${{ secrets.PROD_DATABASE_URL_TCP }}
+          ENVIRONMENT: production
+          CORS_ORIGINS: ${{ secrets.PROD_CORS_ORIGINS }}
+          AUTH0_DOMAIN: ${{ secrets.PROD_AUTH0_DOMAIN }}
+          AUTH0_AUDIENCE: ${{ secrets.PROD_AUTH0_AUDIENCE }}
         run: |
-          if [ -z "$RAW_DB_URL" ]; then
-            echo "ERROR: falta el secret DEV_DATABASE_URL_TCP (usuario:password@127.0.0.1:5432/db para conectar vía el proxy)."
-            echo "No es lo mismo que DEV_DATABASE_URL (esa apunta a un socket Unix, no sirve para TCP local)."
-            exit 1
-          fi
-
           curl -sSL -o cloud-sql-proxy \
             "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
           chmod +x cloud-sql-proxy
@@ -152,8 +160,6 @@ jobs:
           fi
 
           export DATABASE_URL="$RAW_DB_URL"
-          export ENVIRONMENT="development"
-          export CORS_ORIGINS="*"
           python -m alembic current
           python -m alembic upgrade head
 
@@ -176,11 +182,18 @@ jobs:
             --region $REGION \
             --project $PROJECT_ID \
             --add-cloudsql-instances $DB_INSTANCE \
-            --set-secrets="DATABASE_URL=DEV_DATABASE_URL:latest" \
-            --set-env-vars="AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}" \
+            --set-secrets="DATABASE_URL=PROD_DATABASE_URL:latest" \
+            --set-env-vars="ENVIRONMENT=production,AUTH0_DOMAIN=${{ secrets.PROD_AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.PROD_AUTH0_AUDIENCE }},CORS_ORIGINS=${{ secrets.PROD_CORS_ORIGINS }}" \
             --allow-unauthenticated \
-            --min-instances 0 \
-            --max-instances 5 \
+            --min-instances 1 \
+            --max-instances 10 \
             --cpu 1 \
             --memory 512Mi \
             --port 8080
+      # NOTA: --allow-unauthenticated es correcto acá (igual que en dev):
+      # es el gate de IAM de Cloud Run, que exige un token de identidad de
+      # Google -- no tiene nada que ver con la autenticación real de la
+      # app (JWT de Auth0 para humanos, X-Device-Key para M2M). El front
+      # nunca manda un token de identidad de Google, así que
+      # --no-allow-unauthenticated rompería el acceso público real. La
+      # seguridad la sigue dando la app, no Cloud Run.

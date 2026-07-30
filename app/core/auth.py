@@ -2,7 +2,7 @@ import json
 import logging
 from urllib.request import urlopen
 from typing import Optional
-from functools import lru_cache
+from cachetools import TTLCache
 import uuid
 from fastapi import Depends, HTTPException, status, Query, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -54,20 +54,34 @@ ALGORITHMS = ["RS256"]
 
 token_auth_scheme = HTTPBearer()
 
-@lru_cache(maxsize=1)
-def get_auth0_jwks():
-    """Obtiene y CACHEA las llaves públicas de Auth0 en RAM."""
+_jwks_cache: TTLCache = TTLCache(maxsize=1, ttl=settings.AUTH0_JWKS_TTL_SECONDS)
+_JWKS_CACHE_KEY = "jwks"
+
+
+def get_auth0_jwks(forzar_refresco: bool = False):
+    """Obtiene y cachea las llaves públicas de Auth0 en RAM, con TTL (Fase K,
+    auditoría QA #12). Antes era un @lru_cache sin vencimiento: si Auth0
+    rotaba claves, un token firmado con un kid nuevo quedaba rechazado
+    hasta que la instancia se reiniciara. Con TTL, a lo sumo tarda
+    AUTH0_JWKS_TTL_SECONDS en verse la clave nueva -- y verificar_token_auth0
+    fuerza un refresco inmediato si no encuentra el kid pedido."""
+    if not forzar_refresco and _JWKS_CACHE_KEY in _jwks_cache:
+        return _jwks_cache[_JWKS_CACHE_KEY]
+
     if not AUTH0_DOMAIN:
         logger.error("AUTH0_DOMAIN no está configurado.")
         raise HTTPException(status_code=503, detail="Autenticación no disponible temporalmente.")
 
     url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
     try:
-        return json.loads(urlopen(url, timeout=settings.AUTH0_JWKS_TIMEOUT_SECONDS).read())
+        jwks = json.loads(urlopen(url, timeout=settings.AUTH0_JWKS_TIMEOUT_SECONDS).read())
     except Exception as e:
         # Log detallado interno, pero respuesta pública sanitizada (sin URL/stack trace)
         logger.error(f"Falla crítica contactando Auth0 en {url}: {str(e)}")
         raise HTTPException(status_code=503, detail="Autenticación no disponible temporalmente.")
+
+    _jwks_cache[_JWKS_CACHE_KEY] = jwks
+    return jwks
 
 
 def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
@@ -80,17 +94,28 @@ def verificar_token_auth0(credentials: HTTPAuthorizationCredentials = Depends(to
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Formato de token inválido")
 
-    rsa_key = {}
-    for key in jwks["keys"]:
-        if key["kid"] == unverified_header.get("kid"):
-            rsa_key = {
-                "kty": key["kty"], 
-                "kid": key["kid"], 
-                "use": key["use"], 
-                "n": key["n"], 
-                "e": key["e"]
-            }
-            
+    kid_pedido = unverified_header.get("kid")
+
+    def _buscar_rsa_key(jwks_dict):
+        for key in jwks_dict["keys"]:
+            if key["kid"] == kid_pedido:
+                return {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+        return {}
+
+    rsa_key = _buscar_rsa_key(jwks)
+    if not rsa_key:
+        # El kid no está en la caché -- puede ser una rotación real de
+        # Auth0 (no sólo un token inválido). Se fuerza un único refresco
+        # en vez de esperar el TTL o un reinicio de instancia.
+        jwks = get_auth0_jwks(forzar_refresco=True)
+        rsa_key = _buscar_rsa_key(jwks)
+
     if rsa_key:
         try:
             payload = jwt.decode(
@@ -178,9 +203,15 @@ def obtener_contexto_tenant(
     if impersonate_tenant:
         if not is_superadmin:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, 
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="Solo SuperAdmin puede usar el Modo Dios"
             )
+        if not db.get(Tenant, impersonate_tenant):
+            # Fail-closed (Fase K): antes se seguía de largo con un tenant_id
+            # fantasma -- el resto de la app asumía que "existe" por venir
+            # de un query param validado, y terminaba operando en silencio
+            # sobre un tenant que no está en la base.
+            raise HTTPException(status_code=404, detail="El tenant a impersonar no existe.")
         tenant_activo = impersonate_tenant
 
     if x_sub_tenant_id:
@@ -195,12 +226,14 @@ def obtener_contexto_tenant(
             planta = db.exec(
                 select(Planta).where(Planta.nombre.ilike(f"%{x_sub_tenant_id}%"), Planta.tenant_id == tenant_activo)
             ).first()
-        
+
         if not planta:
-            # Si no existe la planta mock, limpiamos el header para que cargue la vista global
-            x_sub_tenant_id = None
-        else:
-            x_sub_tenant_id = str(planta.id)
+            # Fail-closed (Fase K): antes esto degradaba silenciosamente a
+            # "vista global" (sub_tenant_id=None) -- una planta inválida o
+            # de otra empresa terminaba ampliando el alcance de la consulta
+            # en vez de cortar. Ahora se rechaza explícitamente.
+            raise HTTPException(status_code=404, detail="Planta no encontrada en esta empresa.")
+        x_sub_tenant_id = str(planta.id)
 
     return TenantContext(
         tenant_id=tenant_activo,
@@ -222,8 +255,15 @@ def obtener_tenant_aislado(
 # SUSPENSIÓN DE TENANT (Fase D.2)
 # ==========================================
 def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
-    """Corta Edge/M2M sólo si el tenant está en SUSPENSION_TOTAL."""
-    if tenant and tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
+    """Corta Edge/M2M si el tenant está en SUSPENSION_TOTAL, o si no existe.
+
+    Fail-closed (Fase K): antes, tenant=None (no encontrado en la base)
+    dejaba pasar sin cortar -- un tenant_id inválido o huérfano terminaba
+    operando sin ninguna restricción en vez de ser rechazado.
+    """
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant no encontrado.")
+    if tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La empresa se encuentra en suspensión total.",
@@ -231,8 +271,12 @@ def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
 
 
 def _verificar_acceso_humano_habilitado(tenant: Optional[Tenant]) -> None:
-    """Corta endpoints humanos si el tenant está UI_SUSPENDIDA o en SUSPENSION_TOTAL."""
-    if tenant and tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
+    """Corta endpoints humanos si el tenant está UI_SUSPENDIDA, en
+    SUSPENSION_TOTAL, o si no existe (fail-closed, ver nota en
+    verificar_no_suspension_total)."""
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant no encontrado.")
+    if tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="El acceso humano de esta empresa está suspendido.",
