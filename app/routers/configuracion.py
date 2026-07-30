@@ -11,7 +11,8 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
-    Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS
+    Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
+    Maquina, MaquinaEstacion,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -92,6 +93,18 @@ class TurnoUpdate(BaseModel):
     hora_fin: Optional[time] = None
     descanso_minutos: Optional[int] = None
     activo: Optional[bool] = None
+
+class MaquinaCreate(BaseModel):
+    codigo_externo: str
+    nombre: Optional[str] = None
+
+class MaquinaUpdate(BaseModel):
+    codigo_externo: Optional[str] = None
+    nombre: Optional[str] = None
+    activo: Optional[bool] = None
+
+class MaquinaEstacionCreate(BaseModel):
+    estacion_id: uuid.UUID
 
 
 # ==========================================
@@ -176,7 +189,7 @@ def desactivar_linea(
 
 
 # ==========================================
-# ⚙️ ABM DE ESTACIONES (Maquinas)
+# ⚙️ ABM DE ESTACIONES
 # ==========================================
 @router.post("/estaciones/", response_model=Estacion, status_code=status.HTTP_201_CREATED)
 def crear_estacion(
@@ -638,3 +651,168 @@ def desactivar_orden(
     db.add(orden)
     db.commit()
     return {"mensaje": "Orden desactivada."}
+
+
+# ==========================================
+# 🏗️ ABM DE MÁQUINAS (Fase G)
+# El ingreso de eventos (scans.py) ya acepta y valida maquina_id contra
+# MaquinaEstacion desde Fase E1; hasta ahora no existía ningún CRUD para
+# darlas de alta ni asociarlas a una estación.
+# ==========================================
+@router.post("/maquinas/", response_model=Maquina, status_code=status.HTTP_201_CREATED)
+def crear_maquina(
+    payload: MaquinaCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    existente = db.exec(
+        select(Maquina).where(
+            Maquina.tenant_id == context.tenant_id,
+            Maquina.codigo_externo == payload.codigo_externo,
+            Maquina.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail=f"Ya existe una máquina activa con código '{payload.codigo_externo}'.")
+
+    nueva = Maquina(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nueva)
+    db.commit()
+    db.refresh(nueva)
+    return nueva
+
+
+@router.get("/maquinas/", response_model=List[Maquina])
+def listar_maquinas(
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(Maquina).where(Maquina.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(Maquina.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+
+@router.get("/maquinas/{maquina_id}", response_model=Maquina)
+def obtener_maquina(
+    maquina_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    maquina = db.exec(select(Maquina).where(Maquina.id == maquina_id, Maquina.tenant_id == context.tenant_id)).first()
+    if not maquina:
+        raise HTTPException(status_code=404, detail="Máquina no encontrada.")
+    return maquina
+
+
+@router.patch("/maquinas/{maquina_id}", response_model=Maquina)
+def actualizar_maquina(
+    maquina_id: uuid.UUID,
+    payload: MaquinaUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    maquina = db.exec(select(Maquina).where(Maquina.id == maquina_id, Maquina.tenant_id == context.tenant_id)).first()
+    if not maquina:
+        raise HTTPException(status_code=404, detail="Máquina no encontrada.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(maquina, key, value)
+    db.add(maquina)
+    db.commit()
+    db.refresh(maquina)
+    return maquina
+
+
+@router.delete("/maquinas/{maquina_id}")
+def desactivar_maquina(
+    maquina_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    maquina = db.exec(select(Maquina).where(Maquina.id == maquina_id, Maquina.tenant_id == context.tenant_id)).first()
+    if not maquina:
+        raise HTTPException(status_code=404, detail="Máquina no encontrada.")
+    maquina.activo = False
+    db.add(maquina)
+    db.commit()
+    return {"mensaje": "Máquina desactivada."}
+
+
+@router.post("/maquinas/{maquina_id}/estaciones", response_model=MaquinaEstacion, status_code=status.HTTP_201_CREATED)
+def asociar_maquina_a_estacion(
+    maquina_id: uuid.UUID,
+    payload: MaquinaEstacionCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    maquina = db.exec(select(Maquina).where(Maquina.id == maquina_id, Maquina.tenant_id == context.tenant_id)).first()
+    if not maquina:
+        raise HTTPException(status_code=404, detail="Máquina no encontrada.")
+    estacion = db.exec(select(Estacion).where(Estacion.id == payload.estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion:
+        raise HTTPException(status_code=404, detail="Estación no encontrada en este tenant.")
+
+    existente = db.exec(
+        select(MaquinaEstacion).where(
+            MaquinaEstacion.maquina_id == maquina_id,
+            MaquinaEstacion.estacion_id == payload.estacion_id,
+            MaquinaEstacion.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail="Esa máquina ya está asociada a esa estación.")
+
+    nueva = MaquinaEstacion(tenant_id=context.tenant_id, maquina_id=maquina_id, estacion_id=payload.estacion_id)
+    db.add(nueva)
+    db.commit()
+    db.refresh(nueva)
+    return nueva
+
+
+@router.get("/maquinas/{maquina_id}/estaciones", response_model=List[MaquinaEstacion])
+def listar_asociaciones_maquina(
+    maquina_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    maquina = db.exec(select(Maquina).where(Maquina.id == maquina_id, Maquina.tenant_id == context.tenant_id)).first()
+    if not maquina:
+        raise HTTPException(status_code=404, detail="Máquina no encontrada.")
+    return db.exec(
+        select(MaquinaEstacion).where(
+            MaquinaEstacion.maquina_id == maquina_id,
+            MaquinaEstacion.tenant_id == context.tenant_id,
+            MaquinaEstacion.activo == True,  # noqa: E712
+        )
+    ).all()
+
+
+@router.delete("/maquinas/{maquina_id}/estaciones/{asociacion_id}")
+def quitar_asociacion_maquina(
+    maquina_id: uuid.UUID,
+    asociacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    asociacion = db.exec(
+        select(MaquinaEstacion).where(
+            MaquinaEstacion.id == asociacion_id,
+            MaquinaEstacion.maquina_id == maquina_id,
+            MaquinaEstacion.tenant_id == context.tenant_id,
+        )
+    ).first()
+    if not asociacion:
+        raise HTTPException(status_code=404, detail="Asociación no encontrada.")
+    asociacion.activo = False
+    db.add(asociacion)
+    db.commit()
+    return {"mensaje": "Asociación desactivada."}
