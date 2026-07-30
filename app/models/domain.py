@@ -212,6 +212,18 @@ class AsignacionTurno(TenantBase, table=True):
     operario_fk: uuid.UUID = Field(foreign_key="dim_operarios.id")
     turno_fk: uuid.UUID = Field(foreign_key="dim_turnos.id")
 
+class AsignacionSupervisor(TenantBase, table=True):
+    """Tablero de supervisión diaria (Fase H). El turno es una plantilla
+    maestra; el supervisor a cargo se registra por día, no como atributo
+    fijo del turno. Idempotente por (tenant_id, fecha, linea_id, turno_id):
+    reasignar sobrescribe (upsert), nunca duplica."""
+    __tablename__ = "asignaciones_supervisor"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    fecha: date
+    linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
+    turno_id: uuid.UUID = Field(foreign_key="dim_turnos.id")
+    supervisor_id: uuid.UUID = Field(foreign_key="dim_supervisores.id")
+
 # ==========================================
 # 4. CATÁLOGO Y ÓRDENES (Input del ERP / Excel)
 # ==========================================
