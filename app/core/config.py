@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     AUTH0_AUDIENCE: str = ""
     AUTH0_JWKS_TIMEOUT_SECONDS: float = 5.0
 
+    # App M2M separada, autorizada contra la Management API (scope
+    # create:user_tickets) para el reset de password (Fase J). Opcional: si
+    # falta, el endpoint devuelve 503 en vez de romper el arranque -- no es
+    # requerida para el resto de la app.
+    AUTH0_MGMT_CLIENT_ID: str = ""
+    AUTH0_MGMT_CLIENT_SECRET: str = ""
+    AUTH0_MGMT_TIMEOUT_SECONDS: float = 5.0
+
     # Lista separada por comas, ej: "https://app.midominio.com,https://admin.midominio.com"
     CORS_ORIGINS: str = ""
 

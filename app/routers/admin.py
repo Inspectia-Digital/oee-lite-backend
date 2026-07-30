@@ -7,7 +7,8 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
-from app.core.rbac import requerir_gerencia_o_superadmin
+from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
+from app.core.auth0_management import crear_ticket_cambio_password
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso
 
 # Roles a los que no se les asigna alcance por planta -- ven todo el tenant
@@ -59,6 +60,12 @@ class TenantUpdate(BaseModel):
     logo_url: Optional[str] = None
     tolerancia_lento_pct: Optional[float] = None
     tolerancia_alerta_pct: Optional[float] = None
+
+class TenantLogoUpdate(BaseModel):
+    logo_url: str
+
+class TicketCambioPassword(BaseModel):
+    ticket_url: str
 
 class UsuarioPlantaCreate(BaseModel):
     usuario_id: uuid.UUID
@@ -185,6 +192,26 @@ def actualizar_mi_tenant(
     db.commit()
     db.refresh(tenant_db)
     return {"mensaje": "Configuración de empresa actualizada", "tenant": tenant_db}
+
+
+@router.post("/mi-empresa/tenant/logo", response_model=TenantLogoUpdate, tags=["Gestión de Accesos (Empresa)"])
+def actualizar_logo_tenant(
+    payload: TenantLogoUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    """Setea el branding del tenant a partir de una URL ya alojada (sin
+    upload de archivo: no hay object storage conectado todavía). El front
+    sube el archivo adonde corresponda y manda acá la URL resultante."""
+    tenant_db = db.get(Tenant, context.tenant_id)
+    if not tenant_db:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    tenant_db.logo_url = payload.logo_url
+    db.add(tenant_db)
+    db.commit()
+    db.refresh(tenant_db)
+    return TenantLogoUpdate(logo_url=tenant_db.logo_url)
 
 
 # ==========================================
@@ -453,6 +480,23 @@ def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), u
     db.add(usuario_target)
     db.commit()
     return {"mensaje": "Usuario desactivado."}
+
+
+@router.post("/superadmin/usuarios/{auth0_id}/reset-password", response_model=TicketCambioPassword, tags=["SuperAdmin (Global)"])
+def resetear_password_usuario(
+    auth0_id: str,
+    db: Session = Depends(get_session),
+    _: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Genera un link de cambio de password de un solo uso vía Auth0
+    Management API (ticket, no resetea directamente -- requiere sólo el
+    scope create:user_tickets, no update:users)."""
+    usuario_target = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
+    if not usuario_target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    ticket_url = crear_ticket_cambio_password(auth0_id)
+    return TicketCambioPassword(ticket_url=ticket_url)
 
 
 # ==========================================
