@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
@@ -11,7 +13,37 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.models.domain import OrdenProduccion, MaestroSKU, Tenant, Linea
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/lite/importaciones", tags=["Importación y Exportación (UI)"])
+
+# Fase K (auditoría QA #7): antes no había ningún límite de tamaño de
+# archivo ni de filas -- un usuario autenticado podía agotar la memoria de
+# una instancia Cloud Run de 512 MiB subiendo un archivo enorme. Límites
+# deliberadamente generosos para no bloquear cargas reales de catálogo,
+# pero acotados.
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_FILAS_IMPORT = 20_000
+
+
+async def _leer_archivo_acotado(file: UploadFile) -> bytes:
+    """Lee como máximo MAX_UPLOAD_BYTES + 1 del archivo -- si lo excede,
+    corta ahí en vez de bufferizar un archivo arbitrariamente grande
+    completo en memoria antes de rechazarlo."""
+    contenido = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contenido) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el límite de {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB.",
+        )
+    return contenido
+
+
+def _validar_cantidad_filas(df: pd.DataFrame) -> None:
+    if len(df) > MAX_FILAS_IMPORT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"El archivo tiene {len(df)} filas; el máximo soportado por carga es {MAX_FILAS_IMPORT}.",
+        )
 
 # ==========================================
 # HELPER: GUARDIA DE INTEGRACIÓN & PLANTA
@@ -72,8 +104,8 @@ async def subir_plan(
     # 1. Validaciones Core (ERP & Planta)
     verificar_permiso_carga_y_linea(db, context, linea_id)
 
-    # 2. Leer archivo
-    contenido = await file.read()
+    # 2. Leer archivo (acotado en tamaño, Fase K)
+    contenido = await _leer_archivo_acotado(file)
     try:
         if file.filename.lower().endswith('.csv'):
             df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python')
@@ -81,8 +113,12 @@ async def subir_plan(
             df = pd.read_excel(io.BytesIO(contenido))
         else:
             raise ValueError()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
+
+    _validar_cantidad_filas(df)
 
     # 3. Lógica de Mapeo Dinámico
     origen_auditoria = "CSV_TEMPLATE"
@@ -138,7 +174,11 @@ async def subir_plan(
                 creadas += 1
 
         except Exception as e:
-            errores.append(f"Fila {index}: Error de formato ({str(e)})")
+            # Fase K (auditoría QA #8): no se refleja el texto crudo de la
+            # excepción al cliente (puede incluir detalles internos de
+            # pandas/tipos); se loguea completo del lado del servidor.
+            logger.warning(f"Fila {index} del plan rechazada: {e}")
+            errores.append(f"Fila {index}: no se pudo procesar (revisar tipos y formato de los datos).")
 
     db.commit()
     return {"status": "ok", "resultados": {"creadas": creadas, "actualizadas": actualizadas, "errores": errores}}
@@ -168,7 +208,7 @@ async def subir_skus(
 ):
     verificar_permiso_carga_y_linea(db, context, linea_id)
 
-    contenido = await file.read()
+    contenido = await _leer_archivo_acotado(file)
     try:
         if file.filename.lower().endswith('.csv'):
             df = pd.read_csv(io.BytesIO(contenido), sep=None, engine='python')
@@ -176,8 +216,12 @@ async def subir_skus(
             df = pd.read_excel(io.BytesIO(contenido))
         else:
             raise ValueError()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
+
+    _validar_cantidad_filas(df)
 
     if map_json:
         try:
@@ -224,7 +268,8 @@ async def subir_skus(
                 creados += 1
 
         except Exception as e:
-            errores.append(f"Fila {index}: Error de formato ({str(e)})")
+            logger.warning(f"Fila {index} del catálogo de SKUs rechazada: {e}")
+            errores.append(f"Fila {index}: no se pudo procesar (revisar tipos y formato de los datos).")
 
     db.commit()
     return {"status": "ok", "resultados": {"creados": creados, "actualizados": actualizados, "errores": errores}}
