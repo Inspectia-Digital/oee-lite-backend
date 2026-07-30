@@ -285,6 +285,24 @@ class UsuarioPlanta(TenantBase, table=True):
     planta_id: uuid.UUID = Field(foreign_key="plantas.id")
     activo: bool = Field(default=True)
 
+class ModuloPermiso(TenantBase, table=True):
+    """Permiso por módulo y planta (Fase F, InspectIA OS).
+
+    SUPERADMIN/GERENCIA/PRODUCCION ven todos los módulos contratados por el
+    tenant sin necesitar filas acá (igual que ya pasa con UsuarioPlanta); esta
+    tabla sólo registra asignaciones explícitas para SUPERVISOR/OPERARIO,
+    scopeadas a una planta puntual. Hoy el único módulo real es "tymeo"; las
+    demás claves (oee-hub, vision, logistica, seguridad) quedan listas para
+    cuando existan esos backends.
+    """
+    __tablename__ = "modulo_permiso"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
+    modulo: str = Field(index=True, description="Ej: tymeo, oee-hub, vision, logistica, seguridad")
+    planta_id: uuid.UUID = Field(foreign_key="plantas.id")
+    rol: RolUsuario
+    activo: bool = Field(default=True)
+
 class ApiKeyDispositivo(TenantBase, table=True):
     """Credencial M2M para hardware fijo. Formato entregado al cliente: key_id.secret."""
     __tablename__ = "api_keys_dispositivo"
