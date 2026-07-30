@@ -7,8 +7,13 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
-from app.core.rbac import requerir_gerencia_o_superadmin
-from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant
+from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
+from app.core.auth0_management import crear_ticket_cambio_password
+from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso
+
+# Roles a los que no se les asigna alcance por planta -- ven todo el tenant
+# sin necesitar filas explícitas (mismo criterio ya usado por UsuarioPlanta).
+ROLES_ALCANCE_COMPLETO = (RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION)
 
 router = APIRouter(prefix="/accesos", tags=["Administración SaaS y RBAC"])
 
@@ -56,6 +61,12 @@ class TenantUpdate(BaseModel):
     tolerancia_lento_pct: Optional[float] = None
     tolerancia_alerta_pct: Optional[float] = None
 
+class TenantLogoUpdate(BaseModel):
+    logo_url: str
+
+class TicketCambioPassword(BaseModel):
+    ticket_url: str
+
 class UsuarioPlantaCreate(BaseModel):
     usuario_id: uuid.UUID
     planta_id: uuid.UUID
@@ -66,14 +77,84 @@ class UsuarioPlantaResponse(BaseModel):
     planta_id: uuid.UUID
     activo: bool
 
+class ModuloPermisoCreate(BaseModel):
+    usuario_id: uuid.UUID
+    modulo: str
+    planta_id: uuid.UUID
+    rol: RolUsuario
+
+class ModuloPermisoResponse(BaseModel):
+    id: uuid.UUID
+    usuario_id: uuid.UUID
+    modulo: str
+    planta_id: uuid.UUID
+    rol: RolUsuario
+    activo: bool
+
+class PermisoMe(BaseModel):
+    modulo: str
+    planta_id: Optional[uuid.UUID] = None
+    rol: RolUsuario
+
+class PerfilMeResponse(BaseModel):
+    id: uuid.UUID
+    auth0_id: str
+    tenant_id: str
+    email: Optional[str] = None
+    rol: RolUsuario
+    activo: bool
+    nombre: Optional[str] = None
+    apellido: Optional[str] = None
+    permisos: List[PermisoMe]
+
 
 # ==========================================
 # RUTAS DE PERFIL (FRONTEND BOOTSTRAP)
 # ==========================================
-@router.get("/usuarios/me", tags=["Perfil"])
-def obtener_perfil_actual(usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
-    """Devuelve los datos del usuario logueado para que el Frontend arme el menú y los permisos."""
-    return usuario_actual
+@router.get("/usuarios/me", response_model=PerfilMeResponse, tags=["Perfil"])
+def obtener_perfil_actual(
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    db: Session = Depends(get_session),
+):
+    """Devuelve los datos del usuario logueado más su matriz de permisos por
+    módulo y planta, para que el Frontend arme el menú y el gating de rutas.
+
+    SUPERADMIN/GERENCIA/PRODUCCION no tienen filas en ModuloPermiso (ven todo
+    el tenant, igual que ya pasa con UsuarioPlanta): se les sintetiza un
+    permiso de alcance completo (planta_id=None) por cada módulo contratado
+    por su tenant. SUPERVISOR/OPERARIO sólo ven los módulos/plantas que
+    tengan explícitamente asignados.
+    """
+    tenant = db.get(Tenant, usuario_actual.tenant_id)
+    modulos_contratados = [
+        m.strip().lower() for m in (tenant.modulos_contratados or "").split(",") if m.strip()
+    ] if tenant else []
+
+    if usuario_actual.rol in ROLES_ALCANCE_COMPLETO:
+        permisos = [
+            PermisoMe(modulo=modulo, planta_id=None, rol=usuario_actual.rol)
+            for modulo in modulos_contratados
+        ]
+    else:
+        filas = db.exec(
+            select(ModuloPermiso).where(
+                ModuloPermiso.usuario_id == usuario_actual.id,
+                ModuloPermiso.activo == True,  # noqa: E712
+            )
+        ).all()
+        permisos = [PermisoMe(modulo=f.modulo, planta_id=f.planta_id, rol=f.rol) for f in filas]
+
+    return PerfilMeResponse(
+        id=usuario_actual.id,
+        auth0_id=usuario_actual.auth0_id,
+        tenant_id=usuario_actual.tenant_id,
+        email=usuario_actual.email,
+        rol=usuario_actual.rol,
+        activo=usuario_actual.activo,
+        nombre=usuario_actual.nombre,
+        apellido=usuario_actual.apellido,
+        permisos=permisos,
+    )
 
 
 # ==========================================
@@ -111,6 +192,26 @@ def actualizar_mi_tenant(
     db.commit()
     db.refresh(tenant_db)
     return {"mensaje": "Configuración de empresa actualizada", "tenant": tenant_db}
+
+
+@router.post("/mi-empresa/tenant/logo", response_model=TenantLogoUpdate, tags=["Gestión de Accesos (Empresa)"])
+def actualizar_logo_tenant(
+    payload: TenantLogoUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    """Setea el branding del tenant a partir de una URL ya alojada (sin
+    upload de archivo: no hay object storage conectado todavía). El front
+    sube el archivo adonde corresponda y manda acá la URL resultante."""
+    tenant_db = db.get(Tenant, context.tenant_id)
+    if not tenant_db:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    tenant_db.logo_url = payload.logo_url
+    db.add(tenant_db)
+    db.commit()
+    db.refresh(tenant_db)
+    return TenantLogoUpdate(logo_url=tenant_db.logo_url)
 
 
 # ==========================================
@@ -381,6 +482,23 @@ def eliminar_usuario_global(auth0_id: str, db: Session = Depends(get_session), u
     return {"mensaje": "Usuario desactivado."}
 
 
+@router.post("/superadmin/usuarios/{auth0_id}/reset-password", response_model=TicketCambioPassword, tags=["SuperAdmin (Global)"])
+def resetear_password_usuario(
+    auth0_id: str,
+    db: Session = Depends(get_session),
+    _: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Genera un link de cambio de password de un solo uso vía Auth0
+    Management API (ticket, no resetea directamente -- requiere sólo el
+    scope create:user_tickets, no update:users)."""
+    usuario_target = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_id)).first()
+    if not usuario_target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    ticket_url = crear_ticket_cambio_password(auth0_id)
+    return TicketCambioPassword(ticket_url=ticket_url)
+
+
 # ==========================================
 # RBAC GEOLOCALIZADO: ASIGNACIÓN USUARIO-PLANTA (Fase D.1)
 # Aplica sólo a roles SUPERVISOR y OPERARIO; Gerencia/SuperAdmin ven
@@ -465,3 +583,95 @@ def quitar_asignacion_usuario_planta(
     db.add(asignacion)
     db.commit()
     return {"mensaje": "Asignación desactivada."}
+
+
+# ==========================================
+# PERMISOS POR MÓDULO Y PLANTA (Fase F, InspectIA OS)
+# Aplica sólo a roles SUPERVISOR y OPERARIO; Gerencia/SuperAdmin/Producción
+# ven todos los módulos contratados sin necesitar filas acá (ver /me).
+# ==========================================
+@router.post("/mi-empresa/modulo-permiso", response_model=ModuloPermisoResponse, status_code=status.HTTP_201_CREATED, tags=["Permisos por Módulo"])
+def asignar_permiso_modulo(
+    payload: ModuloPermisoCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    usuario_target = db.exec(
+        select(UsuarioSaaS).where(UsuarioSaaS.id == payload.usuario_id, UsuarioSaaS.tenant_id == context.tenant_id)
+    ).first()
+    if not usuario_target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado en este tenant.")
+
+    if usuario_target.rol in ROLES_ALCANCE_COMPLETO:
+        raise HTTPException(
+            status_code=400,
+            detail="Gerencia/SuperAdmin/Producción ya ven todos los módulos contratados; no necesitan permiso explícito.",
+        )
+
+    planta_target = db.exec(
+        select(Planta).where(Planta.id == payload.planta_id, Planta.tenant_id == context.tenant_id)
+    ).first()
+    if not planta_target:
+        raise HTTPException(status_code=404, detail="Planta no encontrada en este tenant.")
+
+    existente = db.exec(
+        select(ModuloPermiso).where(
+            ModuloPermiso.usuario_id == payload.usuario_id,
+            ModuloPermiso.modulo == payload.modulo,
+            ModuloPermiso.planta_id == payload.planta_id,
+            ModuloPermiso.activo == True,  # noqa: E712
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail="Ese usuario ya tiene ese módulo asignado en esa planta.")
+
+    nuevo_permiso = ModuloPermiso(
+        tenant_id=context.tenant_id,
+        usuario_id=payload.usuario_id,
+        modulo=payload.modulo,
+        planta_id=payload.planta_id,
+        rol=payload.rol,
+    )
+    db.add(nuevo_permiso)
+    db.commit()
+    db.refresh(nuevo_permiso)
+    return nuevo_permiso
+
+
+@router.get("/mi-empresa/modulo-permiso", response_model=List[ModuloPermisoResponse], tags=["Permisos por Módulo"])
+def listar_permisos_modulo(
+    usuario_id: Optional[uuid.UUID] = None,
+    planta_id: Optional[uuid.UUID] = None,
+    modulo: Optional[str] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    query = select(ModuloPermiso).where(ModuloPermiso.tenant_id == context.tenant_id, ModuloPermiso.activo == True)  # noqa: E712
+    if usuario_id:
+        query = query.where(ModuloPermiso.usuario_id == usuario_id)
+    if planta_id:
+        query = query.where(ModuloPermiso.planta_id == planta_id)
+    if modulo:
+        query = query.where(ModuloPermiso.modulo == modulo)
+    return db.exec(query).all()
+
+
+@router.delete("/mi-empresa/modulo-permiso/{permiso_id}", tags=["Permisos por Módulo"])
+def quitar_permiso_modulo(
+    permiso_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+):
+    permiso = db.exec(
+        select(ModuloPermiso).where(ModuloPermiso.id == permiso_id, ModuloPermiso.tenant_id == context.tenant_id)
+    ).first()
+    if not permiso:
+        raise HTTPException(status_code=404, detail="Permiso no encontrado.")
+
+    permiso.activo = False
+    db.add(permiso)
+    db.commit()
+    return {"mensaje": "Permiso desactivado."}

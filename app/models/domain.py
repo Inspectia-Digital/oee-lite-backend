@@ -212,6 +212,18 @@ class AsignacionTurno(TenantBase, table=True):
     operario_fk: uuid.UUID = Field(foreign_key="dim_operarios.id")
     turno_fk: uuid.UUID = Field(foreign_key="dim_turnos.id")
 
+class AsignacionSupervisor(TenantBase, table=True):
+    """Tablero de supervisión diaria (Fase H). El turno es una plantilla
+    maestra; el supervisor a cargo se registra por día, no como atributo
+    fijo del turno. Idempotente por (tenant_id, fecha, linea_id, turno_id):
+    reasignar sobrescribe (upsert), nunca duplica."""
+    __tablename__ = "asignaciones_supervisor"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    fecha: date
+    linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
+    turno_id: uuid.UUID = Field(foreign_key="dim_turnos.id")
+    supervisor_id: uuid.UUID = Field(foreign_key="dim_supervisores.id")
+
 # ==========================================
 # 4. CATÁLOGO Y ÓRDENES (Input del ERP / Excel)
 # ==========================================
@@ -283,6 +295,24 @@ class UsuarioPlanta(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
     planta_id: uuid.UUID = Field(foreign_key="plantas.id")
+    activo: bool = Field(default=True)
+
+class ModuloPermiso(TenantBase, table=True):
+    """Permiso por módulo y planta (Fase F, InspectIA OS).
+
+    SUPERADMIN/GERENCIA/PRODUCCION ven todos los módulos contratados por el
+    tenant sin necesitar filas acá (igual que ya pasa con UsuarioPlanta); esta
+    tabla sólo registra asignaciones explícitas para SUPERVISOR/OPERARIO,
+    scopeadas a una planta puntual. Hoy el único módulo real es "tymeo"; las
+    demás claves (oee-hub, vision, logistica, seguridad) quedan listas para
+    cuando existan esos backends.
+    """
+    __tablename__ = "modulo_permiso"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
+    modulo: str = Field(index=True, description="Ej: tymeo, oee-hub, vision, logistica, seguridad")
+    planta_id: uuid.UUID = Field(foreign_key="plantas.id")
+    rol: RolUsuario
     activo: bool = Field(default=True)
 
 class ApiKeyDispositivo(TenantBase, table=True):

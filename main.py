@@ -70,6 +70,7 @@ app.include_router(scans.router)
 
 # 2. UI Supervisor (Protegida por Planta)
 app.include_router(operacion.router)
+app.include_router(operacion.router_asignaciones_supervisor)
 
 # 3. Cargas Masivas (Excel/CSV protegidas por Planta)
 app.include_router(importaciones.router)
