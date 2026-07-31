@@ -228,12 +228,23 @@ def obtener_contexto_tenant(
             ).first()
 
         if not planta:
-            # Fail-closed (Fase K): antes esto degradaba silenciosamente a
-            # "vista global" (sub_tenant_id=None) -- una planta inválida o
-            # de otra empresa terminaba ampliando el alcance de la consulta
-            # en vez de cortar. Ahora se rechaza explícitamente.
-            raise HTTPException(status_code=404, detail="Planta no encontrada en esta empresa.")
-        x_sub_tenant_id = str(planta.id)
+            # Fase M: revertido el fail-closed de la Fase K a nivel de
+            # contexto base -- tenía un radio de impacto mucho mayor al
+            # previsto. Ningún endpoint de admin.py/plantas.py usa
+            # sub_tenant_id (gestionan el tenant/las plantas en sí, no
+            # operan "dentro" de una ya seleccionada); con el 404 acá,
+            # un X-Sub-Tenant-Id viejo o inválido (normal antes de tener
+            # ninguna planta cargada) bloqueaba crear la primera planta,
+            # editar la empresa, invitar usuarios, etc. Los endpoints que
+            # sí necesitan una planta válida (operacion.py, analytics.py)
+            # ya exigen por su cuenta que sub_tenant_id esté presente
+            # (400 "seleccione planta") desde antes de la Fase K -- eso
+            # sigue vigente y no depende de este chequeo. Un ID de otra
+            # empresa tampoco escala nada: la query de arriba ya filtra
+            # por tenant_activo, así que nunca matchea cross-tenant.
+            x_sub_tenant_id = None
+        else:
+            x_sub_tenant_id = str(planta.id)
 
     return TenantContext(
         tenant_id=tenant_activo,
