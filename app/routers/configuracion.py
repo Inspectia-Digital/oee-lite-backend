@@ -45,7 +45,11 @@ def _requerir_permiso_inactivos(incluir_inactivos: bool, usuario: UsuarioSaaS):
 # ==========================================
 class LineaCreate(BaseModel):
     nombre: str
-    planta_id: uuid.UUID
+    # Opcional: si no viene, se usa la planta activa (X-Sub-Tenant-Id).
+    # El front ya trackea "planta activa" vía ese header (switcher del
+    # TopBar) y no la manda en el body de creación -- exigirla acá
+    # duplicaba la misma info en dos lugares y bloqueaba crear líneas.
+    planta_id: Optional[uuid.UUID] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = ModoAsignacionOperarios.MANUAL
 
 class LineaUpdate(BaseModel):
@@ -125,12 +129,20 @@ def crear_linea(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
+    planta_id = payload.planta_id or (uuid.UUID(context.sub_tenant_id) if context.sub_tenant_id else None)
+    if not planta_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Falta planta_id (o seleccioná una planta activa en el selector) para crear la línea.",
+        )
+
     # Cross-Tenant Validation: Evita asignar la línea a una planta de otra empresa
-    planta_db = db.exec(select(Planta).where(Planta.id == payload.planta_id, Planta.tenant_id == context.tenant_id)).first()
+    planta_db = db.exec(select(Planta).where(Planta.id == planta_id, Planta.tenant_id == context.tenant_id)).first()
     if not planta_db:
         raise HTTPException(status_code=400, detail="La planta no existe o pertenece a otra organización.")
 
-    nueva_linea = Linea(tenant_id=context.tenant_id, **payload.model_dump())
+    datos = payload.model_dump(exclude={"planta_id"})
+    nueva_linea = Linea(tenant_id=context.tenant_id, planta_id=planta_id, **datos)
     db.add(nueva_linea)
     db.commit()
     db.refresh(nueva_linea)
