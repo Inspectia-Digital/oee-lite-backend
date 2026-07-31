@@ -167,3 +167,28 @@ def test_command_center_sin_plantas_asignadas_devuelve_vacio(client, db, tenant_
     assert r.status_code == 200
     assert r.json()["plantas"] == []
     assert r.json()["oee_global"] is None
+
+
+def test_command_center_respeta_impersonacion_de_superadmin(client, db, tenant_a, tenant_b, superadmin):
+    """Fase M: bug real -- usaba usuario.tenant_id (el tenant propio del
+    SuperAdmin) en vez de context.tenant_id, así que impersonar otra
+    empresa (?tenant_id=) no tenía efecto en este endpoint."""
+    _preparar_escenario(db, tenant_a)  # planta del tenant propio del superadmin
+    planta_b = Planta(tenant_id=tenant_b, nombre="Planta Impersonada")
+    db.add(planta_b)
+    db.commit()
+
+    autenticar_como(superadmin.id)
+
+    # Sin impersonar: ve las plantas de su propio tenant (tenant_a).
+    r = client.get("/command-center/summary")
+    assert r.status_code == 200
+    nombres_propios = {p["nombre"] for p in r.json()["plantas"]}
+    assert "Planta I" in nombres_propios
+    assert "Planta Impersonada" not in nombres_propios
+
+    # Impersonando tenant_b: debe ver la planta de tenant_b, no la propia.
+    r = client.get(f"/command-center/summary?tenant_id={tenant_b}")
+    assert r.status_code == 200
+    nombres_impersonados = {p["nombre"] for p in r.json()["plantas"]}
+    assert nombres_impersonados == {"Planta Impersonada"}

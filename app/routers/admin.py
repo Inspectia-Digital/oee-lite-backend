@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional
 from sqlalchemy import func
 import uuid
+
+# Catálogo de módulos válidos (Fase M). Sólo "tymeo" tiene backend real
+# hoy -- el resto quedan como valores aceptados para cuando existan, pero
+# ningún tenant debería tener "oee-hub"/"vision"/etc. habilitado todavía
+# (no hay nada del otro lado que lo sirva).
+MODULOS_VALIDOS = {"tymeo", "oee-hub", "vision", "logistica", "seguridad"}
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
@@ -63,6 +69,18 @@ class TenantUpdate(BaseModel):
 
 class TenantLogoUpdate(BaseModel):
     logo_url: str
+
+class TenantModulosUpdate(BaseModel):
+    modulos_contratados: List[str]
+
+    @field_validator("modulos_contratados")
+    @classmethod
+    def _validar_modulos(cls, v: List[str]) -> List[str]:
+        normalizados = [m.strip().lower() for m in v]
+        invalidos = [m for m in normalizados if m not in MODULOS_VALIDOS]
+        if invalidos:
+            raise ValueError(f"Módulos inválidos: {invalidos}. Válidos: {sorted(MODULOS_VALIDOS)}")
+        return normalizados
 
 class TicketCambioPassword(BaseModel):
     ticket_url: str
@@ -393,6 +411,30 @@ def actualizar_tenant_global(tenant_id: str, payload: TenantUpdate, db: Session 
     db.commit()
     db.refresh(tenant)
     return tenant
+
+@router.patch("/superadmin/tenants/{tenant_id}/modulos", tags=["SuperAdmin (Global)"])
+def actualizar_modulos_tenant(
+    tenant_id: str,
+    payload: TenantModulosUpdate,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Módulos contratados por el tenant (Fase M). Sólo SuperAdmin -- es una
+    decisión comercial/de billing, no algo que el propio tenant se
+    autoasigne desde /mi-empresa/tenant (por eso vive en un endpoint
+    separado del PATCH genérico de tenant, no en TenantUpdate)."""
+    if usuario_actual.rol != RolUsuario.SUPERADMIN:
+        raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+    tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+
+    tenant.modulos_contratados = ",".join(sorted(set(payload.modulos_contratados)))
+    db.add(tenant)
+    db.commit()
+    db.refresh(tenant)
+    return {"mensaje": f"Módulos de '{tenant_id}' actualizados.", "tenant": tenant}
+
 
 @router.patch("/superadmin/tenants/{tenant_id}/estado", tags=["SuperAdmin (Global)"])
 def cambiar_estado_empresa(
