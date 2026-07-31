@@ -833,6 +833,7 @@ def obtener_reporte_produccion(
 def obtener_resumen_command_center(
     db: Session = Depends(get_session),
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
     """KPIs cross-planta para el home del shell InspectIA OS (Fase I).
     No usa X-Sub-Tenant-Id (es multi-planta por diseño): Gerencia/SuperAdmin/
@@ -840,10 +841,16 @@ def obtener_resumen_command_center(
     las que tengan asignadas vía UsuarioPlanta (mismo criterio RBAC
     geolocalizado del resto de la app).
 
+    Fase M: usaba usuario.tenant_id (el tenant real del usuario logueado)
+    en vez de context.tenant_id -- rompía el "Modo Dios" de SuperAdmin
+    (?tenant_id=<otro>): al impersonar otra empresa, este endpoint seguía
+    mostrando los datos del tenant propio del SuperAdmin en vez del
+    impersonado. Bug real encontrado probando Green Mills en dev.
+
     'infraestructura' se interpreta como estaciones activas/total (no hay
     telemetría de conectividad de hardware más allá de las credenciales
     M2M) -- a confirmar con el frontend cuando conecte este endpoint."""
-    query_plantas = select(Planta).where(Planta.tenant_id == usuario.tenant_id, Planta.activo == True)  # noqa: E712
+    query_plantas = select(Planta).where(Planta.tenant_id == context.tenant_id, Planta.activo == True)  # noqa: E712
     if usuario.rol not in (RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION):
         plantas_asignadas = db.exec(
             select(UsuarioPlanta.planta_id).where(
@@ -863,7 +870,7 @@ def obtener_resumen_command_center(
     oees_validos = []
     alertas_activas = 0
     for planta in plantas_db:
-        context_planta = TenantContext(tenant_id=usuario.tenant_id, sub_tenant_id=str(planta.id), is_superadmin=(usuario.rol == RolUsuario.SUPERADMIN))
+        context_planta = TenantContext(tenant_id=context.tenant_id, sub_tenant_id=str(planta.id), is_superadmin=context.is_superadmin)
         m = _calcular_metricas_oee(db, context_planta, None, None, None, None)
         oee_pct = round(m["oee_general"] * 100, 1) if m else None
         if oee_pct is not None:
@@ -874,7 +881,7 @@ def obtener_resumen_command_center(
             .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
             .join(Linea, Estacion.linea_id == Linea.id)
             .where(
-                ParadaDetectada.tenant_id == usuario.tenant_id,
+                ParadaDetectada.tenant_id == context.tenant_id,
                 Linea.planta_id == planta.id,
                 ParadaDetectada.estado == "pendiente",
             )
@@ -889,7 +896,7 @@ def obtener_resumen_command_center(
     if plantas_db:
         estaciones_total = db.exec(
             select(Estacion).join(Linea, Estacion.linea_id == Linea.id).where(
-                Estacion.tenant_id == usuario.tenant_id,
+                Estacion.tenant_id == context.tenant_id,
                 Linea.planta_id.in_([p.id for p in plantas_db]),
             )
         ).all()
