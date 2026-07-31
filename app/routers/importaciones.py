@@ -115,7 +115,12 @@ async def subir_plan(
             raise ValueError()
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        # No se refleja el texto crudo al cliente, pero antes tampoco
+        # quedaba registrado del lado del servidor -- un error real (ej.
+        # falta una dependencia para leer .xlsx) quedaba indistinguible
+        # de "el usuario subió un archivo con formato raro".
+        logger.warning(f"Fallo parseando archivo '{file.filename}': {e}")
         raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
 
     _validar_cantidad_filas(df)
@@ -218,7 +223,12 @@ async def subir_skus(
             raise ValueError()
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        # No se refleja el texto crudo al cliente, pero antes tampoco
+        # quedaba registrado del lado del servidor -- un error real (ej.
+        # falta una dependencia para leer .xlsx) quedaba indistinguible
+        # de "el usuario subió un archivo con formato raro".
+        logger.warning(f"Fallo parseando archivo '{file.filename}': {e}")
         raise HTTPException(status_code=400, detail="Formato no soportado. Usa CSV o Excel.")
 
     _validar_cantidad_filas(df)
