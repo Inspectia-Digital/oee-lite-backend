@@ -95,6 +95,10 @@ class Tenant(SQLModel, table=True):
     activo: bool = Field(default=True)
     tolerancia_lento_pct: float = Field(default=1.15)
     tolerancia_alerta_pct: float = Field(default=1.25)
+    # Fase N: objetivo de OEE de referencia del tenant, configurable por
+    # Gerencia (antes estaba hardcodeado en el front: 75 en la tendencia,
+    # 85 en el Command Center -- ninguno de los dos venía de acá).
+    oee_objetivo_pct: float = Field(default=85.0)
     regex_parser_orden: Optional[str] = None
     regex_parser_sku: Optional[str] = None
     origen_maestros: str = Field(default="MANUAL")
@@ -356,6 +360,13 @@ class ParadaDetectada(TenantBase, table=True):
     duracion_segundos: Optional[float] = None
     estado: EstadoParada = Field(default=EstadoParada.PENDIENTE)
     motivo_fk: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_motivos_parada.id")
+    # Fase N: distingue paradas detectadas automáticamente por gap de scans
+    # (AUTOMATICA, el flujo pendiente->clasificar) de las cargadas de
+    # antemano por un supervisor (PLANIFICADA, vía /paradas/planificadas).
+    # Necesario para separar "historial de clasificadas" de "programadas"
+    # en el front sin ambigüedad -- antes ambas terminaban con el mismo
+    # estado=CLASIFICADA y no había forma de diferenciarlas.
+    origen: str = Field(default="AUTOMATICA")
 
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""

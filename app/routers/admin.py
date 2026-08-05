@@ -66,6 +66,9 @@ class TenantUpdate(BaseModel):
     logo_url: Optional[str] = None
     tolerancia_lento_pct: Optional[float] = None
     tolerancia_alerta_pct: Optional[float] = None
+    # Fase N: objetivo de OEE configurable (antes hardcodeado en el front:
+    # 75 en la tendencia, 85 en el Command Center).
+    oee_objetivo_pct: Optional[float] = None
 
 class TenantLogoUpdate(BaseModel):
     logo_url: str
