@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 import uuid
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
@@ -33,6 +33,20 @@ class AsignacionRetroactiva(BaseModel):
     operario_fk: uuid.UUID
     inicio: datetime
     fin: datetime
+
+class ParadaHistorialRow(BaseModel):
+    id: uuid.UUID
+    estacion_fk: uuid.UUID
+    estacion_nombre: str
+    linea_id: uuid.UUID
+    linea_nombre: str
+    inicio: datetime
+    fin: Optional[datetime] = None
+    duracion_segundos: Optional[float] = None
+    estado: EstadoParada
+    origen: str
+    motivo_fk: Optional[uuid.UUID] = None
+    motivo_nombre: Optional[str] = None
 
 def validar_planta(context: TenantContext, usuario: UsuarioSaaS, db: Session):
     """RBAC geolocalizado (Fase D.3): Gerencia/SuperAdmin acceden a todo el
@@ -131,12 +145,107 @@ def registrar_parada_planificada(
         inicio=datos.inicio,
         fin=datos.fin,
         duracion_segundos=duracion,
-        estado=EstadoParada.CLASIFICADA
+        estado=EstadoParada.CLASIFICADA,
+        origen="PLANIFICADA",
     )
     db.add(nueva_parada)
     db.commit()
     db.refresh(nueva_parada)
     return nueva_parada
+
+
+# ==========================================
+# HISTORIAL DE PARADAS (Fase N -- auditoría de producción #8/#9)
+# Antes sólo existía /paradas-pendientes (estado=PENDIENTE); ni el
+# historial de clasificadas ni el listado de programadas tenían un GET
+# real -- el front las leía de un mock local en memoria.
+# ==========================================
+@router.get("/paradas", response_model=List[ParadaHistorialRow])
+def listar_historial_paradas(
+    estado: Optional[EstadoParada] = None,
+    origen: Optional[str] = None,
+    linea_id: Optional[uuid.UUID] = None,
+    motivo_fk: Optional[uuid.UUID] = None,
+    fecha_desde: Optional[date] = None,
+    fecha_hasta: Optional[date] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Historial completo de paradas, filtrable. `origen=PLANIFICADA` da el
+    listado de "programadas"; `estado=clasificada&origen=AUTOMATICA` da el
+    historial de clasificadas por el supervisor. Sin filtros, trae todo
+    (paginado). Misma planta activa que el resto de /supervisor."""
+    validar_planta(context, usuario, db)
+    if not (1 <= limit <= 500):
+        raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 500.")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset no puede ser negativo.")
+
+    query = (
+        select(ParadaDetectada, Estacion, Linea, MotivoParada)
+        .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
+        .where(
+            ParadaDetectada.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+        )
+    )
+    if estado is not None:
+        query = query.where(ParadaDetectada.estado == estado)
+    if origen is not None:
+        query = query.where(ParadaDetectada.origen == origen)
+    if linea_id is not None:
+        query = query.where(Linea.id == linea_id)
+    if motivo_fk is not None:
+        query = query.where(ParadaDetectada.motivo_fk == motivo_fk)
+    if fecha_desde is not None:
+        query = query.where(ParadaDetectada.inicio >= datetime.combine(fecha_desde, time.min))
+    if fecha_hasta is not None:
+        query = query.where(ParadaDetectada.inicio <= datetime.combine(fecha_hasta, time.max))
+
+    query = query.order_by(ParadaDetectada.inicio.desc()).offset(offset).limit(limit)
+    filas = db.exec(query).all()
+
+    return [
+        ParadaHistorialRow(
+            id=p.id, estacion_fk=p.estacion_fk, estacion_nombre=e.nombre,
+            linea_id=l.id, linea_nombre=l.nombre,
+            inicio=p.inicio, fin=p.fin, duracion_segundos=p.duracion_segundos,
+            estado=p.estado, origen=p.origen,
+            motivo_fk=p.motivo_fk, motivo_nombre=m.nombre if m else None,
+        )
+        for p, e, l, m in filas
+    ]
+
+
+@router.delete("/paradas/{parada_id}")
+def eliminar_parada_planificada(
+    parada_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Deshace una parada programada por error, mientras no haya empezado
+    todavía. No se puede borrar una parada AUTOMATICA ni una PLANIFICADA
+    que ya está en curso o pasada -- ahí se preserva trazabilidad real de
+    downtime, no es una fila de agenda editable."""
+    validar_planta(context, usuario, db)
+    parada = db.get(ParadaDetectada, parada_id)
+    if not parada or parada.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")
+    if parada.origen != "PLANIFICADA":
+        raise HTTPException(status_code=409, detail="Sólo se pueden eliminar paradas programadas (origen PLANIFICADA).")
+    if parada.inicio <= datetime.utcnow():
+        raise HTTPException(status_code=409, detail="No se puede eliminar una parada programada que ya comenzó o pasó.")
+
+    db.delete(parada)
+    db.commit()
+    return {"mensaje": "Parada programada eliminada."}
+
 
 @router.post("/operarios/asignar-retroactivo")
 def asignar_operario_retroactivo():

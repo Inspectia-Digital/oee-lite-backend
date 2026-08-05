@@ -11,6 +11,7 @@ from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada,
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
+    OrdenProduccion,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -94,6 +95,17 @@ class ReporteProduccionRow(BaseModel):
     alertas: int
     rechazadas: int
     tiempo_promedio_seg: float
+
+class PlanVsActualRow(BaseModel):
+    id_orden: str
+    sku_fk: Optional[str] = None
+    linea_id: uuid.UUID
+    linea_nombre: str
+    plan_fecha: Optional[str] = None
+    estado: str
+    cantidad_esperada: int
+    cantidad_producida: int
+    cumplimiento_pct: Optional[float] = None
 
 class CommandCenterPlanta(BaseModel):
     id: uuid.UUID
@@ -826,6 +838,81 @@ def obtener_reporte_produccion(
         raise
     except Exception as e:
         logger.error(f"Error en reporte de producción: {e}")
+        return []
+
+
+@router.get("/analytics/plan-vs-actual/", response_model=list[PlanVsActualRow])
+def obtener_plan_vs_actual(
+    fecha_desde: date, fecha_hasta: date,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano)
+):
+    """Cruza el plan (OrdenProduccion.cantidad_esperada) contra la
+    producción real acumulada de cada orden (suma de
+    LiteEventoProduccion.unidades_procesadas agrupada por orden_fk). Antes
+    esta vista era mock siempre en el front -- no existía ningún endpoint
+    que hiciera este cruce (Fase N, auditoría de producción #7).
+
+    cantidad_producida es acumulado a la fecha de consulta, no acotado a
+    fecha_desde/fecha_hasta: ese rango sólo filtra qué órdenes del plan se
+    muestran, no los eventos de producción que las completan (una orden
+    puede seguir sumando piezas después de su plan_fecha)."""
+    try:
+        validar_planta(context)
+        if fecha_hasta < fecha_desde:
+            raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+
+        query = (
+            select(OrdenProduccion, Linea)
+            .join(Linea, OrdenProduccion.linea_id == Linea.id)
+            .where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.activo == True,  # noqa: E712
+                Linea.planta_id == context.sub_tenant_id,
+                OrdenProduccion.plan_fecha >= fecha_desde.isoformat(),
+                OrdenProduccion.plan_fecha <= fecha_hasta.isoformat(),
+            )
+        )
+        if linea_id:
+            query = query.where(Linea.id == linea_id)
+        ordenes = db.exec(query).all()
+
+        if not ordenes:
+            return []
+
+        ids_orden = [orden.id_orden for orden, _ in ordenes]
+        eventos = db.exec(
+            select(LiteEventoProduccion.orden_fk, LiteEventoProduccion.unidades_procesadas)
+            .where(
+                LiteEventoProduccion.tenant_id == context.tenant_id,
+                LiteEventoProduccion.orden_fk.in_(ids_orden),
+            )
+        ).all()
+        producido_por_orden: dict = {}
+        for orden_fk, unidades in eventos:
+            producido_por_orden[orden_fk] = producido_por_orden.get(orden_fk, 0) + (unidades or 0)
+
+        filas = [
+            PlanVsActualRow(
+                id_orden=orden.id_orden, sku_fk=orden.sku_fk,
+                linea_id=linea.id, linea_nombre=linea.nombre,
+                plan_fecha=orden.plan_fecha, estado=str(orden.estado.value if hasattr(orden.estado, "value") else orden.estado),
+                cantidad_esperada=orden.cantidad_esperada,
+                cantidad_producida=producido_por_orden.get(orden.id_orden, 0),
+                cumplimiento_pct=(
+                    round(producido_por_orden.get(orden.id_orden, 0) / orden.cantidad_esperada * 100, 1)
+                    if orden.cantidad_esperada else None
+                ),
+            )
+            for orden, linea in ordenes
+        ]
+        filas.sort(key=lambda f: (f.plan_fecha or "", f.id_orden))
+        return filas
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en plan vs actual: {e}")
         return []
 
 
