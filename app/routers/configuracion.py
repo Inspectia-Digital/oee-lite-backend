@@ -562,6 +562,50 @@ def actualizar_sku(
     return sku
 
 
+# Fase M: alta manual de un SKU individual, sin pasar por importación de
+# archivo -- antes el alta era exclusivamente vía /erp/skus/bulk (CSV) o
+# /api/lite/importaciones/skus/upload (CSV/Excel); no existía ningún POST
+# de un solo SKU, a diferencia de /config/ordenes/ que sí lo tenía.
+class MaestroSKUCreate(BaseModel):
+    codigo_sku: str
+    descripcion: str
+    tiempo_ciclo_teorico: float = 240.0
+    unidades_por_ciclo: int = 1
+    linea_id: Optional[uuid.UUID] = None
+
+
+@router.post("/erp/skus", response_model=MaestroSKU, status_code=status.HTTP_201_CREATED, tags=["Integración ERP"])
+def crear_sku(
+    payload: MaestroSKUCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    # codigo_sku sigue siendo PK legacy (C1/C2): el chequeo de duplicado no
+    # filtra por `activo` -- un SKU inactivo con el mismo código igual
+    # rompería el INSERT por choque de PK, así que hay que detectarlo antes
+    # y devolver un 409 claro en vez de dejar que explote el commit.
+    existente = db.exec(
+        select(MaestroSKU).where(
+            MaestroSKU.tenant_id == context.tenant_id,
+            MaestroSKU.codigo_sku == payload.codigo_sku,
+        )
+    ).first()
+    if existente:
+        raise HTTPException(status_code=409, detail=f"Ya existe un SKU con código '{payload.codigo_sku}'.")
+
+    if payload.linea_id:
+        linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+
+    nuevo = MaestroSKU(tenant_id=context.tenant_id, **payload.model_dump())
+    db.add(nuevo)
+    db.commit()
+    db.refresh(nuevo)
+    return nuevo
+
+
 # ==========================================
 # 📋 ABM DE ÓRDENES DE PRODUCCIÓN
 # Antes no existía ningún CRUD vivo (el único código que las manejaba,
