@@ -374,10 +374,23 @@ def actualizar_usuario(
 @router.get("/superadmin/tenants")
 def listar_todos_los_tenants(db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
     if usuario_actual.rol != RolUsuario.SUPERADMIN: raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
+    # `modulos_contratados` se agrega acá (Fase O, seguimiento de auditoría
+    # #2): el panel SaaS necesitaba el dato para mostrar/editar los
+    # switches de "Módulos contratados" sin un fetch extra por tenant.
+    # Válido en GROUP BY sin agregarlo ahí: depende funcionalmente de
+    # Tenant.id (su PK), Postgres lo permite igual que con nombre/logo_url.
     stmt = select(
-        Tenant.id, Tenant.nombre, Tenant.color_primario, Tenant.logo_url, func.count(UsuarioSaaS.id).label("total_usuarios")
+        Tenant.id, Tenant.nombre, Tenant.color_primario, Tenant.logo_url,
+        Tenant.modulos_contratados, func.count(UsuarioSaaS.id).label("total_usuarios")
     ).outerjoin(UsuarioSaaS, Tenant.id == UsuarioSaaS.tenant_id).group_by(Tenant.id)
-    return [{"id": r.id, "nombre": r.nombre, "color_primario": r.color_primario, "logo_url": r.logo_url, "total_usuarios": r.total_usuarios} for r in db.exec(stmt).all()]
+    return [
+        {
+            "id": r.id, "nombre": r.nombre, "color_primario": r.color_primario,
+            "logo_url": r.logo_url, "modulos_contratados": r.modulos_contratados,
+            "total_usuarios": r.total_usuarios,
+        }
+        for r in db.exec(stmt).all()
+    ]
 
 @router.post("/superadmin/tenants", tags=["SuperAdmin (Global)"])
 def crear_tenant_global(datos: TenantCreate, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):
