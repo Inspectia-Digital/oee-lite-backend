@@ -11,7 +11,7 @@ from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada,
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
-    OrdenProduccion,
+    OrdenProduccion, AsignacionTurno, EstadoParada, EstadoOrden,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -71,7 +71,9 @@ class TendenciaOEERow(BaseModel):
     oee: float
     disp: float
     rend: float
-    cal: float
+    # Fase O: None = sin datos de calidad ese día (distinto de 0%), mismo
+    # criterio que OeeGeneralCard.calidad_pct.
+    cal: Optional[float] = None
 
 class CascadaOEE(BaseModel):
     tiempo_calendario_min: float
@@ -106,6 +108,34 @@ class PlanVsActualRow(BaseModel):
     cantidad_esperada: int
     cantidad_producida: int
     cumplimiento_pct: Optional[float] = None
+
+class LineaEnVivoEstacion(BaseModel):
+    estacion_fk: uuid.UUID
+    estacion_nombre: str
+    posicion_linea: int
+    estado: str  # "activa" | "parada" | "sin_datos"
+    operario_id: Optional[uuid.UUID] = None
+    operario_nombre: Optional[str] = None
+    ultimo_evento: Optional[str] = None
+
+class LineaEnVivoResumen(BaseModel):
+    linea_id: Optional[uuid.UUID] = None
+    linea_nombre: Optional[str] = None
+    turno_actual: Optional[str] = None
+    orden_activa: Optional[str] = None
+    orden_sku: Optional[str] = None
+    estaciones: List[LineaEnVivoEstacion] = []
+
+class RendimientoOperarioRow(BaseModel):
+    operario_id: uuid.UUID
+    legajo: str
+    nombre: str
+    estaciones_operadas: List[str]
+    unidades_producidas: int
+    retrabajos_generados: int
+    tiempo_promedio_seg: float
+    distribucion_desempeno: dict  # {"optimo": pct, "lento": pct, "alerta": pct}
+    eficiencia_global: float  # % óptimo sobre el total de eventos
 
 class CommandCenterPlanta(BaseModel):
     id: uuid.UUID
@@ -219,6 +249,7 @@ def obtener_dashboard_estaciones(
 def obtener_oee_general(
     fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
+    orden_fk: Optional[str] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
@@ -258,7 +289,7 @@ def obtener_oee_general(
         )
 
     try:
-        m = _calcular_metricas_oee(db, context, fecha_desde, fecha_hasta, linea_id, turno_id)
+        m = _calcular_metricas_oee(db, context, fecha_desde, fecha_hasta, linea_id, turno_id, orden_fk)
         if m is None:
             return OeeGeneralCard(
                 disponibilidad_pct=0.0, rendimiento_pct=0.0, calidad_pct=None, oee_general_pct=0.0,
@@ -288,12 +319,21 @@ def _calcular_metricas_oee(
     db: Session, context: TenantContext,
     fecha_desde: Optional[date], fecha_hasta: Optional[date],
     linea_id: Optional[uuid.UUID], turno_id: Optional[uuid.UUID],
+    orden_fk: Optional[str] = None,
 ) -> Optional[dict]:
     """Núcleo del motor OEE (Fase E2), extraído para reusarse en oee-general
     y oee-cascada (Fase I) -- una sola fuente de verdad para las fórmulas,
     nunca se recalculan por separado en cada endpoint. Devuelve None si no
-    hay eventos en el período (equivalente al "panel vacío" de antes)."""
-    inicio, fin = obtener_rango_dia(fecha_desde)
+    hay eventos en el período (equivalente al "panel vacío" de antes).
+
+    Fase O (auditoría de producción del front #2): antes usaba
+    `obtener_rango_dia(fecha_desde)` solo, así que `fecha_hasta` quedaba
+    silenciosamente ignorado -- pedir un rango de 30 días devolvía nada más
+    que el primer día. Ahora el rango realmente cubre [fecha_desde,
+    fecha_hasta]. También suma el filtro opcional por orden (`orden_fk`,
+    el "Plan" del dashboard)."""
+    inicio, _ = obtener_rango_dia(fecha_desde)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
 
     query = (
         select(LiteEventoProduccion, Estacion, Linea)
@@ -308,6 +348,7 @@ def _calcular_metricas_oee(
         )
     )
     if linea_id: query = query.where(Linea.id == linea_id)
+    if orden_fk: query = query.where(LiteEventoProduccion.orden_fk == orden_fk)
     eventos = db.exec(query).all()
 
     if not eventos:
@@ -412,15 +453,28 @@ def _calcular_metricas_oee(
 
 @router.get("/analytics/reporte-operarios/", response_model=list[ReporteOperarioSpringwall])
 def obtener_reporte_springwall(
-    skip: int = 0, limit: int = 1000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None,
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
+    orden_fk: Optional[str] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
+    """Fase O (auditoría de producción del front #2/#3): se agregan
+    fecha_desde/fecha_hasta/linea_id/turno_id/orden_fk para que los filtros
+    del dashboard tengan efecto real acá. `fecha` (día único) se mantiene
+    por compatibilidad -- si viene, gana sobre fecha_desde/fecha_hasta.
+    `turno_id` filtra los eventos por franja horaria del turno, no por un
+    campo directo en el evento (LiteEventoProduccion no guarda turno_fk)."""
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia(fecha)
-            
-        eventos = db.exec(
+        if fecha is not None:
+            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        else:
+            inicio_dia, _ = obtener_rango_dia(fecha_desde)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+
+        query = (
             select(LiteEventoProduccion, Estacion, Operario)
             .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
             .join(Linea, Estacion.linea_id == Linea.id)
@@ -432,9 +486,22 @@ def obtener_reporte_springwall(
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia
             )
-            .offset(skip)
-            .limit(limit)
-        ).all()
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        if orden_fk: query = query.where(LiteEventoProduccion.orden_fk == orden_fk)
+        query = query.offset(skip).limit(limit)
+        eventos = db.exec(query).all()
+
+        if turno_id:
+            turno = db.exec(select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)).first()
+            if turno:
+                def _en_turno(ts, hi, hf):
+                    hora = ts.time()
+                    return (hi <= hora <= hf) if hi <= hf else (hora >= hi or hora <= hf)
+                eventos = [
+                    (e, est, op) for e, est, op in eventos
+                    if _en_turno(e.timestamp, turno.hora_inicio, turno.hora_fin)
+                ]
 
         data_agrupada = {}
         for evento, estacion, operario in eventos:
@@ -479,15 +546,25 @@ def obtener_reporte_springwall(
 
 @router.get("/analytics/pareto-paradas/", response_model=list[ParetoParadas])
 def obtener_pareto_paradas(
-    skip: int = 0, limit: int = 1000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None,
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
+    """Fase O (auditoría de producción del front #2): fecha_desde/
+    fecha_hasta/linea_id para que los filtros del dashboard tengan efecto
+    real. Sin filtro por orden -- ParadaDetectada no tiene relación con
+    OrdenProduccion, el "Plan" no aplica a este reporte."""
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia(fecha)
-            
-        paradas = db.exec(
+        if fecha is not None:
+            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        else:
+            inicio_dia, _ = obtener_rango_dia(fecha_desde)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+
+        query = (
             select(ParadaDetectada, MotivoParada)
             .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
             .join(Linea, Estacion.linea_id == Linea.id)
@@ -498,9 +575,10 @@ def obtener_pareto_paradas(
                 ParadaDetectada.inicio >= inicio_dia,
                 ParadaDetectada.inicio <= fin_dia
             )
-            .offset(skip)
-            .limit(limit)
-        ).all()
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        query = query.offset(skip).limit(limit)
+        paradas = db.exec(query).all()
 
         agrupado = {}
         for parada, motivo in paradas:
@@ -532,15 +610,24 @@ def obtener_pareto_paradas(
 
 @router.get("/analytics/cuellos-botella/", response_model=list[CuelloBotella])
 def obtener_cuellos_botella(
-    skip: int = 0, limit: int = 1000, fecha: date = None, 
+    skip: int = 0, limit: int = 1000, fecha: date = None,
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
+    """Fase O (auditoría de producción del front #2): fecha_desde/
+    fecha_hasta/linea_id para que los filtros del dashboard tengan efecto
+    real."""
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia(fecha)
-            
-        eventos = db.exec(
+        if fecha is not None:
+            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        else:
+            inicio_dia, _ = obtener_rango_dia(fecha_desde)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+
+        query = (
             select(LiteEventoProduccion, Estacion)
             .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
             .join(Linea, Estacion.linea_id == Linea.id)
@@ -549,11 +636,12 @@ def obtener_cuellos_botella(
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia,
-                LiteEventoProduccion.delta_t_segundos > 0 
+                LiteEventoProduccion.delta_t_segundos > 0
             )
-            .offset(skip)
-            .limit(limit)
-        ).all()
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        query = query.offset(skip).limit(limit)
+        eventos = db.exec(query).all()
 
         agrupado = {}
         for evento, estacion in eventos:
@@ -579,24 +667,53 @@ def obtener_cuellos_botella(
 
 @router.get("/analytics/oee-tendencia/", response_model=list[TendenciaOEERow])
 def tendencia_oee_diaria(
-    linea_id: Optional[uuid.UUID] = None, 
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
+    orden_fk: Optional[str] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
+    """Tendencia de OEE día por día, reusando el mismo núcleo de cálculo que
+    /analytics/oee-general (Fase O -- hallazgo nuevo, no reportado por la
+    auditoría: ANTES este endpoint devolvía una serie 100% inventada,
+    `oee=70+i*2` hardcodeado, sin tocar la base en absoluto). Por defecto,
+    últimos 7 días hasta hoy. Un día sin eventos da oee/disp/rend=0 (la
+    planta no produjo); `cal=None` significa específicamente "sin datos de
+    calidad ese día", no 0%."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         hoy = datetime.now().date()
-        datos = []
-        for i in range(5, -1, -1):
-            dia = hoy - timedelta(days=i)
-            datos.append(TendenciaOEERow(
-                fecha=dia.strftime("%d %b"), oee=round(70 + (i*2), 1), 
-                disp=round(75 + i, 1), rend=round(80 - i, 1), cal=round(90 + i, 1)
-            ))
-        return datos
+        hasta = fecha_hasta or hoy
+        desde = fecha_desde or (hasta - timedelta(days=6))
+        if hasta < desde:
+            raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+        if (hasta - desde).days > 90:
+            raise HTTPException(status_code=400, detail="El rango máximo para la tendencia es de 90 días.")
+
+        filas = []
+        dia = desde
+        while dia <= hasta:
+            m = _calcular_metricas_oee(db, context, dia, dia, linea_id, turno_id, orden_fk)
+            if m is None:
+                filas.append(TendenciaOEERow(fecha=dia.strftime("%d %b"), oee=0.0, disp=0.0, rend=0.0, cal=None))
+            else:
+                filas.append(TendenciaOEERow(
+                    fecha=dia.strftime("%d %b"),
+                    oee=round(m["oee_general"] * 100, 1),
+                    disp=round(m["disponibilidad"] * 100, 1),
+                    rend=round(m["rendimiento"] * 100, 1),
+                    cal=m["calidad_pct"],
+                ))
+            dia += timedelta(days=1)
+        return filas
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error en tendencia OEE: {e}")
         return []
 
 
@@ -682,6 +799,7 @@ def obtener_alertas_vivas(
 def obtener_cascada_oee(
     fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None, turno_id: Optional[uuid.UUID] = None,
+    orden_fk: Optional[str] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
@@ -700,7 +818,7 @@ def obtener_cascada_oee(
         )
 
     try:
-        m = _calcular_metricas_oee(db, context, fecha_desde, fecha_hasta, linea_id, turno_id)
+        m = _calcular_metricas_oee(db, context, fecha_desde, fecha_hasta, linea_id, turno_id, orden_fk)
         if m is None:
             return CascadaOEE(
                 tiempo_calendario_min=0.0, tiempo_planificado_min=0.0, tiempo_operativo_min=0.0,
@@ -782,12 +900,14 @@ def obtener_rendimiento_secuencial(
 @router.get("/analytics/reporte-produccion/", response_model=list[ReporteProduccionRow])
 def obtener_reporte_produccion(
     fecha_desde: date, fecha_hasta: date,
+    linea_id: Optional[uuid.UUID] = None, orden_fk: Optional[str] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Filas planas por estación y día, para exportar a Excel (Fase I).
     Misma agrupación que /reportes/dashboard pero con rango de fechas en
-    vez de sólo el día de hoy."""
+    vez de sólo el día de hoy. Fase O: se agrega linea_id/orden_fk para
+    que los filtros del dashboard tengan efecto real acá también."""
     try:
         validar_planta(context)
         if fecha_hasta < fecha_desde:
@@ -796,7 +916,7 @@ def obtener_reporte_produccion(
         inicio = datetime.combine(fecha_desde, time.min)
         fin = datetime.combine(fecha_hasta, time.max)
 
-        eventos = db.exec(
+        query = (
             select(LiteEventoProduccion, Estacion)
             .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
             .join(Linea, Estacion.linea_id == Linea.id)
@@ -806,7 +926,10 @@ def obtener_reporte_produccion(
                 LiteEventoProduccion.timestamp >= inicio,
                 LiteEventoProduccion.timestamp <= fin,
             )
-        ).all()
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        if orden_fk: query = query.where(LiteEventoProduccion.orden_fk == orden_fk)
+        eventos = db.exec(query).all()
 
         agrupado = {}
         for evento, estacion in eventos:
@@ -913,6 +1036,276 @@ def obtener_plan_vs_actual(
         raise
     except Exception as e:
         logger.error(f"Error en plan vs actual: {e}")
+        return []
+
+
+# Sin eventos hace más de esto, la estación se considera "sin_datos" (no
+# "offline": no sabemos si es un corte real o simplemente no hay scans en
+# esta estación ahora mismo -- ver nota de ParadaDetectada.PENDIENTE, que
+# sí es la señal fuerte de corte real).
+UMBRAL_SIN_DATOS_SEG = 15 * 60
+
+
+@router.get("/analytics/linea-en-vivo/", response_model=LineaEnVivoResumen)
+def obtener_linea_en_vivo(
+    linea_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Estado en vivo de una línea para la portada de TYMEO (Fase O,
+    auditoría de producción del front #1 -- antes esa pantalla era 100%
+    mock: turno/orden/operarios de Springwall fijos, sin tocar el backend).
+
+    Turno actual: se resuelve por horario contra los Turnos configurados
+    para la línea, no por AsignacionSupervisor ni nada externo -- si
+    ninguno matchea la hora actual, turno_actual queda None (no se
+    inventa un turno).
+
+    Orden activa: la OrdenProduccion más reciente en estado EN_PROGRESO
+    para la línea. Deliberadamente NO se usa Estacion.orden_activa_fk /
+    sku_activo_fk -- esos campos existen en el modelo pero ningún flujo
+    real los escribe todavía (confirmado: sólo se leen en scans.py, nunca
+    se asignan), así que siempre estarían en NULL para un tenant real.
+
+    Estado por estación: derivado del último LiteEventoProduccion (activa
+    si hubo un evento hace menos de UMBRAL_SIN_DATOS_SEG) y de si hay una
+    ParadaDetectada PENDIENTE abierta ahora mismo (gana sobre "activa").
+    El operario asignado sale de AsignacionTurno para hoy + el turno
+    resuelto arriba."""
+    try:
+        linea = db.exec(select(Linea).where(Linea.id == linea_id, Linea.tenant_id == context.tenant_id)).first()
+        if not linea:
+            raise HTTPException(status_code=404, detail="Línea no encontrada.")
+        if context.sub_tenant_id and str(linea.planta_id) != str(context.sub_tenant_id):
+            raise HTTPException(status_code=404, detail="Línea no encontrada en la planta activa.")
+
+        ahora_time = datetime.now().time()
+        turnos = db.exec(
+            select(Turno).where(
+                Turno.tenant_id == context.tenant_id,
+                Turno.linea_id == linea_id,
+                Turno.activo == True,  # noqa: E712
+            )
+        ).all()
+        turno_actual = None
+        for t in turnos:
+            if t.hora_inicio <= t.hora_fin:
+                en_turno = t.hora_inicio <= ahora_time <= t.hora_fin
+            else:  # turno que cruza medianoche
+                en_turno = ahora_time >= t.hora_inicio or ahora_time <= t.hora_fin
+            if en_turno:
+                turno_actual = t
+                break
+
+        orden_activa = db.exec(
+            select(OrdenProduccion)
+            .where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.linea_id == linea_id,
+                OrdenProduccion.estado == EstadoOrden.EN_PROGRESO,
+                OrdenProduccion.activo == True,  # noqa: E712
+            )
+            .order_by(OrdenProduccion.id_orden.desc())
+        ).first()
+
+        estaciones = db.exec(
+            select(Estacion)
+            .where(
+                Estacion.tenant_id == context.tenant_id,
+                Estacion.linea_id == linea_id,
+                Estacion.activa == True,  # noqa: E712
+            )
+            .order_by(Estacion.posicion_linea)
+        ).all()
+
+        operario_por_estacion = {}
+        if turno_actual and estaciones:
+            asignaciones = db.exec(
+                select(AsignacionTurno).where(
+                    AsignacionTurno.tenant_id == context.tenant_id,
+                    AsignacionTurno.fecha == date.today(),
+                    AsignacionTurno.turno_fk == turno_actual.id,
+                    AsignacionTurno.estacion_fk.in_([e.id for e in estaciones]),
+                )
+            ).all()
+            operario_por_estacion = {a.estacion_fk: a.operario_fk for a in asignaciones}
+
+        operarios_por_id = {}
+        if operario_por_estacion:
+            ops = db.exec(
+                select(Operario).where(Operario.id.in_(list(operario_por_estacion.values())))
+            ).all()
+            operarios_por_id = {o.id: o.nombre_completo for o in ops}
+
+        ahora_dt = datetime.utcnow()
+        filas_estaciones = []
+        for est in estaciones:
+            ultimo = db.exec(
+                select(LiteEventoProduccion)
+                .where(LiteEventoProduccion.id_estacion == str(est.id))
+                .order_by(LiteEventoProduccion.timestamp.desc())
+            ).first()
+
+            if ultimo:
+                segundos_desde_ultimo = (ahora_dt - ultimo.timestamp).total_seconds()
+                estado = "activa" if segundos_desde_ultimo <= UMBRAL_SIN_DATOS_SEG else "sin_datos"
+                ultimo_ts = ultimo.timestamp.isoformat()
+            else:
+                estado = "sin_datos"
+                ultimo_ts = None
+
+            parada_abierta = db.exec(
+                select(ParadaDetectada).where(
+                    ParadaDetectada.tenant_id == context.tenant_id,
+                    ParadaDetectada.estacion_fk == est.id,
+                    ParadaDetectada.estado == EstadoParada.PENDIENTE,
+                )
+            ).first()
+            if parada_abierta:
+                estado = "parada"
+
+            operario_id = operario_por_estacion.get(est.id)
+            filas_estaciones.append(LineaEnVivoEstacion(
+                estacion_fk=est.id,
+                estacion_nombre=est.nombre,
+                posicion_linea=est.posicion_linea,
+                estado=estado,
+                operario_id=operario_id,
+                operario_nombre=operarios_por_id.get(operario_id) if operario_id else None,
+                ultimo_evento=ultimo_ts,
+            ))
+
+        return LineaEnVivoResumen(
+            linea_id=linea.id,
+            linea_nombre=linea.nombre,
+            turno_actual=turno_actual.nombre if turno_actual else None,
+            orden_activa=orden_activa.id_orden if orden_activa else None,
+            orden_sku=orden_activa.sku_fk if orden_activa else None,
+            estaciones=filas_estaciones,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en línea en vivo: {e}")
+        return LineaEnVivoResumen()
+
+
+@router.get("/analytics/rendimiento-operarios/", response_model=list[RendimientoOperarioRow])
+def obtener_rendimiento_operarios(
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None, operario_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Reporte histórico por operario (Fase O, auditoría de producción del
+    front #4 -- antes el front llamaba a esta URL pero el endpoint no
+    existía en absoluto). Por defecto, últimos 7 días.
+
+    La resolución operario→evento es la misma que ya usa /eventos/live y
+    /analytics/reporte-operarios: vía AsignacionTurno por (estación,
+    fecha) del evento, no un campo directo en LiteEventoProduccion (no
+    existe). Eventos sin asignación resuelta se excluyen -- no se le
+    puede atribuir producción a "nadie" en un reporte por operario."""
+    try:
+        validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
+        hoy = datetime.now().date()
+        hasta = fecha_hasta or hoy
+        desde = fecha_desde or (hasta - timedelta(days=6))
+        if hasta < desde:
+            raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+
+        inicio = datetime.combine(desde, time.min)
+        fin = datetime.combine(hasta, time.max)
+
+        query = (
+            select(LiteEventoProduccion, Estacion)
+            .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
+            .join(Linea, Estacion.linea_id == Linea.id)
+            .where(
+                LiteEventoProduccion.tenant_id == context.tenant_id,
+                Linea.planta_id == context.sub_tenant_id,
+                LiteEventoProduccion.timestamp >= inicio,
+                LiteEventoProduccion.timestamp <= fin,
+            )
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        eventos = db.exec(query).all()
+
+        if not eventos:
+            return []
+
+        estacion_ids = {est.id for _, est in eventos}
+        fechas = {e.timestamp.date() for e, _ in eventos}
+        asignaciones = db.exec(
+            select(AsignacionTurno).where(
+                AsignacionTurno.tenant_id == context.tenant_id,
+                AsignacionTurno.estacion_fk.in_(estacion_ids),
+                AsignacionTurno.fecha.in_(fechas),
+            )
+        ).all()
+        operario_por_estacion_fecha = {(a.estacion_fk, a.fecha): a.operario_fk for a in asignaciones}
+
+        agrupado = {}
+        for evento, estacion in eventos:
+            op_id = operario_por_estacion_fecha.get((estacion.id, evento.timestamp.date()))
+            if not op_id:
+                continue
+            if operario_id and op_id != operario_id:
+                continue
+
+            g = agrupado.setdefault(op_id, {
+                "estaciones": set(), "unidades": 0, "retrabajos": 0,
+                "suma_tiempo": 0.0, "con_tiempo": 0,
+                "optimo": 0, "lento": 0, "alerta": 0, "total_eventos": 0,
+            })
+            g["estaciones"].add(estacion.nombre)
+            g["unidades"] += evento.unidades_procesadas
+            g["retrabajos"] += evento.unidades_rechazadas
+            if evento.delta_t_segundos and evento.delta_t_segundos > 0:
+                g["suma_tiempo"] += evento.delta_t_segundos
+                g["con_tiempo"] += 1
+            g["total_eventos"] += 1
+            if evento.estado == "OPTIMO": g["optimo"] += 1
+            elif evento.estado == "LENTO": g["lento"] += 1
+            elif evento.estado == "ALERTA": g["alerta"] += 1
+
+        if not agrupado:
+            return []
+
+        operarios = db.exec(
+            select(Operario).where(Operario.id.in_(list(agrupado.keys())))
+        ).all()
+        operarios_por_id = {o.id: o for o in operarios}
+
+        resultado = []
+        for op_id, g in agrupado.items():
+            operario = operarios_por_id.get(op_id)
+            total = g["total_eventos"] or 1
+            resultado.append(RendimientoOperarioRow(
+                operario_id=op_id,
+                legajo=operario.legajo if operario else "?",
+                nombre=operario.nombre_completo if operario else "Operario no encontrado",
+                estaciones_operadas=sorted(g["estaciones"]),
+                unidades_producidas=g["unidades"],
+                retrabajos_generados=g["retrabajos"],
+                tiempo_promedio_seg=round(g["suma_tiempo"] / g["con_tiempo"], 1) if g["con_tiempo"] else 0.0,
+                distribucion_desempeno={
+                    "optimo": round(g["optimo"] / total * 100, 1),
+                    "lento": round(g["lento"] / total * 100, 1),
+                    "alerta": round(g["alerta"] / total * 100, 1),
+                },
+                eficiencia_global=round(g["optimo"] / total * 100, 1),
+            ))
+        resultado.sort(key=lambda r: r.eficiencia_global, reverse=True)
+        return resultado
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en rendimiento de operarios: {e}")
         return []
 
 
