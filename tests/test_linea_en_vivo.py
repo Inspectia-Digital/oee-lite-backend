@@ -4,8 +4,9 @@ una línea para la portada de TYMEO. Antes esa pantalla era 100% mock
 from datetime import date, datetime, time, timedelta
 
 from app.models.domain import (
-    AsignacionTurno, Estacion, EstadoOrden, Linea, MotivoParada, Operario,
-    OrdenProduccion, ParadaDetectada, EstadoParada, Planta, Turno,
+    AsignacionSupervisor, AsignacionTurno, Estacion, EstadoOrden, Linea,
+    MotivoParada, Operario, OrdenProduccion, ParadaDetectada, EstadoParada,
+    Planta, Supervisor, Turno,
 )
 from tests.conftest import autenticar_como
 
@@ -140,6 +141,37 @@ def test_linea_en_vivo_resuelve_operario_asignado(client, db, tenant_a, gerente_
     assert r.status_code == 200
     fila_est1 = next(e for e in r.json()["estaciones"] if e["estacion_fk"] == str(est1.id))
     assert fila_est1["operario_nombre"] == "Operario Vivo"
+
+
+def test_linea_en_vivo_resuelve_supervisor_asignado(client, db, tenant_a, gerente_a):
+    planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
+    turno = Turno(
+        tenant_id=tenant_a, nombre="Turno con supervisor",
+        hora_inicio=time(0, 0), hora_fin=time(23, 59), linea_id=linea.id,
+    )
+    db.add(turno)
+    db.commit()
+    db.refresh(turno)
+
+    supervisor = Supervisor(tenant_id=tenant_a, legajo="SUP-VIVO", nombre_completo="Supervisor Vivo")
+    db.add(supervisor)
+    db.commit()
+    db.refresh(supervisor)
+
+    db.add(AsignacionSupervisor(
+        tenant_id=tenant_a, fecha=date.today(), linea_id=linea.id,
+        turno_id=turno.id, supervisor_id=supervisor.id,
+    ))
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/linea-en-vivo/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    assert r.json()["supervisor_actual"] == "Supervisor Vivo"
 
 
 def test_linea_en_vivo_linea_de_otro_tenant_devuelve_404(client, db, tenant_a, tenant_b, gerente_a):

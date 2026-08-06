@@ -12,6 +12,7 @@ from app.models.domain import (
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada, EstadoOrden,
+    AsignacionSupervisor, Supervisor,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -122,6 +123,7 @@ class LineaEnVivoResumen(BaseModel):
     linea_id: Optional[uuid.UUID] = None
     linea_nombre: Optional[str] = None
     turno_actual: Optional[str] = None
+    supervisor_actual: Optional[str] = None
     orden_activa: Optional[str] = None
     orden_sku: Optional[str] = None
     estaciones: List[LineaEnVivoEstacion] = []
@@ -1175,10 +1177,26 @@ def obtener_linea_en_vivo(
                 ultimo_evento=ultimo_ts,
             ))
 
+        supervisor_actual = None
+        if turno_actual:
+            asignacion_sup = db.exec(
+                select(AsignacionSupervisor, Supervisor)
+                .join(Supervisor, AsignacionSupervisor.supervisor_id == Supervisor.id)
+                .where(
+                    AsignacionSupervisor.tenant_id == context.tenant_id,
+                    AsignacionSupervisor.fecha == date.today(),
+                    AsignacionSupervisor.linea_id == linea_id,
+                    AsignacionSupervisor.turno_id == turno_actual.id,
+                )
+            ).first()
+            if asignacion_sup:
+                supervisor_actual = asignacion_sup[1].nombre_completo
+
         return LineaEnVivoResumen(
             linea_id=linea.id,
             linea_nombre=linea.nombre,
             turno_actual=turno_actual.nombre if turno_actual else None,
+            supervisor_actual=supervisor_actual,
             orden_activa=orden_activa.id_orden if orden_activa else None,
             orden_sku=orden_activa.sku_fk if orden_activa else None,
             estaciones=filas_estaciones,
