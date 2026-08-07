@@ -49,3 +49,19 @@ def test_gerencia_no_puede_autoasignarse_modulos_via_patch_generico(client, db, 
     assert r.status_code == 200
     despues = db.get(Tenant, tenant_a).modulos_contratados
     assert despues == antes
+
+
+def test_listado_de_tenants_incluye_modulos_contratados(client, db, tenant_a, superadmin):
+    """Fase O (seguimiento auditoría #2 del front): el panel SaaS necesita
+    ver los módulos contratados de cada tenant sin un fetch extra por fila
+    -- antes GET /superadmin/tenants no seleccionaba esta columna."""
+    t = db.get(Tenant, tenant_a)
+    t.modulos_contratados = "tymeo,oee-hub"
+    db.add(t)
+    db.commit()
+
+    autenticar_como(superadmin.id)
+    r = client.get("/accesos/superadmin/tenants")
+    assert r.status_code == 200
+    fila = next(row for row in r.json() if row["id"] == tenant_a)
+    assert fila["modulos_contratados"] == "tymeo,oee-hub"
