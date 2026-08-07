@@ -1,7 +1,7 @@
 """Fase H: tablero de dotación, monitor de eventos live y asignación de
 supervisores por día."""
 import uuid
-from datetime import date
+from datetime import datetime
 
 from sqlmodel import select
 
@@ -62,7 +62,7 @@ def test_asignar_dotacion_y_listar(client, db, tenant_a):
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
 
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
     r = client.post(
         "/supervisor/asignaciones/",
         json={"fecha": hoy, "estacion_fk": str(estacion.id), "operario_fk": str(operario.id), "turno_fk": str(turno.id)},
@@ -86,7 +86,7 @@ def test_reasignar_dotacion_sobrescribe_no_duplica(client, db, tenant_a):
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
     payload = {"fecha": hoy, "estacion_fk": str(estacion.id), "turno_fk": str(turno.id)}
 
     client.post("/supervisor/asignaciones/", json={**payload, "operario_fk": str(operario.id)}, headers=headers)
@@ -103,7 +103,7 @@ def test_liberar_estacion_borra_la_fila(client, db, tenant_a):
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
 
     creado = client.post(
         "/supervisor/asignaciones/",
@@ -120,7 +120,7 @@ def test_dotacion_sin_planta_seleccionada_devuelve_400(client, db, tenant_a):
     _, linea, _, _, _, _ = _armar_planta_completa(db, tenant_a)
     sup_usuario = crear_usuario(db, tenant_a, RolUsuario.SUPERVISOR)
     autenticar_como(sup_usuario.id)
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
     r = client.get(f"/supervisor/asignaciones/?fecha={hoy}&linea_id={linea.id}")
     assert r.status_code == 400
 
@@ -131,7 +131,7 @@ def test_eventos_live_ordenados_desc_con_operario_resuelto(client, db, tenant_a)
     planta, linea, estacion, turno, operario, _ = _armar_planta_completa(db, tenant_a)
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
 
-    db.add(AsignacionTurno(tenant_id=tenant_a, fecha=date.today(), estacion_fk=estacion.id, operario_fk=operario.id, turno_fk=turno.id))
+    db.add(AsignacionTurno(tenant_id=tenant_a, fecha=datetime.utcnow().date(), estacion_fk=estacion.id, operario_fk=operario.id, turno_fk=turno.id))
     db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(estacion.id), estado="OPTIMO"))
     db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(estacion.id), estado="LENTO"))
     db.commit()
@@ -177,7 +177,7 @@ def test_asignar_supervisor_y_listar(client, db, tenant_a):
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
 
     r = client.post(
         "/asignaciones/supervisor/",
@@ -202,7 +202,7 @@ def test_reasignar_supervisor_sobrescribe(client, db, tenant_a):
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()
     payload = {"fecha": hoy, "linea_id": str(linea.id), "turno_id": str(turno.id)}
 
     client.post("/asignaciones/supervisor/", json={**payload, "supervisor_id": str(supervisor.id)}, headers=headers)

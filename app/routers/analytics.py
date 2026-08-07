@@ -159,7 +159,14 @@ class CommandCenterSummary(BaseModel):
 # --- HELPER FUNCTIONS ---
 # ==========================================
 def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
-    f = fecha_busqueda or datetime.now().date()
+    # Fase P: era datetime.now() (hora del SERVIDOR) contra
+    # LiteEventoProduccion.timestamp, que siempre se guarda en UTC puro
+    # (default_factory=datetime.utcnow en el modelo). En un servidor cuyo
+    # timezone de sistema no es UTC, "hoy" podía quedar un día desalineado
+    # con lo que hay guardado -- se vio en vivo: al cruzar la medianoche
+    # UTC, varios endpoints con rango por defecto (éste incluido) dejaban
+    # de encontrar eventos de "hoy" que sí estaban en la base.
+    f = fecha_busqueda or datetime.utcnow().date()
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
 def validar_planta(context: TenantContext):
@@ -688,7 +695,9 @@ def tendencia_oee_diaria(
         return []
 
     try:
-        hoy = datetime.now().date()
+        # Fase P: datetime.now() (servidor) -> datetime.utcnow() (mismo
+        # fix que obtener_rango_dia; ver ese comentario para el porqué).
+        hoy = datetime.utcnow().date()
         hasta = fecha_hasta or hoy
         desde = fecha_desde or (hasta - timedelta(days=6))
         if hasta < desde:
@@ -1230,7 +1239,9 @@ def obtener_rendimiento_operarios(
         return []
 
     try:
-        hoy = datetime.now().date()
+        # Fase P: datetime.now() (servidor) -> datetime.utcnow() (mismo
+        # fix que obtener_rango_dia; ver ese comentario para el porqué).
+        hoy = datetime.utcnow().date()
         hasta = fecha_hasta or hoy
         desde = fecha_desde or (hasta - timedelta(days=6))
         if hasta < desde:
