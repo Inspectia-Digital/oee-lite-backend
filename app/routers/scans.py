@@ -77,6 +77,25 @@ def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:
         raise HTTPException(status_code=400, detail="Timestamp con más de 7 días de antigüedad; rechazado.")
 
 
+# Fase Q: default de sistema cuando ni la Estación ni su Línea configuraron
+# umbrales -- son los mismos valores que antes eran el default duro de
+# Estacion.umbral_optimo/lento/alerta (240/280/300), preservados acá para
+# que una estación/línea sin configurar se comporte exactamente igual que
+# antes de este cambio.
+UMBRAL_OPTIMO_DEFAULT_SISTEMA = 240
+UMBRAL_LENTO_DEFAULT_SISTEMA = 280
+UMBRAL_ALERTA_DEFAULT_SISTEMA = 300
+
+
+def _resolver_umbral(valor_estacion: Optional[int], valor_linea: Optional[int], default_sistema: int) -> int:
+    """Cadena de herencia Estación > Línea > default de sistema (Fase Q)."""
+    if valor_estacion is not None:
+        return valor_estacion
+    if valor_linea is not None:
+        return valor_linea
+    return default_sistema
+
+
 def _calcular_payload_hash(scan: ScanRequest) -> str:
     """Hash canónico de los campos relevantes del payload (Fase E1, idempotencia)."""
     canonico = {
@@ -206,9 +225,12 @@ def registrar_escaneo_rapido(
 
     # 2. FACTOR DE LOTE (Green Mills)
     unidades_a_sumar = 1
-    # Fallback de Estación: valores absolutos configurados por evento/scan
-    # (sin relación con "unidades" -- esto no cambia con este fix).
-    t_optimo, t_lento, t_alerta = estacion.umbral_optimo, estacion.umbral_lento, estacion.umbral_alerta
+    # Fallback de Estación/Línea (Fase Q): valores absolutos por
+    # evento/scan (sin relación con "unidades"). Estación > Línea >
+    # default de sistema -- ver _resolver_umbral.
+    t_optimo = _resolver_umbral(estacion.umbral_optimo, linea.umbral_optimo if linea else None, UMBRAL_OPTIMO_DEFAULT_SISTEMA)
+    t_lento = _resolver_umbral(estacion.umbral_lento, linea.umbral_lento if linea else None, UMBRAL_LENTO_DEFAULT_SISTEMA)
+    t_alerta = _resolver_umbral(estacion.umbral_alerta, linea.umbral_alerta if linea else None, UMBRAL_ALERTA_DEFAULT_SISTEMA)
     sku_resuelto = None
 
     if sku_final:

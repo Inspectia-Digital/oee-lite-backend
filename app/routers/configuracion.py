@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from sqlmodel import Session, select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 from datetime import time
 import uuid
@@ -51,6 +51,12 @@ class LineaCreate(BaseModel):
     # duplicaba la misma info en dos lugares y bloqueaba crear líneas.
     planta_id: Optional[uuid.UUID] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = ModoAsignacionOperarios.MANUAL
+    # Fase Q: default heredable por las estaciones de esta línea que no
+    # configuren el suyo propio. None = sin default de línea (cae al
+    # default de sistema en scans.py).
+    umbral_optimo: Optional[int] = None
+    umbral_lento: Optional[int] = None
+    umbral_alerta: Optional[int] = None
 
 class LineaUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -58,6 +64,9 @@ class LineaUpdate(BaseModel):
     tipo_produccion: Optional[str] = None
     metodo_calidad: Optional[str] = None
     activo: Optional[bool] = None
+    umbral_optimo: Optional[int] = None
+    umbral_lento: Optional[int] = None
+    umbral_alerta: Optional[int] = None
 
 class EstacionCreate(BaseModel):
     nombre: str
@@ -66,9 +75,12 @@ class EstacionCreate(BaseModel):
     parent_id: Optional[uuid.UUID] = None
     posicion_linea: int = 1
     ramal: str = "Principal"
-    umbral_optimo: int = 240
-    umbral_lento: int = 280
-    umbral_alerta: int = 300
+    # Fase Q: None por default (antes 240/280/300 fijos) -- una estación
+    # nueva que no especifica sus propios umbrales hereda los de la Línea
+    # (o el default de sistema si la línea tampoco los tiene, ver scans.py).
+    umbral_optimo: Optional[int] = None
+    umbral_lento: Optional[int] = None
+    umbral_alerta: Optional[int] = None
     codigo_plc: Optional[str] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperariosEstacion] = ModoAsignacionOperariosEstacion.HEREDAR
 
@@ -92,12 +104,29 @@ class MotivoParadaUpdate(BaseModel):
     tipo_parada: Optional[TipoParada] = None
     activo: Optional[bool] = None
 
+def _validar_dias_semana_payload(v: List[int]) -> List[int]:
+    if not v:
+        raise ValueError("dias_semana no puede estar vacío.")
+    invalidos = [d for d in v if d < 1 or d > 7]
+    if invalidos:
+        raise ValueError(f"Días inválidos: {invalidos}. Deben ser 1 (lunes) a 7 (domingo).")
+    return sorted(set(v))
+
+
 class TurnoCreate(BaseModel):
     nombre: str
     hora_inicio: time
     hora_fin: time
     descanso_minutos: int = 0
     linea_id: Optional[uuid.UUID] = None
+    # Fase Q: hay empresas Lu-Vi, Lu-Sa, Lu-Do -- días ISO (1=lunes..7=domingo).
+    # Default: todos los días (comportamiento histórico de un turno).
+    dias_semana: List[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
+
+    @field_validator("dias_semana")
+    @classmethod
+    def _validar_dias(cls, v: List[int]) -> List[int]:
+        return _validar_dias_semana_payload(v)
 
 class TurnoUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -105,6 +134,12 @@ class TurnoUpdate(BaseModel):
     hora_fin: Optional[time] = None
     descanso_minutos: Optional[int] = None
     activo: Optional[bool] = None
+    dias_semana: Optional[List[int]] = None
+
+    @field_validator("dias_semana")
+    @classmethod
+    def _validar_dias(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        return _validar_dias_semana_payload(v) if v is not None else v
 
 class MaquinaCreate(BaseModel):
     codigo_externo: str
@@ -379,7 +414,12 @@ def crear_turno(
         if not linea_db:
             raise HTTPException(status_code=400, detail="Línea inválida o de otra organización.")
 
-    nuevo_turno = Turno(tenant_id=context.tenant_id, **payload.model_dump())
+    datos = payload.model_dump(exclude={"dias_semana"})
+    nuevo_turno = Turno(
+        tenant_id=context.tenant_id,
+        dias_semana=",".join(str(d) for d in payload.dias_semana),
+        **datos,
+    )
     db.add(nuevo_turno)
     db.commit()
     db.refresh(nuevo_turno)
@@ -423,6 +463,8 @@ def actualizar_turno(
     if not turno:
         raise HTTPException(status_code=404, detail="Turno no encontrado.")
     datos = payload.model_dump(exclude_unset=True)
+    if "dias_semana" in datos:
+        datos["dias_semana"] = ",".join(str(d) for d in datos["dias_semana"])
     for key, value in datos.items():
         setattr(turno, key, value)
     db.add(turno)

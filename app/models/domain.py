@@ -153,6 +153,18 @@ class Linea(TenantBase, table=True):
     metodo_calidad: MetodoCalidadLinea = Field(default=MetodoCalidadLinea.POR_RECHAZO)
     activo: bool = Field(default=True)
 
+    # Fase Q (feedback de producto): umbrales por defecto para todas las
+    # estaciones de esta línea. NULL = sin default de línea, cada estación
+    # resuelve el suyo propio (o el default de sistema si tampoco lo tiene).
+    # No reemplaza Tenant.tolerancia_lento_pct/alerta_pct -- ese es un
+    # concepto distinto (% de tolerancia sobre el ciclo ideal del SKU
+    # activo, usado sólo cuando hay un SKU resuelto en scans.py). Esto es
+    # el fallback de segundos absolutos para cuando NO hay SKU resuelto,
+    # heredable Línea -> Estación igual que antes era sólo Estación.
+    umbral_optimo: Optional[int] = Field(default=None, description="Default de línea: tiempo ideal en segundos")
+    umbral_lento: Optional[int] = Field(default=None, description="Default de línea: límite de tiempo aceptable")
+    umbral_alerta: Optional[int] = Field(default=None, description="Default de línea: tiempo que dispara alerta")
+
 class Supervisor(TenantBase, table=True):
     __tablename__ = "dim_supervisores"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -166,9 +178,15 @@ class Estacion(TenantBase, table=True):
     nombre: str
     tipo: str  # Ej: "sensor", "escaneo_manual", "calidad"
     
-    umbral_optimo: int = Field(default=240, description="Tiempo ideal en segundos")
-    umbral_lento: int = Field(default=280, description="Límite de tiempo aceptable")
-    umbral_alerta: int = Field(default=300, description="Tiempo que dispara alerta")
+    # Fase Q: nullable a propósito -- NULL significa "hereda el default de
+    # la Línea" (Linea.umbral_*), y si la Línea tampoco lo tiene, el
+    # sistema cae al default histórico (240/280/300, ver scans.py). Antes
+    # eran NOT NULL con esos mismos valores como default: los registros
+    # existentes no cambian (ya tienen un valor explícito), sólo cambia
+    # el comportamiento de estaciones NUEVAS que no lo configuren.
+    umbral_optimo: Optional[int] = Field(default=None, description="Tiempo ideal en segundos (NULL = hereda de la línea)")
+    umbral_lento: Optional[int] = Field(default=None, description="Límite de tiempo aceptable (NULL = hereda de la línea)")
+    umbral_alerta: Optional[int] = Field(default=None, description="Tiempo que dispara alerta (NULL = hereda de la línea)")
     
     activa: bool = Field(default=True, description="Apagar si hoy no se usa")
     posicion_linea: int = Field(default=1, description="Secuencia lógica (1,2,3...)")
@@ -207,6 +225,12 @@ class Turno(TenantBase, table=True):
     descanso_minutos: int = Field(default=0, description="Minutos a descontar de la Disponibilidad")
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id")
     activo: bool = Field(default=True)
+    # Fase Q (feedback de producto): hay empresas Lu-Vi, Lu-Sa, Lu-Do, y
+    # combinaciones más raras (ej. sólo fines de semana). CSV de días ISO
+    # (1=lunes...7=domingo, ver datetime.isoweekday()). Default = los 7
+    # días: preserva el comportamiento de todos los turnos existentes
+    # (aplicaban todos los días, sin excepción) sin necesitar backfill.
+    dias_semana: str = Field(default="1,2,3,4,5,6,7", description="CSV de días ISO en que aplica este turno (1=lunes..7=domingo)")
 
 class AsignacionTurno(TenantBase, table=True):
     __tablename__ = "asignaciones_turno"
@@ -217,16 +241,22 @@ class AsignacionTurno(TenantBase, table=True):
     turno_fk: uuid.UUID = Field(foreign_key="dim_turnos.id")
 
 class AsignacionSupervisor(TenantBase, table=True):
-    """Tablero de supervisión diaria (Fase H). El turno es una plantilla
-    maestra; el supervisor a cargo se registra por día, no como atributo
-    fijo del turno. Idempotente por (tenant_id, fecha, linea_id, turno_id):
-    reasignar sobrescribe (upsert), nunca duplica."""
+    """Regla de supervisión programable (Fase Q -- reemplaza el tablero
+    diario de Fase H). El turno es una plantilla maestra; el supervisor a
+    cargo se define como una REGLA recurrente (qué días de la semana, con
+    vigencia desde/hasta), no un registro por cada día exacto. Pueden
+    coexistir varias reglas para la misma (línea, turno) a lo largo del
+    tiempo (ej. Juan cubre Ene-Jun, Pedro cubre Jul en adelante) -- la
+    resolución de "quién está a cargo hoy" toma la regla vigente con
+    vigencia_desde más reciente entre las que matchean el día."""
     __tablename__ = "asignaciones_supervisor"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    fecha: date
     linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
     turno_id: uuid.UUID = Field(foreign_key="dim_turnos.id")
     supervisor_id: uuid.UUID = Field(foreign_key="dim_supervisores.id")
+    dias_semana: str = Field(description="CSV de días ISO en que aplica esta regla (1=lunes..7=domingo)")
+    vigencia_desde: date
+    vigencia_hasta: Optional[date] = Field(default=None, description="NULL = sigue vigente indefinidamente")
 
 # ==========================================
 # 4. CATÁLOGO Y ÓRDENES (Input del ERP / Excel)
