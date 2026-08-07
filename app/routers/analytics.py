@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlmodel import Session, select
 from sqlalchemy import cast, String  # <-- IMPORTANTE: Para el casteo de UUID a String
-from datetime import datetime, time, date, timedelta
+from datetime import datetime, time, date, timedelta, timezone as dt_timezone
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 import uuid
 
@@ -114,7 +115,14 @@ class LineaEnVivoEstacion(BaseModel):
     estacion_fk: uuid.UUID
     estacion_nombre: str
     posicion_linea: int
-    estado: str  # "activa" | "parada" | "sin_datos"
+    estado: str  # "activa" | "parada" | "sin_datos" -- estado de PRODUCCIÓN (eventos recientes)
+    # Fase Q: si la estación está administrativamente habilitada
+    # (Estacion.activa). Antes las inactivas se filtraban por completo del
+    # listado; ahora se devuelven igual con activa=False para que el
+    # front las muestre grisadas en su lugar en el flujo, no ausentes.
+    # Distinto de `estado`: una estación puede estar activa=True y en
+    # estado="sin_datos" (habilitada, pero sin scans todavía).
+    activa: bool = True
     operario_id: Optional[uuid.UUID] = None
     operario_nombre: Optional[str] = None
     ultimo_evento: Optional[str] = None
@@ -1056,6 +1064,41 @@ def obtener_plan_vs_actual(
 # sí es la señal fuerte de corte real).
 UMBRAL_SIN_DATOS_SEG = 15 * 60
 
+# Mismo default que _normalizar_timestamp_utc en scans.py.
+_TIMEZONE_DEFAULT_LINEA_VIVO = "America/Buenos_Aires"
+
+
+def _ahora_planta(planta: Optional[Planta]) -> datetime:
+    """Fase Q: 'ahora' en hora de PARED de la planta (naive, sin tzinfo) --
+    para comparar contra Turno.hora_inicio/hora_fin (horarios que alguien
+    configuró pensando en la hora de la planta, no en la del servidor) y
+    para resolver "qué día es hoy" en turnos/asignaciones. Antes esto se
+    resolvía con datetime.now() (hora del SERVIDOR): en un servidor cuyo
+    timezone de sistema no coincide con el de la planta, el turno actual
+    no resolvía nunca (o resolvía el equivocado) buena parte del día, y
+    sin turno resuelto no hay operario ni supervisor resueltos tampoco.
+    Misma idea que _normalizar_timestamp_utc en scans.py, en la dirección
+    inversa (UTC -> hora local)."""
+    try:
+        tz = ZoneInfo(planta.timezone) if planta and planta.timezone else ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    except Exception:
+        tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    ahora_utc = datetime.now(dt_timezone.utc)
+    return ahora_utc.astimezone(tz).replace(tzinfo=None)
+
+
+def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
+    """dias_semana: CSV de días ISO (1=lunes..7=domingo, Fase Q). Un valor
+    corrupto/vacío no bloquea -- mejor de más (aplica todos los días) que
+    hacer desaparecer un turno/regla entero por un dato mal cargado."""
+    try:
+        dias = {int(d) for d in dias_semana.split(",") if d.strip()}
+    except (ValueError, AttributeError):
+        return True
+    if not dias:
+        return True
+    return dia_iso in dias
+
 
 @router.get("/analytics/linea-en-vivo/", response_model=LineaEnVivoResumen)
 def obtener_linea_en_vivo(
@@ -1067,10 +1110,10 @@ def obtener_linea_en_vivo(
     auditoría de producción del front #1 -- antes esa pantalla era 100%
     mock: turno/orden/operarios de Springwall fijos, sin tocar el backend).
 
-    Turno actual: se resuelve por horario contra los Turnos configurados
-    para la línea, no por AsignacionSupervisor ni nada externo -- si
-    ninguno matchea la hora actual, turno_actual queda None (no se
-    inventa un turno).
+    Turno actual: se resuelve por horario Y día de semana (Fase Q) contra
+    los Turnos configurados para la línea, en hora de PARED DE LA PLANTA
+    (antes usaba datetime.now() = hora del servidor, ver _ahora_planta) --
+    si ninguno matchea, turno_actual queda None (no se inventa un turno).
 
     Orden activa: la OrdenProduccion más reciente en estado EN_PROGRESO
     para la línea. Deliberadamente NO se usa Estacion.orden_activa_fk /
@@ -1082,7 +1125,10 @@ def obtener_linea_en_vivo(
     si hubo un evento hace menos de UMBRAL_SIN_DATOS_SEG) y de si hay una
     ParadaDetectada PENDIENTE abierta ahora mismo (gana sobre "activa").
     El operario asignado sale de AsignacionTurno para hoy + el turno
-    resuelto arriba."""
+    resuelto arriba. Fase Q: las estaciones INACTIVAS ya no se filtran --
+    se devuelven igual (con activa=False) para que el front las muestre
+    grisadas en su lugar en el flujo, en vez de hacerlas desaparecer y
+    romper la secuencia visual."""
     try:
         linea = db.exec(select(Linea).where(Linea.id == linea_id, Linea.tenant_id == context.tenant_id)).first()
         if not linea:
@@ -1090,7 +1136,12 @@ def obtener_linea_en_vivo(
         if context.sub_tenant_id and str(linea.planta_id) != str(context.sub_tenant_id):
             raise HTTPException(status_code=404, detail="Línea no encontrada en la planta activa.")
 
-        ahora_time = datetime.now().time()
+        planta = db.get(Planta, linea.planta_id)
+        ahora_planta_dt = _ahora_planta(planta)
+        ahora_time = ahora_planta_dt.time()
+        hoy_planta = ahora_planta_dt.date()
+        dia_iso_hoy = ahora_planta_dt.isoweekday()
+
         turnos = db.exec(
             select(Turno).where(
                 Turno.tenant_id == context.tenant_id,
@@ -1100,6 +1151,8 @@ def obtener_linea_en_vivo(
         ).all()
         turno_actual = None
         for t in turnos:
+            if not _dia_en_dias_semana(dia_iso_hoy, t.dias_semana):
+                continue
             if t.hora_inicio <= t.hora_fin:
                 en_turno = t.hora_inicio <= ahora_time <= t.hora_fin
             else:  # turno que cruza medianoche
@@ -1124,7 +1177,6 @@ def obtener_linea_en_vivo(
             .where(
                 Estacion.tenant_id == context.tenant_id,
                 Estacion.linea_id == linea_id,
-                Estacion.activa == True,  # noqa: E712
             )
             .order_by(Estacion.posicion_linea)
         ).all()
@@ -1134,7 +1186,7 @@ def obtener_linea_en_vivo(
             asignaciones = db.exec(
                 select(AsignacionTurno).where(
                     AsignacionTurno.tenant_id == context.tenant_id,
-                    AsignacionTurno.fecha == date.today(),
+                    AsignacionTurno.fecha == hoy_planta,
                     AsignacionTurno.turno_fk == turno_actual.id,
                     AsignacionTurno.estacion_fk.in_([e.id for e in estaciones]),
                 )
@@ -1181,24 +1233,34 @@ def obtener_linea_en_vivo(
                 estacion_nombre=est.nombre,
                 posicion_linea=est.posicion_linea,
                 estado=estado,
+                activa=est.activa,
                 operario_id=operario_id,
                 operario_nombre=operarios_por_id.get(operario_id) if operario_id else None,
                 ultimo_evento=ultimo_ts,
             ))
 
+        # Fase Q: resolución recurrente (dias_semana + vigencia_desde/hasta)
+        # en vez de "fecha exacta". Pueden existir varias reglas vigentes
+        # para la misma (línea, turno) a lo largo del tiempo -- se toma la
+        # de vigencia_desde más reciente entre las que matchean hoy.
         supervisor_actual = None
         if turno_actual:
-            asignacion_sup = db.exec(
+            reglas = db.exec(
                 select(AsignacionSupervisor, Supervisor)
                 .join(Supervisor, AsignacionSupervisor.supervisor_id == Supervisor.id)
                 .where(
                     AsignacionSupervisor.tenant_id == context.tenant_id,
-                    AsignacionSupervisor.fecha == date.today(),
                     AsignacionSupervisor.linea_id == linea_id,
                     AsignacionSupervisor.turno_id == turno_actual.id,
+                    AsignacionSupervisor.vigencia_desde <= hoy_planta,
                 )
-            ).first()
-            if asignacion_sup:
+                .order_by(AsignacionSupervisor.vigencia_desde.desc())
+            ).all()
+            for regla, sup in reglas:
+                vigente = regla.vigencia_hasta is None or regla.vigencia_hasta >= hoy_planta
+                if vigente and _dia_en_dias_semana(dia_iso_hoy, regla.dias_semana):
+                    supervisor_actual = sup.nombre_completo
+                    break
                 supervisor_actual = asignacion_sup[1].nombre_completo
 
         return LineaEnVivoResumen(

@@ -1,7 +1,7 @@
 """Fase H: tablero de dotación, monitor de eventos live y asignación de
 supervisores por día."""
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlmodel import select
 
@@ -170,7 +170,7 @@ def test_eventos_live_no_cruza_plantas(client, db, tenant_a):
     assert r.json() == []
 
 
-# ---------- Asignación de supervisores por día ----------
+# ---------- Asignación de supervisores: regla recurrente (Fase Q) ----------
 
 def test_asignar_supervisor_y_listar(client, db, tenant_a):
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
@@ -181,18 +181,26 @@ def test_asignar_supervisor_y_listar(client, db, tenant_a):
 
     r = client.post(
         "/asignaciones/supervisor/",
-        json={"fecha": hoy, "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id)},
+        json={
+            "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
+            "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy,
+        },
         headers=headers,
     )
     assert r.status_code == 201
+    assert r.json()["dias_semana"] == "1,2,3,4,5"
+    assert r.json()["vigencia_hasta"] is None
 
-    r = client.get(f"/asignaciones/supervisor/?fecha={hoy}&linea_id={linea.id}", headers=headers)
+    r = client.get(f"/asignaciones/supervisor/?linea_id={linea.id}", headers=headers)
     assert r.status_code == 200
     assert len(r.json()) == 1
     assert r.json()[0]["supervisor_id"] == str(supervisor.id)
 
 
-def test_reasignar_supervisor_sobrescribe(client, db, tenant_a):
+def test_asignaciones_supervisor_coexisten_y_delete_las_saca(client, db, tenant_a):
+    """El modelo ya no es upsert-por-día (Fase Q): pueden coexistir varias
+    reglas para la misma línea+turno (ej. una vigente y otra futura que la
+    va a reemplazar). Para "reasignar" se borra la regla vieja con DELETE."""
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
     otro_supervisor = Supervisor(tenant_id=tenant_a, legajo="SUP-H2", nombre_completo="Otro Sup")
     db.add(otro_supervisor)
@@ -203,12 +211,92 @@ def test_reasignar_supervisor_sobrescribe(client, db, tenant_a):
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date().isoformat()
-    payload = {"fecha": hoy, "linea_id": str(linea.id), "turno_id": str(turno.id)}
+    base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy}
 
-    client.post("/asignaciones/supervisor/", json={**payload, "supervisor_id": str(supervisor.id)}, headers=headers)
-    r = client.post("/asignaciones/supervisor/", json={**payload, "supervisor_id": str(otro_supervisor.id)}, headers=headers)
-    assert r.status_code == 201
+    r1 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(supervisor.id)}, headers=headers)
+    r2 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(otro_supervisor.id)}, headers=headers)
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+
+    filas = db.exec(select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == tenant_a)).all()
+    assert len(filas) == 2  # las dos coexisten -- ya no hay upsert por (línea, turno)
+
+    r = client.delete(f"/asignaciones/supervisor/{r1.json()['id']}", headers=headers)
+    assert r.status_code == 204
 
     filas = db.exec(select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == tenant_a)).all()
     assert len(filas) == 1
     assert filas[0].supervisor_id == otro_supervisor.id
+
+
+def test_asignacion_supervisor_dia_invalido_devuelve_422(client, db, tenant_a):
+    planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
+    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
+    autenticar_como(sup_usuario.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+
+    r = client.post(
+        "/asignaciones/supervisor/",
+        json={
+            "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
+            "dias_semana": [1, 8], "vigencia_desde": datetime.utcnow().date().isoformat(),
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422
+
+
+def test_asignacion_supervisor_vigencia_hasta_antes_de_desde_devuelve_400(client, db, tenant_a):
+    planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
+    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
+    autenticar_como(sup_usuario.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    hoy = datetime.utcnow().date()
+
+    r = client.post(
+        "/asignaciones/supervisor/",
+        json={
+            "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
+            "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy.isoformat(),
+            "vigencia_hasta": (hoy - timedelta(days=1)).isoformat(),
+        },
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_listar_asignaciones_supervisor_filtra_por_fecha_vigente(client, db, tenant_a):
+    """GET con `fecha` filtra a las reglas realmente vigentes ese día
+    (vigencia + día de semana), no a todas las reglas del tenant."""
+    planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
+    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
+    autenticar_como(sup_usuario.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    hoy = datetime.utcnow().date()
+
+    # Regla vigente hoy (todos los días).
+    client.post(
+        "/asignaciones/supervisor/",
+        json={
+            "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
+            "dias_semana": [1, 2, 3, 4, 5, 6, 7], "vigencia_desde": hoy.isoformat(),
+        },
+        headers=headers,
+    )
+    # Regla que todavía no empezó (futura).
+    client.post(
+        "/asignaciones/supervisor/",
+        json={
+            "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
+            "dias_semana": [1, 2, 3, 4, 5, 6, 7], "vigencia_desde": (hoy + timedelta(days=30)).isoformat(),
+        },
+        headers=headers,
+    )
+
+    # Sin fecha: trae las dos (pantalla de gestión).
+    r = client.get(f"/asignaciones/supervisor/?linea_id={linea.id}", headers=headers)
+    assert len(r.json()) == 2
+
+    # Con fecha=hoy: sólo la vigente.
+    r = client.get(f"/asignaciones/supervisor/?linea_id={linea.id}&fecha={hoy.isoformat()}", headers=headers)
+    assert len(r.json()) == 1

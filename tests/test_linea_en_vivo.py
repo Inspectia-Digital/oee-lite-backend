@@ -70,6 +70,79 @@ def test_linea_en_vivo_resuelve_turno_por_horario_actual(client, db, tenant_a, g
     assert r.json()["turno_actual"] == "Turno Actual"
 
 
+def test_linea_en_vivo_respeta_dias_semana_del_turno(client, db, tenant_a, gerente_a):
+    """Fase Q: un turno cuyo horario matchea pero cuyo dias_semana NO
+    incluye hoy no debe resolver como turno_actual -- antes (Fase O) el
+    día de la semana no se chequeaba en absoluto."""
+    planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
+    hoy_iso = datetime.now().isoweekday()
+    otro_dia = "1" if hoy_iso != 1 else "2"  # cualquier día distinto de hoy
+
+    turno_otro_dia = Turno(
+        tenant_id=tenant_a, nombre="Turno de otro día",
+        hora_inicio=time(0, 0), hora_fin=time(23, 59), linea_id=linea.id,
+        dias_semana=otro_dia,
+    )
+    db.add(turno_otro_dia)
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/linea-en-vivo/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    assert r.json()["turno_actual"] is None  # el horario matchea, el día no
+
+
+def test_linea_en_vivo_resuelve_turno_de_hoy_por_dia_semana(client, db, tenant_a, gerente_a):
+    planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
+    hoy_iso = str(datetime.now().isoweekday())
+
+    turno_hoy = Turno(
+        tenant_id=tenant_a, nombre="Turno de hoy",
+        hora_inicio=time(0, 0), hora_fin=time(23, 59), linea_id=linea.id,
+        dias_semana=hoy_iso,
+    )
+    db.add(turno_hoy)
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/linea-en-vivo/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    assert r.json()["turno_actual"] == "Turno de hoy"
+
+
+def test_linea_en_vivo_estacion_inactiva_se_muestra_grisada_no_oculta(client, db, tenant_a, gerente_a):
+    """Feedback de producto (Fase Q): antes una estación inactiva
+    desaparecía por completo del listado (filtro Estacion.activa==True),
+    rompiendo la continuidad visual del flujo. Ahora se devuelve igual,
+    con activa=False, para que el front la muestre grisada en su lugar."""
+    planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
+    est1.activa = False
+    db.add(est1)
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/linea-en-vivo/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["estaciones"]) == 2  # las dos siguen presentes
+    fila_est1 = next(e for e in body["estaciones"] if e["estacion_fk"] == str(est1.id))
+    fila_est2 = next(e for e in body["estaciones"] if e["estacion_fk"] == str(est2.id))
+    assert fila_est1["activa"] is False
+    assert fila_est2["activa"] is True
+
+
 def test_linea_en_vivo_muestra_orden_en_progreso(client, db, tenant_a, gerente_a):
     planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
     orden = OrdenProduccion(
@@ -159,8 +232,8 @@ def test_linea_en_vivo_resuelve_supervisor_asignado(client, db, tenant_a, gerent
     db.refresh(supervisor)
 
     db.add(AsignacionSupervisor(
-        tenant_id=tenant_a, fecha=date.today(), linea_id=linea.id,
-        turno_id=turno.id, supervisor_id=supervisor.id,
+        tenant_id=tenant_a, linea_id=linea.id, turno_id=turno.id, supervisor_id=supervisor.id,
+        dias_semana="1,2,3,4,5,6,7", vigencia_desde=date.today() - timedelta(days=1), vigencia_hasta=None,
     ))
     db.commit()
 

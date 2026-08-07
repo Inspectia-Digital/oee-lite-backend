@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 import uuid
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, date, time, timedelta
 
 from app.core.database import get_session
@@ -453,35 +453,74 @@ def eventos_en_vivo(
 
 
 # ==========================================
-# ASIGNACIÓN DE SUPERVISORES POR DÍA (Fase H)
+# ASIGNACIÓN DE SUPERVISORES -- REGLA RECURRENTE (Fase Q)
 # BACKEND_REQUIREMENTS.md §11.2. Path a nivel raíz (no bajo /supervisor)
-# porque así lo especifica la doc. Idempotente por (fecha, linea_id,
-# turno_id): reasignar sobrescribe.
+# porque así lo especifica la doc.
+#
+# Reemplaza el modelo "un supervisor por línea+turno+día EXACTO" (Fase H)
+# por una regla recurrente: qué días de la semana, con vigencia desde/
+# hasta. Pueden coexistir varias reglas para la misma (línea, turno) a lo
+# largo del tiempo -- por eso el POST ya no hace upsert por una clave
+# implícita, siempre crea una regla nueva; para reemplazar una vigente se
+# borra (DELETE) y se crea la que corresponda.
 # ==========================================
+def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
+    """CSV de días ISO (1=lunes..7=domingo). Debe coincidir con la copia en
+    analytics.py -- misma regla, sin dato compartido entre ambos routers
+    hoy; si se toca acá, tocar también allá."""
+    try:
+        dias = {int(d) for d in dias_semana.split(",") if d.strip()}
+    except (ValueError, AttributeError):
+        return True
+    return (not dias) or (dia_iso in dias)
+
+
 class AsignacionSupervisorCreate(BaseModel):
-    fecha: date
     linea_id: uuid.UUID
     turno_id: uuid.UUID
     supervisor_id: uuid.UUID
+    dias_semana: List[int] = Field(..., description="Días ISO en que aplica esta regla (1=lunes..7=domingo)")
+    vigencia_desde: date
+    vigencia_hasta: Optional[date] = Field(default=None, description="Vacío = sigue vigente indefinidamente")
+
+    @field_validator("dias_semana")
+    @classmethod
+    def _validar_dias_semana(cls, v: List[int]) -> List[int]:
+        if not v:
+            raise ValueError("dias_semana no puede estar vacío.")
+        invalidos = [d for d in v if d < 1 or d > 7]
+        if invalidos:
+            raise ValueError(f"Días inválidos: {invalidos}. Deben ser 1 (lunes) a 7 (domingo).")
+        return sorted(set(v))
 
 
 @router_asignaciones_supervisor.get("/supervisor/", response_model=List[AsignacionSupervisor])
 def listar_asignaciones_supervisor(
-    fecha: date,
+    fecha: Optional[date] = None,
     linea_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
+    """Sin `fecha`: devuelve TODAS las reglas (para la pantalla de gestión
+    en Configuración). Con `fecha`: filtra a las reglas vigentes ese día
+    exacto (vigencia_desde/hasta + día de semana) -- por ejemplo, para
+    resolver "quién cubre este turno tal día"."""
     validar_planta(context, usuario, db)
-    query = select(AsignacionSupervisor).where(
-        AsignacionSupervisor.tenant_id == context.tenant_id,
-        AsignacionSupervisor.fecha == fecha,
-    )
+    query = select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == context.tenant_id)
     if linea_id:
         _validar_linea_en_planta(linea_id, context, db)
         query = query.where(AsignacionSupervisor.linea_id == linea_id)
-    return db.exec(query).all()
+    reglas = db.exec(query).all()
+    if fecha is None:
+        return reglas
+    dia_iso = fecha.isoweekday()
+    return [
+        r for r in reglas
+        if r.vigencia_desde <= fecha
+        and (r.vigencia_hasta is None or r.vigencia_hasta >= fecha)
+        and _dia_en_dias_semana(dia_iso, r.dias_semana)
+    ]
 
 
 @router_asignaciones_supervisor.post("/supervisor/", response_model=AsignacionSupervisor, status_code=status.HTTP_201_CREATED)
@@ -494,6 +533,9 @@ def asignar_supervisor(
     validar_planta(context, usuario, db)
     _validar_linea_en_planta(payload.linea_id, context, db)
 
+    if payload.vigencia_hasta is not None and payload.vigencia_hasta < payload.vigencia_desde:
+        raise HTTPException(status_code=400, detail="vigencia_hasta no puede ser anterior a vigencia_desde.")
+
     turno = db.exec(select(Turno).where(Turno.id == payload.turno_id, Turno.tenant_id == context.tenant_id)).first()
     if not turno:
         raise HTTPException(status_code=404, detail="Turno no encontrado.")
@@ -504,23 +546,36 @@ def asignar_supervisor(
     if not supervisor:
         raise HTTPException(status_code=404, detail="Supervisor no encontrado o inactivo.")
 
-    existente = db.exec(
-        select(AsignacionSupervisor).where(
-            AsignacionSupervisor.tenant_id == context.tenant_id,
-            AsignacionSupervisor.fecha == payload.fecha,
-            AsignacionSupervisor.linea_id == payload.linea_id,
-            AsignacionSupervisor.turno_id == payload.turno_id,
-        )
-    ).first()
-    if existente:
-        existente.supervisor_id = payload.supervisor_id
-        db.add(existente)
-        db.commit()
-        db.refresh(existente)
-        return existente
-
-    nueva = AsignacionSupervisor(tenant_id=context.tenant_id, **payload.model_dump())
+    nueva = AsignacionSupervisor(
+        tenant_id=context.tenant_id,
+        linea_id=payload.linea_id,
+        turno_id=payload.turno_id,
+        supervisor_id=payload.supervisor_id,
+        dias_semana=",".join(str(d) for d in payload.dias_semana),
+        vigencia_desde=payload.vigencia_desde,
+        vigencia_hasta=payload.vigencia_hasta,
+    )
     db.add(nueva)
     db.commit()
     db.refresh(nueva)
     return nueva
+
+
+@router_asignaciones_supervisor.delete("/supervisor/{asignacion_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_asignacion_supervisor(
+    asignacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    validar_planta(context, usuario, db)
+    regla = db.exec(
+        select(AsignacionSupervisor).where(
+            AsignacionSupervisor.id == asignacion_id,
+            AsignacionSupervisor.tenant_id == context.tenant_id,
+        )
+    ).first()
+    if not regla:
+        raise HTTPException(status_code=404, detail="Regla de asignación no encontrada.")
+    db.delete(regla)
+    db.commit()
