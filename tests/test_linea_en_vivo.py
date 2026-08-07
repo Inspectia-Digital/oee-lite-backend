@@ -2,6 +2,7 @@
 una línea para la portada de TYMEO. Antes esa pantalla era 100% mock
 (useFactoryStatus.ts nunca llamaba al backend)."""
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from app.models.domain import (
     AsignacionSupervisor, AsignacionTurno, Estacion, EstadoOrden, Linea,
@@ -52,8 +53,16 @@ def test_linea_en_vivo_sin_datos_devuelve_estructura_vacia_por_estacion(client, 
 
 
 def test_linea_en_vivo_resuelve_turno_por_horario_actual(client, db, tenant_a, gerente_a):
+    """Regresión encontrada en CI (Fase Q): este test usaba datetime.now()
+    -- hora del PROCESO que corre el test -- para armar la ventana del
+    turno, pero el backend ahora resuelve "ahora" en hora de la PLANTA
+    (_ahora_planta, default America/Buenos_Aires si la Planta no la
+    especifica -- ver _preparar_escenario). Pasaba en local porque esta
+    máquina también está en America/Buenos_Aires (coincidencia), y
+    fallaba en GitHub Actions (corre en UTC, 3h de diferencia). El test
+    tiene que usar la misma referencia horaria que el propio backend."""
     planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
-    ahora = datetime.now().time()
+    ahora = datetime.now(ZoneInfo("America/Buenos_Aires")).time()
     inicio = time((ahora.hour - 1) % 24, 0)
     fin = time((ahora.hour + 1) % 24, 59)
     turno = Turno(tenant_id=tenant_a, nombre="Turno Actual", hora_inicio=inicio, hora_fin=fin, linea_id=linea.id)
@@ -75,7 +84,9 @@ def test_linea_en_vivo_respeta_dias_semana_del_turno(client, db, tenant_a, geren
     incluye hoy no debe resolver como turno_actual -- antes (Fase O) el
     día de la semana no se chequeaba en absoluto."""
     planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
-    hoy_iso = datetime.now().isoweekday()
+    # Misma referencia horaria que el backend (_ahora_planta) -- ver el
+    # comentario en test_linea_en_vivo_resuelve_turno_por_horario_actual.
+    hoy_iso = datetime.now(ZoneInfo("America/Buenos_Aires")).isoweekday()
     otro_dia = "1" if hoy_iso != 1 else "2"  # cualquier día distinto de hoy
 
     turno_otro_dia = Turno(
@@ -98,7 +109,9 @@ def test_linea_en_vivo_respeta_dias_semana_del_turno(client, db, tenant_a, geren
 
 def test_linea_en_vivo_resuelve_turno_de_hoy_por_dia_semana(client, db, tenant_a, gerente_a):
     planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
-    hoy_iso = str(datetime.now().isoweekday())
+    # Misma referencia horaria que el backend (_ahora_planta) -- ver el
+    # comentario en test_linea_en_vivo_resuelve_turno_por_horario_actual.
+    hoy_iso = str(datetime.now(ZoneInfo("America/Buenos_Aires")).isoweekday())
 
     turno_hoy = Turno(
         tenant_id=tenant_a, nombre="Turno de hoy",
