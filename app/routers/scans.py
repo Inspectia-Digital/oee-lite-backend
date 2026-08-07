@@ -18,7 +18,7 @@ from app.models.domain import (
     Estacion, Linea, MaestroSKU, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
-    Maquina, MaquinaEstacion
+    Maquina, MaquinaEstacion, OrdenProduccion, EstadoOrden
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,18 @@ class ScanRequest(BaseModel):
     timestamp: Optional[datetime] = None
     maquina_id: Optional[uuid.UUID] = Field(None, description="Máquina física, si el hardware la reporta")
     unidades_rechazadas: int = Field(0, ge=0, description="Calidad por rechazo (Fase E2): 0 <= rechazadas <= unidades_procesadas")
+    unidades_procesadas: Optional[int] = Field(
+        None, ge=1,
+        description=(
+            "Fase P (PLC Green Mills): conteo edge-autoritativo. Cuando el "
+            "tamaño del lote lo decide el propio emisor evento a evento (ej. "
+            "un PLC con canales de formato fijo, donde 4 o 5 unidades "
+            "dependen de qué canal basculó y no del SKU nominalmente activo "
+            "en el sistema), se manda explícito acá y pisa la resolución por "
+            "SKU de abajo. Si no viene, el comportamiento es exactamente el "
+            "de antes (se resuelve por unidades_por_ciclo del SKU activo)."
+        ),
+    )
 
 
 def _normalizar_timestamp_utc(ts: Optional[datetime], planta_timezone: Optional[str]) -> datetime:
@@ -73,6 +85,7 @@ def _calcular_payload_hash(scan: ScanRequest) -> str:
         "timestamp": scan.timestamp.isoformat() if scan.timestamp else None,
         "maquina_id": str(scan.maquina_id) if scan.maquina_id else None,
         "unidades_rechazadas": scan.unidades_rechazadas,
+        "unidades_procesadas": scan.unidades_procesadas,
     }
     payload_json = json.dumps(canonico, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -164,7 +177,32 @@ def registrar_escaneo_rapido(
             if match:
                 orden_final = match.group(1)
         except Exception:
-            pass 
+            pass
+
+    # 1.b FALLBACK: orden EN_PROGRESO de la línea (Fase P). orden_activa_fk/
+    # sku_activo_fk de la Estación nunca los escribe nadie (siguen NULL
+    # siempre) -- confirmado al construir /analytics/linea-en-vivo/, que
+    # usa esta misma resolución para lo que muestra en pantalla. Para un
+    # PLC ciego (sin codigo_pieza, ej. Green Mills) esta es la ÚNICA fuente
+    # posible de orden/SKU. No pisa un orden_final ya resuelto por el regex
+    # de arriba -- sku_final sí se resuelve siempre acá porque hoy no existe
+    # ningún otro camino que lo asigne.
+    if linea and (orden_final is None or sku_final is None):
+        orden_activa = db.exec(
+            select(OrdenProduccion)
+            .where(
+                OrdenProduccion.tenant_id == dispositivo.tenant_id,
+                OrdenProduccion.linea_id == linea.id,
+                OrdenProduccion.estado == EstadoOrden.EN_PROGRESO,
+                OrdenProduccion.activo == True,  # noqa: E712
+            )
+            .order_by(OrdenProduccion.id_orden.desc())
+        ).first()
+        if orden_activa:
+            if orden_final is None:
+                orden_final = orden_activa.id_orden
+            if sku_final is None:
+                sku_final = orden_activa.sku_fk
 
     # 2. FACTOR DE LOTE (Green Mills)
     unidades_a_sumar = 1
@@ -175,11 +213,19 @@ def registrar_escaneo_rapido(
         if sku:
             if linea and linea.tipo_produccion == "por_lotes":
                 unidades_a_sumar = sku.unidades_por_ciclo
-            
+
             # Tolerancias dinámicas[cite: 13]
             t_optimo = sku.tiempo_ciclo_teorico
             t_lento = t_optimo * (tenant_config.tolerancia_lento_pct if tenant_config else 1.15)
             t_alerta = t_optimo * (tenant_config.tolerancia_alerta_pct if tenant_config else 1.25)
+
+    # 2.b CONTEO EDGE-AUTORITATIVO (Fase P): si el emisor ya sabe cuántas
+    # unidades representa este evento (ver ScanRequest.unidades_procesadas),
+    # pisa lo resuelto arriba por SKU. Las tolerancias dinámicas del SKU (si
+    # se pudo resolver uno) se mantienen -- son un concepto aparte del
+    # conteo, no se pisan.
+    if scan.unidades_procesadas is not None:
+        unidades_a_sumar = scan.unidades_procesadas
 
     # 2.5 CALIDAD POR RECHAZO (Fase E2): 0 <= rechazadas <= procesadas.
     if scan.unidades_rechazadas > unidades_a_sumar:

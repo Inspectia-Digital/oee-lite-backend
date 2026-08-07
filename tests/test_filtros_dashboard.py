@@ -2,7 +2,7 @@
 dashboard (Línea, Turno, "Plan"=orden) ahora tienen efecto real en el
 backend. Antes varios endpoints sólo aceptaban `fecha` (un día) y no
 `linea_id`/`orden_fk`."""
-from datetime import date, datetime
+from datetime import datetime
 
 from app.models.domain import (
     Estacion, EstadoParada, LiteEventoProduccion, Linea, MotivoParada,
@@ -85,7 +85,7 @@ def test_reporte_produccion_filtra_por_orden(client, db, tenant_a, gerente_a):
     db.commit()
 
     autenticar_como(gerente_a.id)
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()  # Fase P: alinear con timestamp UTC de LiteEventoProduccion
     r = client.get(
         "/analytics/reporte-produccion/",
         params={"fecha_desde": hoy, "fecha_hasta": hoy, "orden_fk": "OP-FILTRO-1"},

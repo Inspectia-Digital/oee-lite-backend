@@ -1,0 +1,770 @@
+17/7/2026, 09:00:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:00:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:00:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:00:43nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:00:53nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:01:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:01:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:01:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:01:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:01:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:02:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:02:13nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:02:23nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:02:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:02:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:00nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:33nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:43nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:03:53nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:04:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:04:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:04:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:04:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:04:53nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:05:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:05:13nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:05:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: false
+Entrada 2: true
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:05:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:06:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:06:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:06:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:06:43nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:06:53nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:07:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:07:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:07:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:07:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:07:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:08:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:08:13nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:08:23nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:08:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:08:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:09:00nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:09:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:09:23nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:09:33nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:09:43nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:00nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:43nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:10:53nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:11:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:11:20nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:11:30nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:11:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:11:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:12:03nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:12:13nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:12:23nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:12:40nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:12:50nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:13:00nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:13:10nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:13:23nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: true
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0
+17/7/2026, 09:13:33nodo: debug 2
+msg.payload : Object
+object
+Entrada 1: true
+Entrada 2: false
+Salida 1: false
+Salida 2: false
+Marca 1: false
+Palabra 0: 0
+Palabra 2: 0
+Palabra 4: 0

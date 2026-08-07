@@ -1,6 +1,6 @@
 """Fase I: oee-cascada, rendimiento-secuencial, reporte-produccion, command-center/summary."""
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.models.domain import Estacion, Linea, Planta, RolUsuario, Turno
 from tests.conftest import autenticar_como, crear_usuario
@@ -102,7 +102,7 @@ def test_reporte_produccion_filas_planas_por_fecha(client, db, tenant_a, gerente
     _emitir_evento(client, credencial, estacion.id)
 
     autenticar_como(gerente_a.id)
-    hoy = date.today().isoformat()
+    hoy = datetime.utcnow().date().isoformat()  # Fase P: alinear con timestamp UTC de LiteEventoProduccion
     r = client.get(
         f"/analytics/reporte-produccion/?fecha_desde={hoy}&fecha_hasta={hoy}",
         headers={"X-Sub-Tenant-Id": str(planta.id)},
