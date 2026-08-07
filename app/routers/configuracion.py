@@ -540,22 +540,32 @@ def obtener_sku(
     return sku
 
 
+class MaestroSKUUpdate(BaseModel):
+    activo: Optional[bool] = None
+    descripcion: Optional[str] = None
+
+
 @router.patch("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
 def actualizar_sku(
     codigo_sku: str,
-    activo: Optional[bool] = None,
-    descripcion: Optional[str] = None,
+    payload: MaestroSKUUpdate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
+    # Bug real (encontrado en uso): activo/descripcion eran parámetros
+    # sueltos (no envueltos en un BaseModel) -- FastAPI los interpreta
+    # como QUERY PARAMS por default, no como el body JSON que manda el
+    # front (`apiPatch(url, {descripcion, activo})`). El endpoint
+    # devolvía 200 sin error, pero activo/descripcion siempre llegaban
+    # None -- activar/desactivar un SKU no hacía nada, en silencio.
     sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
     if not sku:
         raise HTTPException(status_code=404, detail="SKU no encontrado.")
-    if activo is not None:
-        sku.activo = activo
-    if descripcion is not None:
-        sku.descripcion = descripcion
+    if payload.activo is not None:
+        sku.activo = payload.activo
+    if payload.descripcion is not None:
+        sku.descripcion = payload.descripcion
     db.add(sku)
     db.commit()
     db.refresh(sku)

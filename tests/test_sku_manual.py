@@ -107,3 +107,35 @@ def test_crear_sku_manual_requiere_gerencia(client, db, tenant_a):
         json={"codigo_sku": f"SKU-{uuid.uuid4().hex[:8]}", "descripcion": "No autorizado"},
     )
     assert r.status_code == 403
+
+
+def test_desactivar_sku_por_patch_persiste(client, db, tenant_a, gerente_a):
+    """Bug real: activo/descripcion eran parámetros sueltos en la firma del
+    endpoint (no un BaseModel) -- FastAPI los trataba como query params, el
+    body JSON que manda el front (apiPatch) nunca llegaba. El PATCH
+    devolvía 200 pero no cambiaba nada: activar/desactivar un SKU no hacía
+    nada, en silencio."""
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"activo": False, "descripcion": "Editado"})
+    assert r.status_code == 200
+    assert r.json()["activo"] is False
+    assert r.json()["descripcion"] == "Editado"
+
+    sku_db = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo, MaestroSKU.tenant_id == tenant_a)).first()
+    assert sku_db.activo is False
+    assert sku_db.descripcion == "Editado"
+
+
+def test_patch_sku_campo_omitido_no_lo_toca(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"activo": False})
+    assert r.status_code == 200
+    assert r.json()["descripcion"] == "Original"  # no se mandó, no se toca
