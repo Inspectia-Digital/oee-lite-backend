@@ -206,26 +206,49 @@ def registrar_escaneo_rapido(
 
     # 2. FACTOR DE LOTE (Green Mills)
     unidades_a_sumar = 1
+    # Fallback de Estación: valores absolutos configurados por evento/scan
+    # (sin relación con "unidades" -- esto no cambia con este fix).
     t_optimo, t_lento, t_alerta = estacion.umbral_optimo, estacion.umbral_lento, estacion.umbral_alerta
+    sku_resuelto = None
 
     if sku_final:
-        sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == dispositivo.tenant_id)).first()
-        if sku:
+        sku_resuelto = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == dispositivo.tenant_id)).first()
+        if sku_resuelto:
             if linea and linea.tipo_produccion == "por_lotes":
-                unidades_a_sumar = sku.unidades_por_ciclo
-
-            # Tolerancias dinámicas[cite: 13]
-            t_optimo = sku.tiempo_ciclo_teorico
-            t_lento = t_optimo * (tenant_config.tolerancia_lento_pct if tenant_config else 1.15)
-            t_alerta = t_optimo * (tenant_config.tolerancia_alerta_pct if tenant_config else 1.25)
+                unidades_a_sumar = sku_resuelto.unidades_por_ciclo
+            # Snapshot para tiempo_ideal_seg (Rendimiento = tiempo_ideal_seg *
+            # unidades_procesadas) -- tiempo_ciclo_teorico es "segundos
+            # ideales POR UNIDAD" (ver MaestroSKU), no se toca acá.
+            t_optimo = sku_resuelto.tiempo_ciclo_teorico
 
     # 2.b CONTEO EDGE-AUTORITATIVO (Fase P): si el emisor ya sabe cuántas
     # unidades representa este evento (ver ScanRequest.unidades_procesadas),
-    # pisa lo resuelto arriba por SKU. Las tolerancias dinámicas del SKU (si
-    # se pudo resolver uno) se mantienen -- son un concepto aparte del
-    # conteo, no se pisan.
+    # pisa lo resuelto arriba por SKU. Se resuelve ANTES del umbral de
+    # ciclo de abajo -- ese umbral tiene que reflejar cuántas unidades
+    # produjo ESTE evento en particular.
     if scan.unidades_procesadas is not None:
         unidades_a_sumar = scan.unidades_procesadas
+
+    # Fase P: bug real encontrado al preparar la carga de Green Mills.
+    # delta_t_segundos (más abajo) mide el tiempo entre EVENTOS
+    # consecutivos -- para una línea por_lotes cada evento es una
+    # bandeja/ciclo completo (varias unidades), no una unidad individual.
+    # Comparar ese delta_t contra el umbral "por unidad" del SKU sin
+    # escalarlo por unidades_a_sumar clasificaría CADA bandeja normal como
+    # una parada enorme (ej. bandeja de 5 panes a 2s/pan ideal = 10s de
+    # ciclo, contra un umbral de alerta de ~2.5s). Nunca se detectó antes
+    # porque sku_final nunca se resolvía (fix de la sección 1.b) -- esta
+    # rama jamás había corrido con un SKU real. El fallback de Estación
+    # (sin SKU) queda exactamente como estaba: t_lento/t_alerta son los
+    # valores absolutos configurados en la Estación, no se derivan de nada.
+    if sku_resuelto:
+        tiempo_ideal_por_ciclo = sku_resuelto.tiempo_ciclo_teorico * unidades_a_sumar
+        tolerancia_lento_pct = tenant_config.tolerancia_lento_pct if tenant_config else 1.15
+        tolerancia_alerta_pct = tenant_config.tolerancia_alerta_pct if tenant_config else 1.25
+        t_lento = tiempo_ideal_por_ciclo * tolerancia_lento_pct
+        t_alerta = tiempo_ideal_por_ciclo * tolerancia_alerta_pct
+    else:
+        tiempo_ideal_por_ciclo = t_optimo  # = estacion.umbral_optimo; usado en el cap de más abajo
 
     # 2.5 CALIDAD POR RECHAZO (Fase E2): 0 <= rechazadas <= procesadas.
     if scan.unidades_rechazadas > unidades_a_sumar:
@@ -269,8 +292,10 @@ def registrar_escaneo_rapido(
                 estado=EstadoParada.PENDIENTE
             )
             db.add(nueva_parada)
-            # Cap de Rendimiento: Limitamos delta_t a t_optimo para no penalizar el OEE de Rendimiento
-            delta_t_segundos = t_optimo
+            # Cap de Rendimiento: limitamos delta_t al tiempo ideal de UN
+            # CICLO (no de una unidad -- mismo motivo que t_lento/t_alerta
+            # arriba) para no penalizar dos veces el mismo hueco.
+            delta_t_segundos = tiempo_ideal_por_ciclo
 
         elif delta_t_segundos > t_lento:
             desempeno = "LENTO"
