@@ -189,3 +189,63 @@ def test_codigo_pieza_regex_sigue_teniendo_prioridad_sobre_la_orden_en_progreso(
     from sqlmodel import select
     evento = db.exec(select(LiteEventoProduccion).where(LiteEventoProduccion.id_estacion == str(estacion.id))).first()
     assert evento.orden_fk == "OP9999"  # del regex, no de la orden EN_PROGRESO
+
+
+def test_por_lotes_umbral_de_parada_es_por_ciclo_no_por_unidad(client, db, tenant_a, gerente_a):
+    """Bug real encontrado al preparar la carga de Green Mills: delta_t
+    (tiempo entre EVENTOS/bandejas consecutivas) se comparaba contra un
+    umbral derivado de tiempo_ciclo_teorico SIN escalar por
+    unidades_por_ciclo -- ese campo es "segundos ideales POR UNIDAD"
+    (ver MaestroSKU.tiempo_ciclo_teorico), así que compararlo tal cual
+    contra delta_t (que mide tiempo por CICLO) marcaba cada bandeja normal
+    como una parada grande. Nunca se detectó porque sku_final nunca se
+    resolvía antes de este fix (Fase P, sección 1.b) -- esta rama jamás
+    había corrido con un SKU real."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a, TipoProduccion.POR_LOTES)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, unidades_por_ciclo=5)
+    sku.tiempo_ciclo_teorico = 2.0  # seg/unidad -> ciclo ideal de 5 unidades = 10s
+    db.add(sku)
+    db.commit()
+    credencial = _emitir_credencial(client, gerente_a, estacion.id)
+
+    ahora = datetime.now(timezone.utc)
+    # 4 bandejas normales, exactamente cada 10s (el ciclo ideal calculado).
+    for i in range(4):
+        ts = (ahora + timedelta(seconds=10 * i)).isoformat()
+        r = client.post(
+            "/api/lite/scans",
+            json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ts},
+            headers={"X-Device-Key": credencial},
+        )
+        assert r.status_code == 201
+
+    # 5to evento: hueco real de 100s (una parada de verdad).
+    ts_parada = (ahora + timedelta(seconds=30 + 100)).isoformat()
+    r = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ts_parada},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r.status_code == 201
+
+    from app.models.domain import LiteEventoProduccion, ParadaDetectada
+    from sqlmodel import select
+
+    eventos = db.exec(
+        select(LiteEventoProduccion)
+        .where(LiteEventoProduccion.id_estacion == str(estacion.id))
+        .order_by(LiteEventoProduccion.timestamp)
+    ).all()
+    assert len(eventos) == 5
+    # Las primeras 4 bandejas (delta_t=10s contra un ciclo ideal de 10s) NO
+    # deben clasificar ALERTA -- con el bug, 10s contra un umbral "por
+    # unidad" de ~2.5s (2.0 * 1.25) las hubiese marcado ALERTA a todas.
+    assert [e.estado for e in eventos[:4]] == ["OPTIMO", "OPTIMO", "OPTIMO", "OPTIMO"]
+    # El hueco real de 100s sí debe detectarse.
+    assert eventos[4].estado == "ALERTA"
+
+    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
+    assert len(paradas) == 1
+    # t_alerta = tiempo_ideal_por_ciclo(10) * tolerancia_alerta_pct(1.25) = 12.5
+    # tiempo_perdido = delta_t(100) - t_alerta(12.5) = 87.5
+    assert paradas[0].duracion_segundos == 87.5
