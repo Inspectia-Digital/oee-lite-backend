@@ -94,6 +94,129 @@ def test_rendimiento_secuencial_ordenado_por_posicion(client, db, tenant_a, gere
     assert [f["posicion_linea"] for f in filas] == sorted(f["posicion_linea"] for f in filas)
 
 
+def test_rendimiento_secuencial_no_rompe_si_estacion_no_tiene_umbral_optimo(client, db, tenant_a, gerente_a):
+    """Fase Q (ronda 3): objetivo usaba estacion.umbral_optimo directo --
+    Optional[int] desde Fase Q, podía romper la construcción del modelo
+    (RendimientoSecuencialRow.objetivo: float, requerido) con un 500
+    para cualquier estación sin umbral propio (el caso nuevo por
+    default). Ahora objetivo sale de tiempo_ideal_seg del evento, que
+    siempre tiene un valor numérico (default 0.0)."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    estacion.umbral_optimo = None
+    db.add(estacion)
+    db.commit()
+    credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
+    _emitir_evento(client, credencial, estacion.id)
+    _emitir_evento(client, credencial, estacion.id)  # 2do evento: el 1ro nunca tiene delta_t > 0
+
+    autenticar_como(gerente_a.id)
+    r = client.get(f"/analytics/rendimiento-secuencial/?linea_id={linea.id}", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    assert r.status_code == 200
+
+
+def test_rendimiento_secuencial_acepta_fecha_desde_fecha_hasta(client, db, tenant_a, gerente_a):
+    """Fase Q (ronda 3): antes sólo aceptaba `fecha` (un día) -- el
+    selector de rango ("Últimos N días") del dashboard no tenía ningún
+    efecto acá. Un evento de hace 3 días no aparecía si se pedía sólo
+    `fecha=hoy`, pero sí tiene que aparecer con fecha_desde/fecha_hasta
+    cubriendo el rango."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
+    hace_3_dias = datetime.now(timezone.utc) - timedelta(days=3)
+    for i in range(2):
+        r = client.post(
+            "/api/lite/scans",
+            json={
+                "event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id),
+                "timestamp": (hace_3_dias + timedelta(seconds=30 * i)).isoformat(),
+            },
+            headers={"X-Device-Key": credencial},
+        )
+        assert r.status_code == 201
+
+    autenticar_como(gerente_a.id)
+    hoy = datetime.now(timezone.utc).date()
+    r = client.get(
+        "/analytics/rendimiento-secuencial/",
+        params={"fecha_desde": (hoy - timedelta(days=6)).isoformat(), "fecha_hasta": hoy.isoformat(), "linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    filas = r.json()
+    assert len(filas) == 1
+    assert filas[0]["tiempo_ciclo_prom"] == 30.0
+
+
+# ---------- cuellos-botella ----------
+
+def test_cuellos_botella_esperado_usa_snapshot_del_evento_no_el_umbral_de_estacion(client, db, tenant_a, gerente_a):
+    """Fase Q (ronda 3): "esperado" usaba estacion.umbral_optimo directo
+    -- desalineado del todo cuando el evento resuelve un SKU (tiempo_ideal_seg
+    pasa a ser el tiempo_ciclo_teorico del SKU, no el umbral de la
+    estación -- ver scans.py). Acá la estación tiene un umbral propio
+    deliberadamente DISTINTO del ciclo ideal del SKU, para probar que el
+    endpoint usa el snapshot del evento, no el umbral de estación."""
+    from app.models.domain import EstadoOrden, MaestroSKU, OrdenProduccion
+
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    estacion.umbral_optimo = 999  # deliberadamente distinto -- no debería usarse
+    db.add(estacion)
+
+    sku = MaestroSKU(tenant_id=tenant_a, codigo_sku="SKU-CB-1", descripcion="Test", tiempo_ciclo_teorico=20.0)
+    db.add(sku)
+    db.commit()
+    orden = OrdenProduccion(tenant_id=tenant_a, id_orden="OP-CB-1", linea_id=linea.id, estado=EstadoOrden.EN_PROGRESO, sku_fk=sku.codigo_sku)
+    db.add(orden)
+    db.commit()
+
+    credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
+    ahora = datetime.now(timezone.utc)
+    for i in range(2):
+        r = client.post(
+            "/api/lite/scans",
+            json={
+                "event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id),
+                "timestamp": (ahora + timedelta(seconds=20 * i)).isoformat(),
+            },
+            headers={"X-Device-Key": credencial},
+        )
+        assert r.status_code == 201
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/cuellos-botella/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    filas = r.json()
+    assert len(filas) == 1
+    # tiempo_ideal_seg del 2do evento = 20.0 (tiempo_ciclo_teorico del SKU,
+    # unidades_procesadas=1) -- nunca 999 (el umbral de la estación).
+    assert filas[0]["tiempo_esperado_seg"] == 20.0
+
+
+def test_cuellos_botella_no_rompe_si_estacion_no_tiene_umbral_optimo(client, db, tenant_a, gerente_a):
+    """Contraparte station-only (sin SKU/orden) del test anterior: antes
+    de este fix, estacion.umbral_optimo=None rompía la construcción del
+    modelo (CuelloBotella.tiempo_esperado_seg: float, requerido)."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    estacion.umbral_optimo = None
+    db.add(estacion)
+    db.commit()
+    credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
+    _emitir_evento(client, credencial, estacion.id)
+    _emitir_evento(client, credencial, estacion.id)
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/cuellos-botella/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+
+
 # ---------- reporte-produccion ----------
 
 def test_reporte_produccion_filas_planas_por_fecha(client, db, tenant_a, gerente_a):
