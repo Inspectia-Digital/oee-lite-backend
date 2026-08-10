@@ -320,7 +320,13 @@ def obtener_oee_general(
             oee_general_pct=round(m["oee_general"] * 100, 1),
             total_unidades=m["total_unidades"],
             unidades_con_retrabajo=m["total_rechazadas"],
-            minutos_desvio_calidad=0.0
+            # Fase Q (ronda 2): antes hardcodeado a 0.0 -- el campo se
+            # llama "por desvío de calidad" pero es el único que alimenta
+            # la card "Minutos Perdidos" del dashboard, así que ahora
+            # refleja lentitud + paradas no planificadas (ver
+            # _calcular_metricas_oee). Nombre del campo desactualizado,
+            # no se renombra acá para no romper el contrato de API.
+            minutos_desvio_calidad=round(m["minutos_perdidos_seg"] / 60, 1)
         )
     except HTTPException:
         raise
@@ -386,26 +392,33 @@ def _calcular_metricas_oee(
     planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
     dias_produccion = len({_fecha_planta(e.timestamp, planta) for e, _, _ in eventos})
 
-    q_turnos = select(Turno).join(Linea, Turno.linea_id == Linea.id).where(
-        Turno.tenant_id == context.tenant_id,
-        Linea.planta_id == context.sub_tenant_id
+    # Fase Q (feedback de producto, ronda 2): tiempo_planificado dejó de
+    # basarse en la duración nominal del turno (Turno.hora_inicio/fin ×
+    # dias_produccion) -- con datos reales cortos (capturas de prueba del
+    # PLC de Green Mills) eso seguía comparando contra un turno completo
+    # nominal aunque la actividad real hubiera durado minutos, diluyendo
+    # Rendimiento igual. Ahora se arma DE ABAJO HACIA ARRIBA, a partir de
+    # lo que realmente pasó evento por evento:
+    #   tiempo_planificado = tiempo_ideal (Efectivo) + lentitud + paradas
+    # `turno_id`/`turnos` quedan sin usar en este cálculo a partir de acá
+    # (antes sólo elegían qué turno nominal multiplicar, nunca filtraban
+    # qué eventos entraban) -- si se necesita que turno_id filtre POR
+    # VENTANA HORARIA qué eventos cuentan, es un cambio aparte, no incluido.
+
+    # RENDIMIENTO (Fase E2): tiempo_ideal_seg es snapshot por evento
+    # (umbral SKU si había uno activo), multiplicado por unidades_procesadas.
+    tiempo_ideal_total = sum(e.tiempo_ideal_seg * e.unidades_procesadas for e, _, _ in eventos)
+
+    # Fase Q (ronda 2): tiempo perdido por LENTITUD -- antes sólo se
+    # detectaba/guardaba el excedente cuando un evento cruzaba a ALERTA
+    # (ParadaDetectada). Los eventos "LENTO" (entre óptimo y alerta)
+    # quedaban marcados en el evento individual pero nunca se sumaban a
+    # nada -- por eso la card "Minutos Perdidos" siempre daba 0. Acá se
+    # suma el excedente real sobre el tiempo ideal de cada evento LENTO.
+    tiempo_perdido_lentitud_seg = sum(
+        max(0.0, (e.delta_t_segundos or 0.0) - (e.tiempo_ideal_seg * e.unidades_procesadas))
+        for e, _, _ in eventos if e.estado == "LENTO"
     )
-    if linea_id: q_turnos = q_turnos.where(Turno.linea_id == linea_id)
-    if turno_id: q_turnos = q_turnos.where(Turno.id == turno_id)
-    turnos = db.exec(q_turnos).all()
-
-    tiempo_planificado_seg = 0
-    for t in turnos:
-        inicio_dt = datetime.combine(date.today(), t.hora_inicio)
-        fin_dt = datetime.combine(date.today(), t.hora_fin)
-        if fin_dt < inicio_dt: fin_dt += timedelta(days=1)
-
-        duracion_turno_seg = (fin_dt - inicio_dt).total_seconds()
-        duracion_neta_seg = duracion_turno_seg - (t.descanso_minutos * 60)
-        tiempo_planificado_seg += (duracion_neta_seg * dias_produccion)
-
-    if tiempo_planificado_seg == 0:
-        tiempo_planificado_seg = 28800 * dias_produccion
 
     q_paradas = (
         select(ParadaDetectada, MotivoParada)
@@ -425,15 +438,25 @@ def _calcular_metricas_oee(
     t_paradas_no_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if not m or m.tipo_parada == TipoParada.NO_PLANIFICADA)
     t_paradas_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if m and m.tipo_parada == TipoParada.PLANIFICADA)
 
+    # tiempo_planificado_seg ahora es la suma completa de abajo hacia
+    # arriba (ideal + lentitud + TODAS las paradas, planificadas y no);
+    # tiempo_planificado_neto/tiempo_operativo_seg restan exactamente lo
+    # mismo que antes (paradas planificadas, después no planificadas) --
+    # sólo cambió de qué número parten.
+    tiempo_planificado_seg = tiempo_ideal_total + tiempo_perdido_lentitud_seg + t_paradas_no_planificadas + t_paradas_planificadas
+    if tiempo_planificado_seg == 0:
+        tiempo_planificado_seg = 28800 * dias_produccion  # borde defensivo: no debería pasar con eventos no vacíos
+
     tiempo_planificado_neto = max(1, tiempo_planificado_seg - t_paradas_planificadas)
     tiempo_operativo_seg = max(1, tiempo_planificado_neto - t_paradas_no_planificadas)
 
     disponibilidad = min(tiempo_operativo_seg / tiempo_planificado_neto, 1.0)
-
-    # RENDIMIENTO (Fase E2): tiempo_ideal_seg es snapshot por evento
-    # (umbral SKU si había uno activo), multiplicado por unidades_procesadas.
-    tiempo_ideal_total = sum(e.tiempo_ideal_seg * e.unidades_procesadas for e, _, _ in eventos)
     rendimiento = min((tiempo_ideal_total / tiempo_operativo_seg) if tiempo_operativo_seg > 0 else 0.0, 1.0)
+
+    # "Minutos Perdidos" (KPI del dashboard): lentitud + paradas NO
+    # planificadas -- las planificadas son esperadas (ej. cambio de
+    # formato), no cuentan como "perdido" en el sentido que ve el usuario.
+    minutos_perdidos_seg = tiempo_perdido_lentitud_seg + t_paradas_no_planificadas
 
     # CALIDAD (Fase E2): combina POR_RECHAZO y POR_TIEMPO según
     # Linea.metodo_calidad de cada evento. Fallback explícito a N/A.
@@ -478,6 +501,7 @@ def _calcular_metricas_oee(
         "tiempo_planificado_seg": tiempo_planificado_seg,
         "tiempo_planificado_neto_seg": tiempo_planificado_neto,
         "tiempo_operativo_seg": tiempo_operativo_seg,
+        "minutos_perdidos_seg": minutos_perdidos_seg,
     }
 
 
