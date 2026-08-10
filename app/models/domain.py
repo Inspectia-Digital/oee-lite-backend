@@ -165,6 +165,16 @@ class Linea(TenantBase, table=True):
     umbral_lento: Optional[int] = Field(default=None, description="Default de línea: límite de tiempo aceptable")
     umbral_alerta: Optional[int] = Field(default=None, description="Default de línea: tiempo que dispara alerta")
 
+    # Fase R (feedback de producto): tolerancia % heredable Estación ->
+    # Línea -> Tenant, para la rama de scans.py donde SÍ hay un SKU
+    # resuelto (antes esa tolerancia era un único valor fijo por tenant,
+    # sin poder ajustarla por línea/estación). NULL = sin override de
+    # línea, cada estación resuelve el suyo propio (o el del tenant si
+    # tampoco lo tiene). Mismo patrón que umbral_optimo/lento/alerta de
+    # arriba, pero para el eje de tolerancia, no de segundos absolutos.
+    tolerancia_lento_pct: Optional[float] = Field(default=None, description="Default de línea: % de tolerancia lento sobre el ciclo ideal del SKU")
+    tolerancia_alerta_pct: Optional[float] = Field(default=None, description="Default de línea: % de tolerancia alerta sobre el ciclo ideal del SKU")
+
 class Supervisor(TenantBase, table=True):
     __tablename__ = "dim_supervisores"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -187,7 +197,12 @@ class Estacion(TenantBase, table=True):
     umbral_optimo: Optional[int] = Field(default=None, description="Tiempo ideal en segundos (NULL = hereda de la línea)")
     umbral_lento: Optional[int] = Field(default=None, description="Límite de tiempo aceptable (NULL = hereda de la línea)")
     umbral_alerta: Optional[int] = Field(default=None, description="Tiempo que dispara alerta (NULL = hereda de la línea)")
-    
+
+    # Fase R: tolerancia % heredable -- NULL = hereda de la Línea (y del
+    # Tenant si la Línea tampoco la tiene). Ver mismo comentario en Linea.
+    tolerancia_lento_pct: Optional[float] = Field(default=None, description="% de tolerancia lento sobre el ciclo ideal del SKU (NULL = hereda de la línea)")
+    tolerancia_alerta_pct: Optional[float] = Field(default=None, description="% de tolerancia alerta sobre el ciclo ideal del SKU (NULL = hereda de la línea)")
+
     activa: bool = Field(default=True, description="Apagar si hoy no se usa")
     posicion_linea: int = Field(default=1, description="Secuencia lógica (1,2,3...)")
     ramal: str = Field(default="Principal", description="Ej: Principal, Ramal A, Ramal B")
@@ -278,6 +293,25 @@ class MaestroSKU(TenantBase, table=True):
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id") # OS Shell requirement para uploads
     unidades_por_ciclo: int = Field(default=1, description="Factor de lote (ej: 4 panes por molde)")
     activo: bool = Field(default=True)
+
+class SkuTiempoEstacion(TenantBase, table=True):
+    """Fase R (feedback de producto): un mismo SKU puede tardar distinto
+    según en qué estación se procesa (ej. la Armadora vs. el Embalaje) --
+    MaestroSKU.tiempo_ciclo_teorico es un único valor genérico por SKU,
+    no alcanza para eso. Esta tabla es un OVERRIDE opcional por
+    (SKU, Estación): si no existe fila acá para el par, scans.py cae al
+    tiempo_ciclo_teorico genérico del SKU (no bloquea nada, sólo hace
+    falta cargar el override donde realmente difiera del genérico)."""
+    __tablename__ = "sku_tiempo_estacion"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    sku_fk: str = Field(foreign_key="maestro_skus.codigo_sku")
+    estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id")
+    tiempo_ciclo_teorico: float = Field(description="Segundos ideales por unidad de este SKU en esta estación")
+    activo: bool = Field(default=True)
+
+    __table_args__ = (
+        Index("ix_sku_tiempo_estacion_unico", "tenant_id", "sku_fk", "estacion_id", unique=True),
+    )
 
 class OrdenProduccion(TenantBase, table=True):
     __tablename__ = "ordenes_produccion"
