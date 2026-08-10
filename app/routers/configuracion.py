@@ -16,7 +16,7 @@ from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usu
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
-    Maquina, MaquinaEstacion,
+    Maquina, MaquinaEstacion, SkuTiempoEstacion,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -57,6 +57,13 @@ class LineaCreate(BaseModel):
     umbral_optimo: Optional[int] = None
     umbral_lento: Optional[int] = None
     umbral_alerta: Optional[int] = None
+    # Fase R: % de tolerancia heredable (Estación > Línea > Tenant) sobre
+    # el ciclo ideal de un SKU -- reemplaza usar SIEMPRE el único valor
+    # fijo de Tenant.tolerancia_lento_pct/alerta_pct cuando el evento
+    # resuelve un SKU (scans.py). None = sin default de línea (cae al
+    # tenant, ver _resolver_tolerancia en scans.py).
+    tolerancia_lento_pct: Optional[float] = None
+    tolerancia_alerta_pct: Optional[float] = None
 
 class LineaUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -67,6 +74,8 @@ class LineaUpdate(BaseModel):
     umbral_optimo: Optional[int] = None
     umbral_lento: Optional[int] = None
     umbral_alerta: Optional[int] = None
+    tolerancia_lento_pct: Optional[float] = None
+    tolerancia_alerta_pct: Optional[float] = None
 
 class EstacionCreate(BaseModel):
     nombre: str
@@ -81,6 +90,10 @@ class EstacionCreate(BaseModel):
     umbral_optimo: Optional[int] = None
     umbral_lento: Optional[int] = None
     umbral_alerta: Optional[int] = None
+    # Fase R: idem umbral_*, pero para el % de tolerancia que se aplica
+    # cuando el evento SÍ resuelve un SKU (None = hereda de la Línea).
+    tolerancia_lento_pct: Optional[float] = None
+    tolerancia_alerta_pct: Optional[float] = None
     codigo_plc: Optional[str] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperariosEstacion] = ModoAsignacionOperariosEstacion.HEREDAR
 
@@ -90,6 +103,8 @@ class EstacionUpdate(BaseModel):
     umbral_optimo: Optional[int] = None
     umbral_lento: Optional[int] = None
     umbral_alerta: Optional[int] = None
+    tolerancia_lento_pct: Optional[float] = None
+    tolerancia_alerta_pct: Optional[float] = None
     activa: Optional[bool] = None
     posicion_linea: Optional[int] = None
     ramal: Optional[str] = None
@@ -656,6 +671,145 @@ def crear_sku(
     db.commit()
     db.refresh(nuevo)
     return nuevo
+
+
+# ==========================================
+# ⏱️ TIEMPO IDEAL POR SKU × ESTACIÓN (Fase R)
+# MaestroSKU.tiempo_ciclo_teorico es un único valor genérico por SKU, pero
+# un mismo SKU puede tardar distinto según qué estación lo procesa. Esta
+# tabla es un override OPCIONAL por (SKU, Estación) -- si no hay fila acá,
+# scans.py cae al tiempo_ciclo_teorico genérico del SKU (no bloquea nada,
+# sólo hace falta cargar el override donde realmente difiera).
+# ==========================================
+class SkuTiempoEstacionCreate(BaseModel):
+    estacion_id: uuid.UUID
+    tiempo_ciclo_teorico: float
+
+
+class SkuTiempoEstacionUpdate(BaseModel):
+    tiempo_ciclo_teorico: Optional[float] = None
+    activo: Optional[bool] = None
+
+
+@router.post(
+    "/erp/skus/{codigo_sku}/tiempos-estacion/", response_model=SkuTiempoEstacion,
+    status_code=status.HTTP_201_CREATED, tags=["Integración ERP"],
+)
+def crear_tiempo_sku_estacion(
+    codigo_sku: str,
+    payload: SkuTiempoEstacionCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU no encontrado.")
+
+    estacion = db.exec(select(Estacion).where(Estacion.id == payload.estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion:
+        raise HTTPException(status_code=400, detail="estacion_id no existe o pertenece a otra organización.")
+
+    # El índice único (tenant_id, sku_fk, estacion_id) de la tabla no
+    # distingue activo/inactivo -- se chequea antes para devolver un 409
+    # claro (con el id existente) en vez de dejar que explote el commit.
+    existente = db.exec(
+        select(SkuTiempoEstacion).where(
+            SkuTiempoEstacion.tenant_id == context.tenant_id,
+            SkuTiempoEstacion.sku_fk == codigo_sku,
+            SkuTiempoEstacion.estacion_id == payload.estacion_id,
+        )
+    ).first()
+    if existente:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Ya existe un tiempo configurado para este SKU en esta estación (id={existente.id}). "
+                f"Usá PATCH /config/erp/skus/{codigo_sku}/tiempos-estacion/{existente.id} para editarlo."
+            ),
+        )
+
+    nuevo = SkuTiempoEstacion(
+        tenant_id=context.tenant_id, sku_fk=codigo_sku,
+        estacion_id=payload.estacion_id, tiempo_ciclo_teorico=payload.tiempo_ciclo_teorico,
+    )
+    db.add(nuevo)
+    db.commit()
+    db.refresh(nuevo)
+    return nuevo
+
+
+@router.get(
+    "/erp/skus/{codigo_sku}/tiempos-estacion/", response_model=List[SkuTiempoEstacion], tags=["Integración ERP"],
+)
+def listar_tiempos_sku_estacion(
+    codigo_sku: str,
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(SkuTiempoEstacion).where(
+        SkuTiempoEstacion.tenant_id == context.tenant_id,
+        SkuTiempoEstacion.sku_fk == codigo_sku,
+    )
+    if not incluir_inactivos:
+        query = query.where(SkuTiempoEstacion.activo == True)  # noqa: E712
+    return db.exec(query).all()
+
+
+@router.patch(
+    "/erp/skus/{codigo_sku}/tiempos-estacion/{tiempo_id}", response_model=SkuTiempoEstacion, tags=["Integración ERP"],
+)
+def actualizar_tiempo_sku_estacion(
+    codigo_sku: str,
+    tiempo_id: uuid.UUID,
+    payload: SkuTiempoEstacionUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    registro = db.exec(
+        select(SkuTiempoEstacion).where(
+            SkuTiempoEstacion.id == tiempo_id,
+            SkuTiempoEstacion.sku_fk == codigo_sku,
+            SkuTiempoEstacion.tenant_id == context.tenant_id,
+        )
+    ).first()
+    if not registro:
+        raise HTTPException(status_code=404, detail="Tiempo SKU×Estación no encontrado.")
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(registro, key, value)
+    db.add(registro)
+    db.commit()
+    db.refresh(registro)
+    return registro
+
+
+@router.delete("/erp/skus/{codigo_sku}/tiempos-estacion/{tiempo_id}", tags=["Integración ERP"])
+def desactivar_tiempo_sku_estacion(
+    codigo_sku: str,
+    tiempo_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    """Baja lógica (activo=False), no hard-delete -- mismo criterio que el resto del ABM."""
+    registro = db.exec(
+        select(SkuTiempoEstacion).where(
+            SkuTiempoEstacion.id == tiempo_id,
+            SkuTiempoEstacion.sku_fk == codigo_sku,
+            SkuTiempoEstacion.tenant_id == context.tenant_id,
+        )
+    ).first()
+    if not registro:
+        raise HTTPException(status_code=404, detail="Tiempo SKU×Estación no encontrado.")
+    registro.activo = False
+    db.add(registro)
+    db.commit()
+    return {"mensaje": "Tiempo SKU×Estación desactivado."}
 
 
 # ==========================================

@@ -15,7 +15,7 @@ import uuid
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.models.domain import (
-    Estacion, Linea, MaestroSKU, Tenant, Planta,
+    Estacion, Linea, MaestroSKU, SkuTiempoEstacion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
     Maquina, MaquinaEstacion, OrdenProduccion, EstadoOrden
@@ -94,6 +94,17 @@ def _resolver_umbral(valor_estacion: Optional[int], valor_linea: Optional[int], 
     if valor_linea is not None:
         return valor_linea
     return default_sistema
+
+
+def _resolver_tolerancia(valor_estacion: Optional[float], valor_linea: Optional[float], default_tenant: float) -> float:
+    """Misma cascada que _resolver_umbral (Estación > Línea > default),
+    separada porque acá el default no es una constante de sistema sino
+    Tenant.tolerancia_lento_pct/alerta_pct (float, Fase R)."""
+    if valor_estacion is not None:
+        return valor_estacion
+    if valor_linea is not None:
+        return valor_linea
+    return default_tenant
 
 
 def _calcular_payload_hash(scan: ScanRequest) -> str:
@@ -238,10 +249,26 @@ def registrar_escaneo_rapido(
         if sku_resuelto:
             if linea and linea.tipo_produccion == "por_lotes":
                 unidades_a_sumar = sku_resuelto.unidades_por_ciclo
+            # Fase R (feedback de producto): un mismo SKU puede tardar
+            # distinto según la estación que lo procesa -- el tiempo
+            # genérico del SKU no alcanza para eso. Si hay un override
+            # cargado para este (SKU, Estación) puntual, ese manda; si no,
+            # se cae al tiempo_ciclo_teorico genérico del SKU (no bloquea
+            # nada, sólo hace falta cargar el override donde difiera).
+            override_tiempo = db.exec(
+                select(SkuTiempoEstacion).where(
+                    SkuTiempoEstacion.tenant_id == dispositivo.tenant_id,
+                    SkuTiempoEstacion.sku_fk == sku_resuelto.codigo_sku,
+                    SkuTiempoEstacion.estacion_id == estacion.id,
+                    SkuTiempoEstacion.activo == True,  # noqa: E712
+                )
+            ).first()
+            tiempo_ciclo_efectivo = override_tiempo.tiempo_ciclo_teorico if override_tiempo else sku_resuelto.tiempo_ciclo_teorico
             # Snapshot para tiempo_ideal_seg (Rendimiento = tiempo_ideal_seg *
-            # unidades_procesadas) -- tiempo_ciclo_teorico es "segundos
-            # ideales POR UNIDAD" (ver MaestroSKU), no se toca acá.
-            t_optimo = sku_resuelto.tiempo_ciclo_teorico
+            # unidades_procesadas) -- tiempo_ciclo_efectivo ya es "segundos
+            # ideales POR UNIDAD" en esta estación (mismo significado que
+            # MaestroSKU.tiempo_ciclo_teorico), no se toca acá.
+            t_optimo = tiempo_ciclo_efectivo
 
     # 2.b CONTEO EDGE-AUTORITATIVO (Fase P): si el emisor ya sabe cuántas
     # unidades representa este evento (ver ScanRequest.unidades_procesadas),
@@ -264,9 +291,20 @@ def registrar_escaneo_rapido(
     # (sin SKU) queda exactamente como estaba: t_lento/t_alerta son los
     # valores absolutos configurados en la Estación, no se derivan de nada.
     if sku_resuelto:
-        tiempo_ideal_por_ciclo = sku_resuelto.tiempo_ciclo_teorico * unidades_a_sumar
-        tolerancia_lento_pct = tenant_config.tolerancia_lento_pct if tenant_config else 1.15
-        tolerancia_alerta_pct = tenant_config.tolerancia_alerta_pct if tenant_config else 1.25
+        tiempo_ideal_por_ciclo = tiempo_ciclo_efectivo * unidades_a_sumar
+        # Fase R: tolerancia % heredable Estación > Línea > Tenant (antes
+        # era un único valor fijo por tenant, sin importar qué línea o
+        # estación reportara el evento).
+        tolerancia_lento_pct = _resolver_tolerancia(
+            estacion.tolerancia_lento_pct,
+            linea.tolerancia_lento_pct if linea else None,
+            tenant_config.tolerancia_lento_pct if tenant_config else 1.15,
+        )
+        tolerancia_alerta_pct = _resolver_tolerancia(
+            estacion.tolerancia_alerta_pct,
+            linea.tolerancia_alerta_pct if linea else None,
+            tenant_config.tolerancia_alerta_pct if tenant_config else 1.25,
+        )
         t_lento = tiempo_ideal_por_ciclo * tolerancia_lento_pct
         t_alerta = tiempo_ideal_por_ciclo * tolerancia_alerta_pct
     else:

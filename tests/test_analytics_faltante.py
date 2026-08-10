@@ -162,10 +162,15 @@ def test_cuellos_botella_esperado_usa_snapshot_del_evento_no_el_umbral_de_estaci
     estacion.umbral_optimo = 999  # deliberadamente distinto -- no debería usarse
     db.add(estacion)
 
-    sku = MaestroSKU(tenant_id=tenant_a, codigo_sku="SKU-CB-1", descripcion="Test", tiempo_ciclo_teorico=20.0)
+    # codigo_sku/id_orden con sufijo random (Bug real encontrado corriendo
+    # la suite dos veces seguidas contra el mismo Postgres persistente:
+    # codigo_sku sigue siendo PK legacy global -- ver nota C1/C2 en
+    # MaestroSKU -- un literal fijo choca en la segunda corrida).
+    codigo_sku = f"SKU-CB-{uuid.uuid4().hex[:8]}"
+    sku = MaestroSKU(tenant_id=tenant_a, codigo_sku=codigo_sku, descripcion="Test", tiempo_ciclo_teorico=20.0)
     db.add(sku)
     db.commit()
-    orden = OrdenProduccion(tenant_id=tenant_a, id_orden="OP-CB-1", linea_id=linea.id, estado=EstadoOrden.EN_PROGRESO, sku_fk=sku.codigo_sku)
+    orden = OrdenProduccion(tenant_id=tenant_a, id_orden=f"OP-CB-{uuid.uuid4().hex[:8]}", linea_id=linea.id, estado=EstadoOrden.EN_PROGRESO, sku_fk=sku.codigo_sku)
     db.add(orden)
     db.commit()
 
