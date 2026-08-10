@@ -662,6 +662,52 @@ def obtener_pareto_paradas(
         return []
 
 
+def _eventos_con_ciclo_real(eventos_ordenados):
+    """Filtra eventos cuyo delta_t_segundos representa un ciclo de
+    producción REAL en su estación -- excluye los que fueron el primer
+    evento de una nueva "sesión" de orden (mismo criterio de continuidad
+    de orden que scans.py::mismo_contexto_de_orden, Fase Q).
+
+    Por qué hace falta: si la orden activa cambió respecto del evento
+    anterior de esa estación, scans.py NO evalúa ese hueco contra los
+    umbrales -- ni lo clasifica, ni lo capea (el evento queda con
+    estado="OPTIMO" por default, y delta_t_segundos es el hueco REAL sin
+    tocar, que puede ser de horas: cambio de turno, corte de sesión de
+    prueba, etc.). Eso es correcto para no generar una parada falsa, pero
+    "tiempo de ciclo promedio" y "cuellos de botella" promediaban
+    delta_t_segundos de TODOS los eventos por igual -- un puñado de
+    huecos de horas mezclados con el resto (segundos) arruina cualquier
+    promedio, sin que ningún umbral mal configurado tenga la culpa
+    (encontrado auditando el dashboard de Green Mills: el desvío seguía
+    siendo altísimo después de corregir la tolerancia de la estación).
+
+    `eventos_ordenados` tiene que venir ordenado por (id_estacion,
+    timestamp) -- son tuplas (LiteEventoProduccion, ...) del resultado de
+    una query con más de una entidad seleccionada.
+
+    IMPORTANTE: `eventos_ordenados` tiene que venir SIN filtrar por
+    delta_t_segundos > 0 -- esta función necesita ver también el primer
+    evento de cada estación (el que tiene delta_t=0, sin evento anterior)
+    para poder resolver correctamente la continuidad de orden del
+    evento SIGUIENTE. Si se filtra antes, el segundo evento de una
+    estación queda sin forma de saber que comparte contexto con el
+    primero y se excluye por error (encontrado escribiendo el test de
+    esta misma función). El filtro delta_t_segundos > 0 se aplica ACÁ
+    adentro, después de resolver continuidad, no antes.
+    """
+    _SIN_EVENTO_PREVIO = object()  # sentinel: distinto de cualquier orden_fk real (incluido None)
+    resultado = []
+    orden_previo_por_estacion: dict[str, object] = {}
+    for fila in eventos_ordenados:
+        evento = fila[0]
+        anterior = orden_previo_por_estacion.get(evento.id_estacion, _SIN_EVENTO_PREVIO)
+        mismo_contexto = anterior is not _SIN_EVENTO_PREVIO and anterior == evento.orden_fk
+        if mismo_contexto and (evento.delta_t_segundos or 0) > 0:
+            resultado.append(fila)
+        orden_previo_por_estacion[evento.id_estacion] = evento.orden_fk
+    return resultado
+
+
 @router.get("/analytics/cuellos-botella/", response_model=list[CuelloBotella])
 def obtener_cuellos_botella(
     skip: int = 0, limit: int = 1000, fecha: date = None,
@@ -690,12 +736,19 @@ def obtener_cuellos_botella(
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia,
-                LiteEventoProduccion.delta_t_segundos > 0
+                # Fase U: el filtro delta_t_segundos > 0 se aplica DENTRO de
+                # _eventos_con_ciclo_real, no acá -- necesita ver también el
+                # primer evento de cada estación (delta_t=0) para resolver
+                # continuidad de orden del que sigue.
             )
+            .order_by(LiteEventoProduccion.id_estacion, LiteEventoProduccion.timestamp)
         )
         if linea_id: query = query.where(Linea.id == linea_id)
         query = query.offset(skip).limit(limit)
-        eventos = db.exec(query).all()
+        # Fase U: excluye eventos que fueron el primer ping de una nueva
+        # sesión de orden -- su delta_t_segundos es el hueco real SIN
+        # clasificar/capear (puede ser de horas), ver _eventos_con_ciclo_real.
+        eventos = _eventos_con_ciclo_real(db.exec(query).all())
 
         # Fase Q (feedback de producto, ronda 3): "esperado" usaba
         # estacion.umbral_optimo directo -- desactualizado en dos sentidos
@@ -958,12 +1011,18 @@ def obtener_rendimiento_secuencial(
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia,
-                LiteEventoProduccion.delta_t_segundos > 0,
+                # Fase U: el filtro delta_t_segundos > 0 se aplica DENTRO de
+                # _eventos_con_ciclo_real, no acá -- ver el comentario en
+                # /analytics/cuellos-botella/.
             )
+            .order_by(LiteEventoProduccion.id_estacion, LiteEventoProduccion.timestamp)
         )
         if linea_id:
             query = query.where(Linea.id == linea_id)
-        eventos = db.exec(query).all()
+        # Fase U: mismo criterio que /analytics/cuellos-botella/ -- excluye
+        # eventos que fueron el primer ping de una nueva sesión de orden
+        # (ver _eventos_con_ciclo_real).
+        eventos = _eventos_con_ciclo_real(db.exec(query).all())
 
         agrupado = {}
         for evento, estacion in eventos:

@@ -2,7 +2,7 @@
 dashboard (Línea, Turno, "Plan"=orden) ahora tienen efecto real en el
 backend. Antes varios endpoints sólo aceptaban `fecha` (un día) y no
 `linea_id`/`orden_fk`."""
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.models.domain import (
     Estacion, EstadoParada, LiteEventoProduccion, Linea, MotivoParada,
@@ -61,9 +61,18 @@ def test_pareto_paradas_filtra_por_linea(client, db, tenant_a, gerente_a):
 
 
 def test_cuellos_botella_filtra_por_linea(client, db, tenant_a, gerente_a):
+    """Fase U: cuellos-botella excluye el primer evento de cada estación
+    (sin evento anterior no hay forma de resolver continuidad de orden,
+    ver _eventos_con_ciclo_real) -- acá se inserta un evento previo con
+    delta_t=0 antes del evento "real" que el test quiere medir, igual que
+    lo haría /api/lite/scans en la práctica."""
     planta, linea1, linea2, est1, est2 = _preparar_dos_lineas(db, tenant_a)
-    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est1.id), unidades_procesadas=1, delta_t_segundos=90))
-    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est2.id), unidades_procesadas=1, delta_t_segundos=200))
+    ahora = datetime.utcnow()
+    minuto = timedelta(minutes=1)
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est1.id), unidades_procesadas=1, delta_t_segundos=0, timestamp=ahora))
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est1.id), unidades_procesadas=1, delta_t_segundos=90, timestamp=ahora + minuto))
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est2.id), unidades_procesadas=1, delta_t_segundos=0, timestamp=ahora))
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(est2.id), unidades_procesadas=1, delta_t_segundos=200, timestamp=ahora + minuto))
     db.commit()
 
     autenticar_como(gerente_a.id)
