@@ -106,3 +106,50 @@ def test_sin_planta_seleccionada_devuelve_tarjeta_vacia_no_error(client, db, ten
     r = client.get("/analytics/oee-general/")
     assert r.status_code == 200
     assert r.json()["calidad_pct"] is None
+
+
+def test_tiempo_planificado_escala_por_dias_con_produccion_no_por_rango_consultado(client, db, tenant_a, gerente_a):
+    """Feedback de producto (Fase Q, onboarding Green Mills): antes
+    tiempo_planificado se multiplicaba por TODO el rango consultado
+    (dias_consulta) -- pedir "últimos 7 días" con producción real en un
+    solo día diluía Disponibilidad/Rendimiento contra 6 días que nunca
+    tuvieron un turno corriendo (se vio en vivo: 3 capturas cortas de
+    prueba del PLC, cargadas en un solo día, dieron Rendimiento ~0.8%
+    contra un denominador de 7 días de turno completo). Ahora
+    tiempo_planificado escala por los días CALENDARIO (hora de planta)
+    que efectivamente tuvieron al menos un evento -- tiempo_calendario
+    sigue reflejando el rango completo pedido, esa sí es una medida del
+    rango, no de cuánto se produjo en él."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
+
+    hoy = datetime.now(timezone.utc)
+    hace_5_dias = hoy - timedelta(days=5)
+
+    # Un solo evento, hace 5 días -- el único día con producción real
+    # dentro del rango de 7 días que se va a consultar.
+    r = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": hace_5_dias.isoformat()},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r.status_code == 201
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/oee-cascada/",
+        params={
+            "fecha_desde": (hoy - timedelta(days=6)).date().isoformat(),
+            "fecha_hasta": hoy.date().isoformat(),
+        },
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    # Rango consultado: 7 días -> tiempo_calendario NO cambia, sigue
+    # siendo el rango completo pedido (7 * 24h = 10080 min).
+    assert data["tiempo_calendario_min"] == 10080.0
+    # Turno de _preparar_escenario: 00:00-23:59, sin descanso -> 1439
+    # min/día. Con el fix, tiempo_planificado = 1 día de producción real
+    # (no 7): 1439.0 min, no 1439*7=10073.0.
+    assert data["tiempo_planificado_min"] == 1439.0

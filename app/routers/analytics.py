@@ -374,6 +374,18 @@ def _calcular_metricas_oee(
     total_unidades = sum(e.unidades_procesadas for e, _, _ in eventos)
     dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
 
+    # Fase Q (feedback de producto): tiempo_planificado antes se calculaba
+    # sobre TODO el rango consultado (dias_consulta) -- pedir "últimos 7
+    # días" con sólo 1 día de producción real diluía Rendimiento/
+    # Disponibilidad contra 6 días que nunca tuvieron un turno corriendo.
+    # dias_produccion cuenta sólo los días CALENDARIO (hora de planta, no
+    # UTC puro -- ver _fecha_planta) que efectivamente tuvieron al menos
+    # un evento, y es lo que ahora escala tiempo_planificado. dias_consulta
+    # se sigue devolviendo tal cual para tiempo_calendario_seg (ese sí
+    # representa el rango pedido completo, no cuánto se produjo en él).
+    planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
+    dias_produccion = len({_fecha_planta(e.timestamp, planta) for e, _, _ in eventos})
+
     q_turnos = select(Turno).join(Linea, Turno.linea_id == Linea.id).where(
         Turno.tenant_id == context.tenant_id,
         Linea.planta_id == context.sub_tenant_id
@@ -390,10 +402,10 @@ def _calcular_metricas_oee(
 
         duracion_turno_seg = (fin_dt - inicio_dt).total_seconds()
         duracion_neta_seg = duracion_turno_seg - (t.descanso_minutos * 60)
-        tiempo_planificado_seg += (duracion_neta_seg * dias_consulta)
+        tiempo_planificado_seg += (duracion_neta_seg * dias_produccion)
 
     if tiempo_planificado_seg == 0:
-        tiempo_planificado_seg = 28800 * dias_consulta
+        tiempo_planificado_seg = 28800 * dias_produccion
 
     q_paradas = (
         select(ParadaDetectada, MotivoParada)
@@ -461,6 +473,7 @@ def _calcular_metricas_oee(
         "total_unidades": total_unidades,
         "total_rechazadas": total_rechazadas,
         "dias_consulta": dias_consulta,
+        "dias_produccion": dias_produccion,
         "tiempo_calendario_seg": 86400 * dias_consulta,
         "tiempo_planificado_seg": tiempo_planificado_seg,
         "tiempo_planificado_neto_seg": tiempo_planificado_neto,
@@ -1085,6 +1098,22 @@ def _ahora_planta(planta: Optional[Planta]) -> datetime:
         tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
     ahora_utc = datetime.now(dt_timezone.utc)
     return ahora_utc.astimezone(tz).replace(tzinfo=None)
+
+
+def _fecha_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> date:
+    """Convierte un timestamp UTC naive (como se persisten los eventos,
+    ver LiteEventoProduccion.timestamp) a la fecha calendario de la
+    PLANTA -- misma idea que _ahora_planta pero para un instante
+    arbitrario, no "ahora". Se usa para agrupar eventos por día real de
+    producción (Fase Q, motor OEE): agrupar por fecha UTC pura correría
+    el riesgo de partir en dos un mismo turno que cruza medianoche local
+    (o de fusionar dos turnos reales de días distintos que caen del
+    mismo lado de la medianoche UTC)."""
+    try:
+        tz = ZoneInfo(planta.timezone) if planta and planta.timezone else ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    except Exception:
+        tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).date()
 
 
 def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
