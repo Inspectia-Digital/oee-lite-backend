@@ -697,20 +697,41 @@ def obtener_cuellos_botella(
         query = query.offset(skip).limit(limit)
         eventos = db.exec(query).all()
 
+        # Fase Q (feedback de producto, ronda 3): "esperado" usaba
+        # estacion.umbral_optimo directo -- desactualizado en dos sentidos
+        # a la vez. (1) Es Optional[int] desde Fase Q (heredable de la
+        # Línea); puede ser None, lo que antes rompía la construcción del
+        # modelo (float requerido) o daba una comparación sin sentido.
+        # (2) Cuando el evento resuelve un SKU (caso real de Green Mills:
+        # tiempo_ideal_seg = tiempo_ciclo_teorico del SKU, no el umbral de
+        # la estación en absoluto -- ver scans.py) comparar el delta_t
+        # real contra el umbral de estación es comparar dos cosas que no
+        # tienen relación. tiempo_ideal_seg ya es el snapshot correcto
+        # por evento (SKU si había uno activo, si no el de la estación/
+        # línea resuelto -- Fase E2/Q), así que se usa ese en vez de
+        # volver a resolver "esperado" por su cuenta con una lógica vieja
+        # y desalineada de la que ya gobierna la clasificación real.
         agrupado = {}
         for evento, estacion in eventos:
             if estacion.nombre not in agrupado:
-                agrupado[estacion.nombre] = {"esperado": estacion.umbral_optimo, "suma_real": 0, "cantidad": 0}
-                
+                agrupado[estacion.nombre] = {"suma_esperado": 0.0, "suma_real": 0.0, "cantidad": 0}
+
+            agrupado[estacion.nombre]["suma_esperado"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
             agrupado[estacion.nombre]["suma_real"] += (evento.delta_t_segundos or 0)
             agrupado[estacion.nombre]["cantidad"] += 1
 
         res = []
         for n, d in agrupado.items():
             if d["cantidad"] > 0:
-                promedio = d["suma_real"] / d["cantidad"]
-                desvio = ((promedio - d["esperado"]) / d["esperado"]) * 100 if d["esperado"] else 0
-                res.append(CuelloBotella(estacion=n, tiempo_esperado_seg=d["esperado"], tiempo_promedio_real_seg=round(promedio, 1), desvio_pct=round(desvio, 1)))
+                promedio_esperado = d["suma_esperado"] / d["cantidad"]
+                promedio_real = d["suma_real"] / d["cantidad"]
+                desvio = ((promedio_real - promedio_esperado) / promedio_esperado) * 100 if promedio_esperado else 0
+                res.append(CuelloBotella(
+                    estacion=n,
+                    tiempo_esperado_seg=round(promedio_esperado, 1),
+                    tiempo_promedio_real_seg=round(promedio_real, 1),
+                    desvio_pct=round(desvio, 1),
+                ))
         return sorted(res, key=lambda x: x.desvio_pct, reverse=True)
     except HTTPException:
         raise
@@ -899,16 +920,34 @@ def obtener_cascada_oee(
 
 @router.get("/analytics/rendimiento-secuencial/", response_model=list[RendimientoSecuencialRow])
 def obtener_rendimiento_secuencial(
-    fecha: date = None, linea_id: Optional[uuid.UUID] = None,
+    fecha: date = None, fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     """Tiempo de ciclo promedio por estación, ordenado por su posición
     física en la línea -- para detectar en qué punto de la secuencia se
-    frena el flujo."""
+    frena el flujo.
+
+    Fase Q (feedback de producto, ronda 3): dos bugs encontrados
+    revisando consistencia del dashboard tras el fix del motor OEE.
+    (1) Sólo aceptaba `fecha` (un solo día) -- el resto de los endpoints
+    de este dashboard ya migraron a fecha_desde/fecha_hasta (Fase O); el
+    filtro "Últimos N días" del front no tenía ningún efecto acá, se
+    seguía viendo sólo el día que cae en `hasta`. Se mantiene `fecha`
+    por compatibilidad (si viene, gana). (2) "objetivo" usaba
+    estacion.umbral_optimo directo -- Optional[int] desde Fase Q, podía
+    romper la construcción del modelo (float requerido) con un 500, y de
+    todos modos no es la referencia correcta cuando el evento resolvió
+    un SKU (tiempo_ideal_seg ya es el snapshot correcto por evento, ver
+    mismo fix en /analytics/cuellos-botella/)."""
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        if fecha is not None:
+            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        else:
+            inicio_dia, _ = obtener_rango_dia(fecha_desde)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -931,8 +970,9 @@ def obtener_rendimiento_secuencial(
             if estacion.id not in agrupado:
                 agrupado[estacion.id] = {
                     "nombre": estacion.nombre, "posicion": estacion.posicion_linea,
-                    "objetivo": estacion.umbral_optimo, "suma": 0.0, "cantidad": 0,
+                    "suma_objetivo": 0.0, "suma": 0.0, "cantidad": 0,
                 }
+            agrupado[estacion.id]["suma_objetivo"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
             agrupado[estacion.id]["suma"] += evento.delta_t_segundos or 0
             agrupado[estacion.id]["cantidad"] += 1
 
@@ -940,7 +980,7 @@ def obtener_rendimiento_secuencial(
             RendimientoSecuencialRow(
                 estacion=d["nombre"], posicion_linea=d["posicion"],
                 tiempo_ciclo_prom=round(d["suma"] / d["cantidad"], 1) if d["cantidad"] else 0.0,
-                objetivo=d["objetivo"],
+                objetivo=round(d["suma_objetivo"] / d["cantidad"], 1) if d["cantidad"] else 0.0,
             )
             for d in agrupado.values()
         ]
