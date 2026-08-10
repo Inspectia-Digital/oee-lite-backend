@@ -249,3 +249,102 @@ def test_por_lotes_umbral_de_parada_es_por_ciclo_no_por_unidad(client, db, tenan
     # t_alerta = tiempo_ideal_por_ciclo(10) * tolerancia_alerta_pct(1.25) = 12.5
     # tiempo_perdido = delta_t(100) - t_alerta(12.5) = 87.5
     assert paradas[0].duracion_segundos == 87.5
+
+
+def test_cambio_de_orden_activa_no_genera_parada_aunque_el_hueco_sea_grande(client, db, tenant_a, gerente_a):
+    """Fase Q (feedback de producto, onboarding Green Mills): una orden
+    tiene día/turno de INICIO pero no de fin definido -- puede seguir
+    corriendo más allá de su turno nominal (horas extra, cambio de turno
+    sin cortar producción). El límite real de "sigue siendo la misma
+    sesión de producción" es la continuidad de la ORDEN activa, no el
+    reloj. Si la orden cambió entre dos eventos consecutivos (la anterior
+    se cerró, arrancó una distinta), el hueco entre ellos es un límite de
+    sesión, no una parada -- aunque sea de horas."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a, TipoProduccion.DISCRETA)
+    orden1, _ = _crear_orden_en_progreso(db, tenant_a, linea.id)
+    credencial = _emitir_credencial(client, gerente_a, estacion.id)
+
+    ahora = datetime.now(timezone.utc)
+    hace_2_horas = ahora - timedelta(hours=2)
+    r1 = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": hace_2_horas.isoformat()},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r1.status_code == 201
+
+    # La orden 1 se cierra, arranca la orden 2 -- cambio de sesión real.
+    orden1.estado = EstadoOrden.CERRADA
+    db.add(orden1)
+    db.commit()
+    orden2, _ = _crear_orden_en_progreso(db, tenant_a, linea.id)
+
+    # Hueco de 2 horas -- de sobra para cruzar cualquier umbral_alerta razonable.
+    # El evento 2 va "ahora" (el 1 quedó hace 2h): /api/lite/scans rechaza
+    # timestamps en el futuro, por eso el hueco se arma hacia atrás.
+    r2 = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ahora.isoformat()},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r2.status_code == 201
+
+    from app.models.domain import LiteEventoProduccion, ParadaDetectada
+    from sqlmodel import select
+
+    eventos = db.exec(
+        select(LiteEventoProduccion)
+        .where(LiteEventoProduccion.id_estacion == str(estacion.id))
+        .order_by(LiteEventoProduccion.timestamp)
+    ).all()
+    assert len(eventos) == 2
+    assert eventos[0].orden_fk == orden1.id_orden
+    assert eventos[1].orden_fk == orden2.id_orden
+    assert eventos[1].estado == "OPTIMO"  # no ALERTA pese al hueco de 2h: cambió la orden
+
+    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
+    assert len(paradas) == 0  # el cambio de orden no genera parada
+
+
+def test_misma_orden_activa_con_hueco_grande_si_genera_parada(client, db, tenant_a, gerente_a):
+    """Contraparte del test anterior: si la orden activa NO cambió, un
+    hueco real se sigue evaluando normal contra los umbrales -- aunque
+    cruce lo que sería un límite de turno nominal, sigue siendo la misma
+    sesión de producción (regla de negocio: una orden puede seguir
+    corriendo más allá de su turno de inicio)."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a, TipoProduccion.DISCRETA)
+    orden, _ = _crear_orden_en_progreso(db, tenant_a, linea.id)
+    credencial = _emitir_credencial(client, gerente_a, estacion.id)
+
+    ahora = datetime.now(timezone.utc)
+    hace_2_horas = ahora - timedelta(hours=2)
+    r1 = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": hace_2_horas.isoformat()},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r1.status_code == 201
+
+    # Misma orden sigue en progreso -- hueco real de 2 horas, sí es una
+    # parada real. Evento 2 "ahora" (el 1 quedó hace 2h): /api/lite/scans
+    # rechaza timestamps en el futuro, por eso el hueco se arma hacia atrás.
+    r2 = client.post(
+        "/api/lite/scans",
+        json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ahora.isoformat()},
+        headers={"X-Device-Key": credencial},
+    )
+    assert r2.status_code == 201
+
+    from app.models.domain import LiteEventoProduccion, ParadaDetectada
+    from sqlmodel import select
+
+    eventos = db.exec(
+        select(LiteEventoProduccion)
+        .where(LiteEventoProduccion.id_estacion == str(estacion.id))
+        .order_by(LiteEventoProduccion.timestamp)
+    ).all()
+    assert eventos[0].orden_fk == eventos[1].orden_fk == orden.id_orden
+    assert eventos[1].estado == "ALERTA"
+
+    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
+    assert len(paradas) == 1

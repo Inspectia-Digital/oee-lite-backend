@@ -297,7 +297,22 @@ def registrar_escaneo_rapido(
     if ultimo_evento:
         delta_t_segundos = (evento_timestamp - ultimo_evento.timestamp).total_seconds()
 
-        if delta_t_segundos > t_alerta:
+        # Fase Q (feedback de producto): un cambio de ORDEN ACTIVA entre el
+        # evento anterior y éste es un límite de SESIÓN, no una parada real
+        # -- una orden tiene día/turno de INICIO pero no de fin definido,
+        # puede seguir corriendo más allá de su turno nominal (horas
+        # extra, cambio de turno sin cortar producción). El límite real de
+        # "sigue siendo la misma sesión de producción" es la continuidad
+        # de la orden, no el reloj/turno. Mismo trato que el primer evento
+        # de la estación (sin ultimo_evento): no se evalúa contra los
+        # umbrales, no genera parada. Si ambas son None (estación que
+        # nunca resuelve orden) el comportamiento no cambia respecto a
+        # antes de este fix.
+        mismo_contexto_de_orden = ultimo_evento.orden_fk == orden_final
+
+        if not mismo_contexto_de_orden:
+            pass  # arranca sesión nueva: se guarda delta_t real, pero no se clasifica ni genera parada
+        elif delta_t_segundos > t_alerta:
             desempeno = "ALERTA"
             # Disponibilidad (Fase E2): sólo el EXCEDENTE sobre la tolerancia
             # cuenta como tiempo perdido -- no el delta completo, para no
