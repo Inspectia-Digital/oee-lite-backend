@@ -14,8 +14,9 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
+from app.core.clasificacion import resolver_umbrales_evento
 from app.models.domain import (
-    Estacion, Linea, MaestroSKU, SkuTiempoEstacion, Tenant, Planta,
+    Estacion, Linea, MaestroSKU, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
     Maquina, MaquinaEstacion, OrdenProduccion, EstadoOrden
@@ -75,36 +76,6 @@ def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:
         raise HTTPException(status_code=400, detail="Timestamp más de 5 minutos en el futuro; rechazado.")
     if ts_utc_naive < ahora - TOLERANCIA_ANTIGUEDAD:
         raise HTTPException(status_code=400, detail="Timestamp con más de 7 días de antigüedad; rechazado.")
-
-
-# Fase Q: default de sistema cuando ni la Estación ni su Línea configuraron
-# umbrales -- son los mismos valores que antes eran el default duro de
-# Estacion.umbral_optimo/lento/alerta (240/280/300), preservados acá para
-# que una estación/línea sin configurar se comporte exactamente igual que
-# antes de este cambio.
-UMBRAL_OPTIMO_DEFAULT_SISTEMA = 240
-UMBRAL_LENTO_DEFAULT_SISTEMA = 280
-UMBRAL_ALERTA_DEFAULT_SISTEMA = 300
-
-
-def _resolver_umbral(valor_estacion: Optional[int], valor_linea: Optional[int], default_sistema: int) -> int:
-    """Cadena de herencia Estación > Línea > default de sistema (Fase Q)."""
-    if valor_estacion is not None:
-        return valor_estacion
-    if valor_linea is not None:
-        return valor_linea
-    return default_sistema
-
-
-def _resolver_tolerancia(valor_estacion: Optional[float], valor_linea: Optional[float], default_tenant: float) -> float:
-    """Misma cascada que _resolver_umbral (Estación > Línea > default),
-    separada porque acá el default no es una constante de sistema sino
-    Tenant.tolerancia_lento_pct/alerta_pct (float, Fase R)."""
-    if valor_estacion is not None:
-        return valor_estacion
-    if valor_linea is not None:
-        return valor_linea
-    return default_tenant
 
 
 def _calcular_payload_hash(scan: ScanRequest) -> str:
@@ -234,81 +205,36 @@ def registrar_escaneo_rapido(
             if sku_final is None:
                 sku_final = orden_activa.sku_fk
 
-    # 2. FACTOR DE LOTE (Green Mills)
+    # 2. FACTOR DE LOTE (Green Mills): sólo afecta unidades_a_sumar, se
+    # resuelve acá porque necesita saber si la línea es por_lotes ANTES de
+    # llamar a resolver_umbrales_evento (Fase S) -- esa función ya no
+    # recalcula unidades, sólo tiempo ideal/tolerancia con las unidades que
+    # se le pasan (las mismas que después quedan en unidades_procesadas).
     unidades_a_sumar = 1
-    # Fallback de Estación/Línea (Fase Q): valores absolutos por
-    # evento/scan (sin relación con "unidades"). Estación > Línea >
-    # default de sistema -- ver _resolver_umbral.
-    t_optimo = _resolver_umbral(estacion.umbral_optimo, linea.umbral_optimo if linea else None, UMBRAL_OPTIMO_DEFAULT_SISTEMA)
-    t_lento = _resolver_umbral(estacion.umbral_lento, linea.umbral_lento if linea else None, UMBRAL_LENTO_DEFAULT_SISTEMA)
-    t_alerta = _resolver_umbral(estacion.umbral_alerta, linea.umbral_alerta if linea else None, UMBRAL_ALERTA_DEFAULT_SISTEMA)
-    sku_resuelto = None
-
-    if sku_final:
-        sku_resuelto = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == dispositivo.tenant_id)).first()
-        if sku_resuelto:
-            if linea and linea.tipo_produccion == "por_lotes":
-                unidades_a_sumar = sku_resuelto.unidades_por_ciclo
-            # Fase R (feedback de producto): un mismo SKU puede tardar
-            # distinto según la estación que lo procesa -- el tiempo
-            # genérico del SKU no alcanza para eso. Si hay un override
-            # cargado para este (SKU, Estación) puntual, ese manda; si no,
-            # se cae al tiempo_ciclo_teorico genérico del SKU (no bloquea
-            # nada, sólo hace falta cargar el override donde difiera).
-            override_tiempo = db.exec(
-                select(SkuTiempoEstacion).where(
-                    SkuTiempoEstacion.tenant_id == dispositivo.tenant_id,
-                    SkuTiempoEstacion.sku_fk == sku_resuelto.codigo_sku,
-                    SkuTiempoEstacion.estacion_id == estacion.id,
-                    SkuTiempoEstacion.activo == True,  # noqa: E712
-                )
-            ).first()
-            tiempo_ciclo_efectivo = override_tiempo.tiempo_ciclo_teorico if override_tiempo else sku_resuelto.tiempo_ciclo_teorico
-            # Snapshot para tiempo_ideal_seg (Rendimiento = tiempo_ideal_seg *
-            # unidades_procesadas) -- tiempo_ciclo_efectivo ya es "segundos
-            # ideales POR UNIDAD" en esta estación (mismo significado que
-            # MaestroSKU.tiempo_ciclo_teorico), no se toca acá.
-            t_optimo = tiempo_ciclo_efectivo
+    if sku_final and linea and linea.tipo_produccion == "por_lotes":
+        sku_para_lote = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == dispositivo.tenant_id)).first()
+        if sku_para_lote:
+            unidades_a_sumar = sku_para_lote.unidades_por_ciclo
 
     # 2.b CONTEO EDGE-AUTORITATIVO (Fase P): si el emisor ya sabe cuántas
     # unidades representa este evento (ver ScanRequest.unidades_procesadas),
-    # pisa lo resuelto arriba por SKU. Se resuelve ANTES del umbral de
-    # ciclo de abajo -- ese umbral tiene que reflejar cuántas unidades
+    # pisa lo resuelto arriba por SKU. Se resuelve ANTES de resolver
+    # umbrales/tolerancia -- esos tienen que reflejar cuántas unidades
     # produjo ESTE evento en particular.
     if scan.unidades_procesadas is not None:
         unidades_a_sumar = scan.unidades_procesadas
 
-    # Fase P: bug real encontrado al preparar la carga de Green Mills.
-    # delta_t_segundos (más abajo) mide el tiempo entre EVENTOS
-    # consecutivos -- para una línea por_lotes cada evento es una
-    # bandeja/ciclo completo (varias unidades), no una unidad individual.
-    # Comparar ese delta_t contra el umbral "por unidad" del SKU sin
-    # escalarlo por unidades_a_sumar clasificaría CADA bandeja normal como
-    # una parada enorme (ej. bandeja de 5 panes a 2s/pan ideal = 10s de
-    # ciclo, contra un umbral de alerta de ~2.5s). Nunca se detectó antes
-    # porque sku_final nunca se resolvía (fix de la sección 1.b) -- esta
-    # rama jamás había corrido con un SKU real. El fallback de Estación
-    # (sin SKU) queda exactamente como estaba: t_lento/t_alerta son los
-    # valores absolutos configurados en la Estación, no se derivan de nada.
-    if sku_resuelto:
-        tiempo_ideal_por_ciclo = tiempo_ciclo_efectivo * unidades_a_sumar
-        # Fase R: tolerancia % heredable Estación > Línea > Tenant (antes
-        # era un único valor fijo por tenant, sin importar qué línea o
-        # estación reportara el evento).
-        tolerancia_lento_pct = _resolver_tolerancia(
-            estacion.tolerancia_lento_pct,
-            linea.tolerancia_lento_pct if linea else None,
-            tenant_config.tolerancia_lento_pct if tenant_config else 1.15,
-        )
-        tolerancia_alerta_pct = _resolver_tolerancia(
-            estacion.tolerancia_alerta_pct,
-            linea.tolerancia_alerta_pct if linea else None,
-            tenant_config.tolerancia_alerta_pct if tenant_config else 1.25,
-        )
-        t_lento = tiempo_ideal_por_ciclo * tolerancia_lento_pct
-        t_alerta = tiempo_ideal_por_ciclo * tolerancia_alerta_pct
-    else:
-        tiempo_ideal_por_ciclo = t_optimo  # = estacion.umbral_optimo; usado en el cap de más abajo
+    # Fase P/Q/R (extraído a app/core/clasificacion.py en Fase S para que
+    # /config/estaciones/{id}/recomputar-eventos/ use exactamente la misma
+    # cascada, nunca una reimplementación paralela): Rama A (sin SKU) usa
+    # umbral_optimo/lento/alerta heredable Estación>Línea>sistema; Rama B
+    # (con SKU) usa tiempo_ciclo_teorico del SKU (o su override por
+    # Estación) × unidades del evento, con tolerancia % heredable
+    # Estación>Línea>Tenant.
+    umbrales = resolver_umbrales_evento(db, dispositivo.tenant_id, tenant_config, estacion, linea, sku_final, unidades_a_sumar)
+    t_optimo, t_lento, t_alerta = umbrales.t_optimo, umbrales.t_lento, umbrales.t_alerta
+    tiempo_ideal_por_ciclo = umbrales.tiempo_ideal_por_ciclo
+    sku_resuelto = umbrales.sku_resuelto
 
     # 2.5 CALIDAD POR RECHAZO (Fase E2): 0 <= rechazadas <= procesadas.
     if scan.unidades_rechazadas > unidades_a_sumar:
