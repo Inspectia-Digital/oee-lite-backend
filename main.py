@@ -24,6 +24,9 @@ from app.routers import dispositivos
 # Fase API/CRUD completo
 from app.routers import personas
 
+# Fase S — recómputo de eventos ya ingeridos
+from app.routers import recomputo
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -93,6 +96,9 @@ app.include_router(dispositivos.router)
 
 # 6. Fase API/CRUD completo
 app.include_router(personas.router)
+
+# 7. Fase S — recómputo de eventos ya ingeridos
+app.include_router(recomputo.router)
 
 
 # ==========================================
