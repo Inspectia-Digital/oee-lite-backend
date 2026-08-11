@@ -985,9 +985,15 @@ def obtener_cascada_oee(
     """Cascada de pérdidas OEE en 5 etapas (Fase I), reusando el mismo
     núcleo de cálculo que /analytics/oee-general -- nunca se recalculan
     las fórmulas por separado:
-    Calendario -> Planificado (turnos) -> Operativo (menos paradas
-    planificadas) -> Neto (menos paradas no planificadas = Disponibilidad)
-    -> Efectivo (Neto * Rendimiento * Calidad, si hay dato de Calidad)."""
+    Calendario -> Planificado (Fase X: NO son los turnos configurados --
+    ver el comentario de Fase Q ronda 2 en _calcular_metricas_oee; es
+    tiempo_ideal + lentitud + TODAS las paradas, armado de abajo hacia
+    arriba a partir de lo que realmente pasó. turno_id no participa de
+    este cálculo en absoluto, así que un tenant con turnos sin usar o
+    parcialmente usados -- como Green Mills -- no lo distorsiona) ->
+    Operativo (menos paradas planificadas) -> Neto (menos paradas no
+    planificadas = Disponibilidad) -> Efectivo (Neto * Rendimiento *
+    Calidad, si hay dato de Calidad)."""
     try:
         validar_planta(context)
     except ValueError:
