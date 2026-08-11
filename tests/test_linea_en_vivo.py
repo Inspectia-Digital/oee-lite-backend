@@ -260,6 +260,68 @@ def test_linea_en_vivo_resuelve_supervisor_asignado(client, db, tenant_a, gerent
     assert r.json()["supervisor_actual"] == "Supervisor Vivo"
 
 
+def test_linea_en_vivo_no_crashea_con_una_regla_de_supervisor_no_vigente_hoy(client, db, tenant_a, gerente_a):
+    """Fase X (bug real, root cause reportado de "la portada de TYMEO se
+    quedó sin estaciones"): con MÁS DE UNA AsignacionSupervisor para la
+    misma (línea, turno), el loop que resuelve supervisor_actual tenía
+    una línea muerta (`asignacion_sup[1]...` -- variable que nunca
+    existió en este scope, resto de un refactor viejo) que se ejecutaba
+    cada vez que una regla NO matcheaba "hoy". Con una sola regla vigente
+    (el caso que cubría el test de arriba) esa rama nunca se alcanzaba;
+    apenas hay una segunda regla que no matchea, tira NameError -- el
+    except genérico de la función lo atrapa y devuelve un
+    LineaEnVivoResumen() completamente VACÍO (sin estaciones, sin turno,
+    sin orden), no sólo sin supervisor. Por eso se valida acá que TODO el
+    resto de la respuesta sobrevive, no sólo supervisor_actual."""
+    planta, linea, est1, est2 = _preparar_escenario(db, tenant_a)
+    turno = Turno(
+        tenant_id=tenant_a, nombre="Turno con 2 reglas",
+        hora_inicio=time(0, 0), hora_fin=time(23, 59), linea_id=linea.id,
+    )
+    db.add(turno)
+    db.commit()
+    db.refresh(turno)
+
+    sup_vieja = Supervisor(tenant_id=tenant_a, legajo="SUP-VIEJA", nombre_completo="Supervisor Histórico")
+    sup_nueva = Supervisor(tenant_id=tenant_a, legajo="SUP-NUEVA", nombre_completo="Supervisor Nuevo")
+    db.add(sup_vieja)
+    db.add(sup_nueva)
+    db.commit()
+    db.refresh(sup_vieja)
+    db.refresh(sup_nueva)
+
+    hoy_iso = datetime.now(ZoneInfo("America/Buenos_Aires")).isoweekday()
+    otro_dia = "1" if hoy_iso != 1 else "2"
+
+    # Regla MÁS RECIENTE (vigencia_desde más nueva -> primera en el
+    # order_by desc de la query), pero para OTRO día de la semana -- NO
+    # matchea hoy. Esta es la que disparaba la línea muerta.
+    db.add(AsignacionSupervisor(
+        tenant_id=tenant_a, linea_id=linea.id, turno_id=turno.id, supervisor_id=sup_nueva.id,
+        dias_semana=otro_dia, vigencia_desde=date.today() - timedelta(days=1), vigencia_hasta=None,
+    ))
+    # Regla más VIEJA (vigencia_desde anterior), para TODOS los días --
+    # matchea hoy, pero el loop tiene que llegar hasta la 2da iteración
+    # sin crashear en la 1ra para encontrarla.
+    db.add(AsignacionSupervisor(
+        tenant_id=tenant_a, linea_id=linea.id, turno_id=turno.id, supervisor_id=sup_vieja.id,
+        dias_semana="1,2,3,4,5,6,7", vigencia_desde=date.today() - timedelta(days=30), vigencia_hasta=None,
+    ))
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/linea-en-vivo/",
+        params={"linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["estaciones"]) == 2
+    assert body["turno_actual"] == "Turno con 2 reglas"
+    assert body["supervisor_actual"] == "Supervisor Histórico"
+
+
 def test_linea_en_vivo_linea_de_otro_tenant_devuelve_404(client, db, tenant_a, tenant_b, gerente_a):
     planta_a, linea_a, *_ = _preparar_escenario(db, tenant_a)
     planta_b, linea_b, *_ = _preparar_escenario(db, tenant_b)

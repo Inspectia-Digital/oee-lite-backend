@@ -1480,12 +1480,33 @@ def obtener_linea_en_vivo(
                 )
                 .order_by(AsignacionSupervisor.vigencia_desde.desc())
             ).all()
+            # Fase X (bug real, root cause de "portada sin estaciones"):
+            # esta rama tenía una línea muerta -- `supervisor_actual =
+            # asignacion_sup[1].nombre_completo` -- que referenciaba una
+            # variable que NUNCA existió en este scope (`asignacion_sup`,
+            # resto de un refactor viejo; el loop usa `regla, sup`).
+            # Apenas `reglas` tenía más de una fila y la PRIMERA (la de
+            # vigencia_desde más reciente, por el order_by de arriba) no
+            # matcheaba "hoy" (dia_semana o vigencia), esta línea SIEMPRE
+            # se ejecutaba y tiraba NameError -- capturado por el except
+            # genérico de abajo, que devuelve un LineaEnVivoResumen()
+            # completamente VACÍO (sin estaciones, sin turno, sin orden,
+            # sin operarios). Con una sola regla vigente esto nunca se
+            # disparaba (por eso funcionaba en las pruebas iniciales); en
+            # cuanto Green Mills cargó más de una asignación de supervisor
+            # para la misma (línea, turno), la portada de TYMEO se quedó
+            # en blanco de un día para el otro sin que cambiara nada en
+            # Configuración -- exactamente el síntoma reportado ("antes se
+            # veían las estaciones... ahora no se ven"). Sin la línea
+            # muerta, el loop simplemente sigue probando la siguiente
+            # regla (por vigencia_desde descendente) hasta encontrar una
+            # que matchee "hoy"; si ninguna matchea, supervisor_actual
+            # queda None (su valor inicial), no un crash.
             for regla, sup in reglas:
                 vigente = regla.vigencia_hasta is None or regla.vigencia_hasta >= hoy_planta
                 if vigente and _dia_en_dias_semana(dia_iso_hoy, regla.dias_semana):
                     supervisor_actual = sup.nombre_completo
                     break
-                supervisor_actual = asignacion_sup[1].nombre_completo
 
         return LineaEnVivoResumen(
             linea_id=linea.id,
