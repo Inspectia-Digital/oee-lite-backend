@@ -60,6 +60,14 @@ class CuelloBotella(BaseModel):
     estacion: str
     tiempo_esperado_seg: float
     tiempo_promedio_real_seg: float
+    # Fase V: desde este fix, desvio_pct usa la MISMA metodología asimétrica
+    # que Rendimiento del agregado (_calcular_metricas_oee) -- excedente de
+    # eventos LENTO sobre su tiempo ideal, ninguna "bonificación" por
+    # eventos más rápidos que lo ideal. Antes era un desvío simétrico
+    # ((real-esperado)/esperado) que podía ir fuerte a negativo apenas la
+    # mayoría de los ciclos corría más rápido que el "ideal" configurado --
+    # nunca coincidía con el Rendimiento de arriba ni siquiera con una sola
+    # estación. Ver comentario largo en obtener_cuellos_botella().
     desvio_pct: float
 
 class AlertaActiva(BaseModel):
@@ -89,6 +97,11 @@ class RendimientoSecuencialRow(BaseModel):
     posicion_linea: int
     tiempo_ciclo_prom: float
     objetivo: float
+    # Fase V: mismo motivo/misma fórmula que CuelloBotella.desvio_pct
+    # (ver ese comentario) -- reemplaza el performance = objetivo/tiempo_ciclo_prom
+    # que el FRONTEND calculaba por su cuenta (anti-patrón: lógica de
+    # negocio recalculada fuera de la capa de datos).
+    rendimiento_pct: float
 
 class ReporteProduccionRow(BaseModel):
     fecha: str
@@ -736,6 +749,10 @@ def obtener_cuellos_botella(
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia,
+                # Fase V: mismo filtro que _calcular_metricas_oee -- un
+                # evento de una estación que estaba inactiva al momento de
+                # escanear no cuenta para OEE, acá tampoco debería.
+                LiteEventoProduccion.incluido_oee == True,  # noqa: E712
                 # Fase U: el filtro delta_t_segundos > 0 se aplica DENTRO de
                 # _eventos_con_ciclo_real, no acá -- necesita ver también el
                 # primer evento de cada estación (delta_t=0) para resolver
@@ -745,10 +762,14 @@ def obtener_cuellos_botella(
         )
         if linea_id: query = query.where(Linea.id == linea_id)
         query = query.offset(skip).limit(limit)
+        todos = db.exec(query).all()
         # Fase U: excluye eventos que fueron el primer ping de una nueva
         # sesión de orden -- su delta_t_segundos es el hueco real SIN
         # clasificar/capear (puede ser de horas), ver _eventos_con_ciclo_real.
-        eventos = _eventos_con_ciclo_real(db.exec(query).all())
+        # Sólo se usa para los promedios CRUDOS informativos
+        # (tiempo_esperado_seg/tiempo_promedio_real_seg) -- desvio_pct usa
+        # `todos` sin este filtro, ver más abajo.
+        eventos = _eventos_con_ciclo_real(todos)
 
         # Fase Q (feedback de producto, ronda 3): "esperado" usaba
         # estacion.umbral_optimo directo -- desactualizado en dos sentidos
@@ -773,12 +794,40 @@ def obtener_cuellos_botella(
             agrupado[estacion.nombre]["suma_real"] += (evento.delta_t_segundos or 0)
             agrupado[estacion.nombre]["cantidad"] += 1
 
+        # Fase V (feedback de producto: "con una sola estación debería dar
+        # lo mismo que el Rendimiento de arriba"): ideal_total/lentitud_total
+        # POR ESTACIÓN, calculados con la MISMA metodología asimétrica que
+        # _calcular_metricas_oee -- sólo el excedente de eventos LENTO sobre
+        # su tiempo ideal cuenta como "desvío"; un evento más rápido que lo
+        # ideal no resta nada (no hay "bonificación"), y ALERTA no entra acá
+        # (su excedente ya se contabiliza aparte como ParadaDetectada, ver
+        # Disponibilidad). Se usa `todos` (sin el filtro de continuidad de
+        # orden de Fase U) a propósito: un evento de transición de orden
+        # nunca queda clasificado LENTO (scans.py no lo clasifica), así que
+        # no contamina lentitud_total; pero sí aporta tiempo_ideal_seg real
+        # a ideal_total, exactamente como lo hace _calcular_metricas_oee al
+        # sumar tiempo_ideal_total sobre TODOS los eventos incluido_oee=True
+        # del rango. Con una sola estación en la línea, esto hace que
+        # ideal_total/lentitud_total acá sean IDÉNTICOS a tiempo_ideal_total/
+        # tiempo_perdido_lentitud_seg del agregado, y por lo tanto
+        # desvio_pct = 100/rendimiento_pct(agregado) - 100 exactamente.
+        # Sumando esto estación por estación para una línea de N
+        # estaciones también reconstruye exacto el total agregado (es una
+        # partición del mismo conjunto de eventos, no una aproximación).
+        metodologia = {}
+        for evento, estacion in todos:
+            m = metodologia.setdefault(estacion.nombre, {"ideal": 0.0, "lentitud": 0.0})
+            m["ideal"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
+            if evento.estado == "LENTO":
+                m["lentitud"] += max(0.0, (evento.delta_t_segundos or 0.0) - evento.tiempo_ideal_seg * evento.unidades_procesadas)
+
         res = []
         for n, d in agrupado.items():
             if d["cantidad"] > 0:
                 promedio_esperado = d["suma_esperado"] / d["cantidad"]
                 promedio_real = d["suma_real"] / d["cantidad"]
-                desvio = ((promedio_real - promedio_esperado) / promedio_esperado) * 100 if promedio_esperado else 0
+                m = metodologia.get(n, {"ideal": 0.0, "lentitud": 0.0})
+                desvio = (m["lentitud"] / m["ideal"]) * 100 if m["ideal"] > 0 else 0.0
                 res.append(CuelloBotella(
                     estacion=n,
                     tiempo_esperado_seg=round(promedio_esperado, 1),
@@ -1011,6 +1060,9 @@ def obtener_rendimiento_secuencial(
                 Linea.planta_id == context.sub_tenant_id,
                 LiteEventoProduccion.timestamp >= inicio_dia,
                 LiteEventoProduccion.timestamp <= fin_dia,
+                # Fase V: mismo filtro que _calcular_metricas_oee, ver
+                # comentario en /analytics/cuellos-botella/.
+                LiteEventoProduccion.incluido_oee == True,  # noqa: E712
                 # Fase U: el filtro delta_t_segundos > 0 se aplica DENTRO de
                 # _eventos_con_ciclo_real, no acá -- ver el comentario en
                 # /analytics/cuellos-botella/.
@@ -1019,10 +1071,13 @@ def obtener_rendimiento_secuencial(
         )
         if linea_id:
             query = query.where(Linea.id == linea_id)
+        todos = db.exec(query).all()
         # Fase U: mismo criterio que /analytics/cuellos-botella/ -- excluye
         # eventos que fueron el primer ping de una nueva sesión de orden
-        # (ver _eventos_con_ciclo_real).
-        eventos = _eventos_con_ciclo_real(db.exec(query).all())
+        # (ver _eventos_con_ciclo_real). Sólo para los promedios crudos
+        # informativos (tiempo_ciclo_prom/objetivo); rendimiento_pct usa
+        # `todos`, ver Fase V más abajo.
+        eventos = _eventos_con_ciclo_real(todos)
 
         agrupado = {}
         for evento, estacion in eventos:
@@ -1035,14 +1090,31 @@ def obtener_rendimiento_secuencial(
             agrupado[estacion.id]["suma"] += evento.delta_t_segundos or 0
             agrupado[estacion.id]["cantidad"] += 1
 
-        resultado = [
-            RendimientoSecuencialRow(
+        # Fase V: idéntica metodología que /analytics/cuellos-botella/ (ver
+        # ese comentario largo) -- ideal_total/lentitud_total por estación,
+        # asimétrico (sólo excedente LENTO), sobre `todos` (incluye eventos
+        # de transición de orden, que nunca son LENTO así que no ensucian
+        # lentitud_total, pero sí aportan a ideal_total como corresponde).
+        metodologia = {}
+        for evento, estacion in todos:
+            m = metodologia.setdefault(estacion.id, {"ideal": 0.0, "lentitud": 0.0})
+            m["ideal"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
+            if evento.estado == "LENTO":
+                m["lentitud"] += max(0.0, (evento.delta_t_segundos or 0.0) - evento.tiempo_ideal_seg * evento.unidades_procesadas)
+
+        resultado = []
+        for eid, d in agrupado.items():
+            m = metodologia.get(eid, {"ideal": 0.0, "lentitud": 0.0})
+            rendimiento_pct = (
+                round(min(100.0, (m["ideal"] / (m["ideal"] + m["lentitud"])) * 100), 1)
+                if m["ideal"] > 0 else 0.0
+            )
+            resultado.append(RendimientoSecuencialRow(
                 estacion=d["nombre"], posicion_linea=d["posicion"],
                 tiempo_ciclo_prom=round(d["suma"] / d["cantidad"], 1) if d["cantidad"] else 0.0,
                 objetivo=round(d["suma_objetivo"] / d["cantidad"], 1) if d["cantidad"] else 0.0,
-            )
-            for d in agrupado.values()
-        ]
+                rendimiento_pct=rendimiento_pct,
+            ))
         resultado.sort(key=lambda r: r.posicion_linea)
         return resultado
     except HTTPException:
