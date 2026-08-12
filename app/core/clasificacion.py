@@ -15,7 +15,10 @@ from typing import Optional
 
 from sqlmodel import Session, select
 
-from app.models.domain import Estacion, Linea, MaestroSKU, SkuTiempoEstacion, Tenant
+from app.models.domain import (
+    Estacion, EstadoOrden, EstadoPlan, Linea, MaestroSKU, OrdenProduccion,
+    PlanProduccion, SkuTiempoEstacion, Tenant,
+)
 
 # Fase Q: default de sistema cuando ni la Estación ni su Línea configuraron
 # umbrales -- son los mismos valores que antes eran el default duro de
@@ -143,3 +146,48 @@ def resolver_umbrales_evento(
         t_optimo=t_optimo, t_lento=t_lento, t_alerta=t_alerta,
         tiempo_ideal_por_ciclo=tiempo_ideal_por_ciclo, sku_resuelto=sku_resuelto,
     )
+
+
+def resolver_orden_activa(db: Session, tenant_id: str, linea_id) -> Optional[OrdenProduccion]:
+    """Fase AA: resuelve "cuál es la orden activa de esta línea AHORA
+    MISMO", con la MISMA fuente de verdad para scans.py (ingesta) y
+    /analytics/linea-en-vivo/ (lo que se ve en pantalla) -- antes cada
+    uno reimplementaba su propia versión de "la orden EN_PROGRESO más
+    reciente" por separado (Fase P), sin garantía de que dieran lo mismo.
+
+    - Si la línea tiene un PlanProduccion ABIERTO con orden_activa_fk
+      definida, esa es la fuente AUTORITATIVA -- la decide un supervisor
+      (ver avanzar_orden en operacion.py), sin ambigüedad posible.
+    - Si no (la línea no adoptó el flujo de Plan, o el plan no tiene
+      ninguna orden activa todavía), cae al heurístico histórico: la
+      orden EN_PROGRESO más reciente de la línea (comportamiento
+      idéntico al de antes de Fase AA para cualquier línea que no cree
+      un Plan -- Plan es opcional, nunca se le impone a un tenant)."""
+    plan_abierto = db.exec(
+        select(PlanProduccion).where(
+            PlanProduccion.tenant_id == tenant_id,
+            PlanProduccion.linea_id == linea_id,
+            PlanProduccion.estado == EstadoPlan.ABIERTO,
+            PlanProduccion.activo == True,  # noqa: E712
+        )
+    ).first()
+    if plan_abierto and plan_abierto.orden_activa_fk:
+        orden = db.exec(
+            select(OrdenProduccion).where(
+                OrdenProduccion.tenant_id == tenant_id,
+                OrdenProduccion.id == plan_abierto.orden_activa_fk,
+            )
+        ).first()
+        if orden:
+            return orden
+
+    return db.exec(
+        select(OrdenProduccion)
+        .where(
+            OrdenProduccion.tenant_id == tenant_id,
+            OrdenProduccion.linea_id == linea_id,
+            OrdenProduccion.estado == EstadoOrden.EN_PROGRESO,
+            OrdenProduccion.activo == True,  # noqa: E712
+        )
+        .order_by(OrdenProduccion.id_orden.desc())
+    ).first()

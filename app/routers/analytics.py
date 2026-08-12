@@ -8,11 +8,12 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext
+from app.core.clasificacion import resolver_orden_activa
 from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada,
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
-    OrdenProduccion, AsignacionTurno, EstadoParada, EstadoOrden,
+    OrdenProduccion, AsignacionTurno, EstadoParada,
     AsignacionSupervisor, Supervisor,
 )
 from app.core.auth import get_usuario_actual
@@ -1391,16 +1392,13 @@ def obtener_linea_en_vivo(
                 turno_actual = t
                 break
 
-        orden_activa = db.exec(
-            select(OrdenProduccion)
-            .where(
-                OrdenProduccion.tenant_id == context.tenant_id,
-                OrdenProduccion.linea_id == linea_id,
-                OrdenProduccion.estado == EstadoOrden.EN_PROGRESO,
-                OrdenProduccion.activo == True,  # noqa: E712
-            )
-            .order_by(OrdenProduccion.id_orden.desc())
-        ).first()
+        # Fase AA: misma resolución que scans.py (resolver_orden_activa,
+        # clasificacion.py) -- si la línea tiene un Plan de Producción
+        # ABIERTO con orden activa explícita, esa es la que se muestra acá
+        # también (antes esta pantalla y la ingesta podían, en teoría,
+        # resolver una orden EN_PROGRESO distinta si hubiera más de una a
+        # la vez -- ahora las dos miran la misma fuente).
+        orden_activa = resolver_orden_activa(db, context.tenant_id, linea_id)
 
         estaciones = db.exec(
             select(Estacion)

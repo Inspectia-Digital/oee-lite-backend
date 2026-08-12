@@ -18,6 +18,14 @@ class EstadoOrden(str, Enum):
     EN_PROGRESO = "en_progreso"
     CERRADA = "cerrada"
 
+class EstadoPlan(str, Enum):
+    """Fase AA (pedido de Green Mills): un Plan agrupa las Ordenes que se
+    van a producir en un día -- sin fecha_fin (a pedido explícito, ver
+    PlanProduccion.fecha_inicio); se cierra solo cuando se agota la
+    secuencia de órdenes (ver avanzar_orden en operacion.py)."""
+    ABIERTO = "abierto"
+    CERRADO = "cerrado"
+
 class EstadoParada(str, Enum):
     PENDIENTE = "pendiente"       # Gap detectado automáticamente, esperando al supervisor
     CLASIFICADA = "clasificada"   # El supervisor ya le asignó un motivo
@@ -313,6 +321,36 @@ class SkuTiempoEstacion(TenantBase, table=True):
         Index("ix_sku_tiempo_estacion_unico", "tenant_id", "sku_fk", "estacion_id", unique=True),
     )
 
+class PlanProduccion(TenantBase, table=True):
+    """Fase AA (pedido de Green Mills, reunión de producción): un nivel
+    nuevo arriba de Orden -- "el plan contiene todo lo que se va a
+    producir ese día". Agrupa Ordenes (que se asocian a un SKU y una
+    cantidad cada una, ver OrdenProduccion.plan_id/secuencia); dentro de
+    un plan se pueden producir cantidades de distintos SKUs, uno por
+    orden, en secuencia. Deliberadamente SIN fecha_fin -- el plan no
+    tiene un cierre programado, se cierra solo cuando se agota la
+    secuencia de órdenes (ver avanzar_orden en operacion.py).
+
+    orden_activa_fk es la fuente AUTORITATIVA de "qué orden está
+    corriendo ahora" para las líneas que adoptan este flujo -- sólo
+    cambia vía avanzar_orden (acción de supervisor), nunca automático.
+    Reemplaza, para esas líneas, al heurístico "orden EN_PROGRESO más
+    reciente" que scans.py usa de fallback (Fase P) -- ver
+    resolver_orden_activa en clasificacion.py. Las líneas que no crean
+    un Plan siguen exactamente con el comportamiento de siempre: Plan es
+    opcional, no se le impone a ningún tenant que no lo pida."""
+    __tablename__ = "planes_produccion"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
+    fecha_inicio: date
+    estado: EstadoPlan = Field(default=EstadoPlan.ABIERTO)
+    # NOTA (C1/C2, mismo criterio que el resto del esquema): apunta a
+    # OrdenProduccion.id (UUID), no a id_orden (PK legacy) -- las FKs
+    # nuevas hacia Orden usan la identidad interna, ver nota en esa clase.
+    orden_activa_fk: Optional[uuid.UUID] = Field(default=None, foreign_key="ordenes_produccion.id")
+    activo: bool = Field(default=True)
+
+
 class OrdenProduccion(TenantBase, table=True):
     __tablename__ = "ordenes_produccion"
     # NOTA (C1/C2): id_orden sigue siendo PK legacy durante la fase expand.
@@ -326,6 +364,13 @@ class OrdenProduccion(TenantBase, table=True):
 
     cantidad_esperada: int = Field(default=0)
     cantidad_producida: int = Field(default=0)
+
+    # Fase AA: si pertenece a un Plan, plan_id la vincula y secuencia
+    # define su lugar en la fila (1, 2, 3...) -- avanzar_orden usa
+    # secuencia para decidir cuál sigue. None = orden suelta, fuera de
+    # cualquier plan (comportamiento histórico, sin cambios).
+    plan_id: Optional[uuid.UUID] = Field(default=None, foreign_key="planes_produccion.id")
+    secuencia: int = Field(default=0)
 
     plan_fecha: Optional[str] = Field(default=None, description="Ej: YYYY-MM-DD")
     estado: EstadoOrden = Field(default=EstadoOrden.ABIERTA)
