@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
+from app.core.clasificacion import validar_orden_lento_alerta
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
@@ -193,6 +194,11 @@ def crear_linea(
 
     datos = payload.model_dump(exclude={"planta_id"})
     nueva_linea = Linea(tenant_id=context.tenant_id, planta_id=planta_id, **datos)
+    try:
+        validar_orden_lento_alerta(nueva_linea.umbral_lento, nueva_linea.umbral_alerta)
+        validar_orden_lento_alerta(nueva_linea.tolerancia_lento_pct, nueva_linea.tolerancia_alerta_pct)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.add(nueva_linea)
     db.commit()
     db.refresh(nueva_linea)
@@ -236,6 +242,11 @@ def actualizar_linea(
     datos = payload.model_dump(exclude_unset=True)
     for key, value in datos.items():
         setattr(linea, key, value)
+    try:
+        validar_orden_lento_alerta(linea.umbral_lento, linea.umbral_alerta)
+        validar_orden_lento_alerta(linea.tolerancia_lento_pct, linea.tolerancia_alerta_pct)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.add(linea)
     db.commit()
     db.refresh(linea)
@@ -273,6 +284,11 @@ def crear_estacion(
         if not linea_db: raise HTTPException(status_code=400, detail="Línea inválida.")
 
     nueva_estacion = Estacion(tenant_id=context.tenant_id, **payload.model_dump())
+    try:
+        validar_orden_lento_alerta(nueva_estacion.umbral_lento, nueva_estacion.umbral_alerta)
+        validar_orden_lento_alerta(nueva_estacion.tolerancia_lento_pct, nueva_estacion.tolerancia_alerta_pct)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.add(nueva_estacion)
     db.commit()
     db.refresh(nueva_estacion)
@@ -315,6 +331,12 @@ def actualizar_estacion(
 
     update_data = payload.model_dump(exclude_unset=True)
     for key, value in update_data.items(): setattr(estacion_db, key, value)
+
+    try:
+        validar_orden_lento_alerta(estacion_db.umbral_lento, estacion_db.umbral_alerta)
+        validar_orden_lento_alerta(estacion_db.tolerancia_lento_pct, estacion_db.tolerancia_alerta_pct)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     db.add(estacion_db)
     db.commit()
