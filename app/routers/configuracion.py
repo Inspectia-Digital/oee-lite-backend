@@ -2,9 +2,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from sqlmodel import Session, select
+from sqlalchemy import func
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
-from datetime import time
+from datetime import time, date
 import uuid
 import pandas as pd
 import io
@@ -17,7 +18,7 @@ from app.core.clasificacion import validar_orden_lento_alerta
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
-    Maquina, MaquinaEstacion, SkuTiempoEstacion,
+    Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -847,6 +848,11 @@ class OrdenProduccionCreate(BaseModel):
     cantidad_esperada: int = 0
     plan_fecha: Optional[str] = None
     origen: str = "UI"
+    # Fase AA: si pertenece a un PlanProduccion. secuencia=None = se
+    # autoasigna como "la siguiente" dentro del plan (max existente + 1) --
+    # no obliga al caller a llevar la cuenta.
+    plan_id: Optional[uuid.UUID] = None
+    secuencia: Optional[int] = None
 
 class OrdenProduccionUpdate(BaseModel):
     sku_fk: Optional[str] = None
@@ -856,6 +862,8 @@ class OrdenProduccionUpdate(BaseModel):
     plan_fecha: Optional[str] = None
     estado: Optional[str] = None
     activo: Optional[bool] = None
+    plan_id: Optional[uuid.UUID] = None
+    secuencia: Optional[int] = None
 
 
 @router.post("/ordenes/", response_model=OrdenProduccion, status_code=status.HTTP_201_CREATED)
@@ -885,7 +893,24 @@ def crear_orden(
         if not linea:
             raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
 
-    nueva = OrdenProduccion(tenant_id=context.tenant_id, **payload.model_dump())
+    datos = payload.model_dump()
+    if datos.get("plan_id"):
+        plan = db.exec(
+            select(PlanProduccion).where(PlanProduccion.id == datos["plan_id"], PlanProduccion.tenant_id == context.tenant_id)
+        ).first()
+        if not plan:
+            raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+        if datos.get("secuencia") is None:
+            maxima = db.exec(
+                select(OrdenProduccion.secuencia)
+                .where(OrdenProduccion.tenant_id == context.tenant_id, OrdenProduccion.plan_id == plan.id)
+                .order_by(OrdenProduccion.secuencia.desc())
+            ).first()
+            datos["secuencia"] = (maxima or 0) + 1
+    elif datos.get("secuencia") is None:
+        datos["secuencia"] = 0
+
+    nueva = OrdenProduccion(tenant_id=context.tenant_id, **datos)
     db.add(nueva)
     db.commit()
     db.refresh(nueva)
@@ -962,6 +987,154 @@ def desactivar_orden(
     db.add(orden)
     db.commit()
     return {"mensaje": "Orden desactivada."}
+
+
+# ==========================================
+# 🗓️ ABM DE PLANES DE PRODUCCIÓN (Fase AA, pedido de Green Mills)
+# Agrupa Ordenes de una línea para un día -- ver PlanProduccion en
+# app/models/domain.py para el razonamiento completo (por qué sin
+# fecha_fin, por qué orden_activa_fk es autoritativo). Es OPCIONAL: una
+# línea que nunca crea un Plan sigue con el comportamiento histórico
+# (scans.py resuelve "orden EN_PROGRESO más reciente" como siempre, ver
+# resolver_orden_activa en clasificacion.py). El avance de una orden a
+# la siguiente (POST .../avanzar-orden/) vive en operacion.py -- es una
+# acción de supervisor, no un CRUD de configuración.
+# ==========================================
+class PlanProduccionCreate(BaseModel):
+    linea_id: uuid.UUID
+    fecha_inicio: date
+
+
+class OrdenEnPlan(BaseModel):
+    id_orden: str
+    id: uuid.UUID
+    sku_fk: Optional[str] = None
+    cantidad_esperada: int
+    # Calculada sumando LiteEventoProduccion.unidades_procesadas por
+    # orden_fk (misma regla de oro que el resto del sistema: nunca se lee
+    # OrdenProduccion.cantidad_producida, ese campo nunca se actualiza en
+    # ningún lado -- ver PlanVsActualRow en analytics.py, mismo patrón).
+    cantidad_producida: int
+    secuencia: int
+    estado: str
+    activa: bool
+
+
+class PlanConOrdenes(BaseModel):
+    id: uuid.UUID
+    linea_id: uuid.UUID
+    fecha_inicio: date
+    estado: str
+    orden_activa_fk: Optional[uuid.UUID] = None
+    ordenes: List[OrdenEnPlan]
+
+
+def _armar_plan_con_ordenes(db: Session, tenant_id: str, plan: PlanProduccion) -> PlanConOrdenes:
+    ordenes = db.exec(
+        select(OrdenProduccion)
+        .where(OrdenProduccion.tenant_id == tenant_id, OrdenProduccion.plan_id == plan.id)
+        .order_by(OrdenProduccion.secuencia)
+    ).all()
+
+    producido_por_orden: dict = {}
+    if ordenes:
+        filas = db.exec(
+            select(LiteEventoProduccion.orden_fk, func.sum(LiteEventoProduccion.unidades_procesadas))
+            .where(
+                LiteEventoProduccion.tenant_id == tenant_id,
+                LiteEventoProduccion.orden_fk.in_([o.id_orden for o in ordenes]),
+            )
+            .group_by(LiteEventoProduccion.orden_fk)
+        ).all()
+        producido_por_orden = {orden_fk: int(total or 0) for orden_fk, total in filas}
+
+    return PlanConOrdenes(
+        id=plan.id, linea_id=plan.linea_id, fecha_inicio=plan.fecha_inicio, estado=plan.estado,
+        orden_activa_fk=plan.orden_activa_fk,
+        ordenes=[
+            OrdenEnPlan(
+                id_orden=o.id_orden, id=o.id, sku_fk=o.sku_fk,
+                cantidad_esperada=o.cantidad_esperada,
+                cantidad_producida=producido_por_orden.get(o.id_orden, 0),
+                secuencia=o.secuencia, estado=o.estado,
+                activa=(plan.orden_activa_fk == o.id),
+            )
+            for o in ordenes
+        ],
+    )
+
+
+@router.post("/planes/", response_model=PlanConOrdenes, status_code=status.HTTP_201_CREATED)
+def crear_plan(
+    payload: PlanProduccionCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
+    if not linea:
+        raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
+
+    nuevo = PlanProduccion(tenant_id=context.tenant_id, linea_id=payload.linea_id, fecha_inicio=payload.fecha_inicio)
+    db.add(nuevo)
+    db.commit()
+    db.refresh(nuevo)
+    return _armar_plan_con_ordenes(db, context.tenant_id, nuevo)
+
+
+@router.get("/planes/", response_model=List[PlanProduccion])
+def listar_planes(
+    linea_id: Optional[uuid.UUID] = None,
+    estado: Optional[str] = None,
+    incluir_inactivos: bool = False,
+    db: Session = Depends(get_session),
+    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Sin `ordenes` embebidas a propósito (lista liviana para elegir un
+    plan) -- para el detalle completo con órdenes y cantidad_producida
+    calculada, ver GET /planes/{plan_id}."""
+    _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
+    query = select(PlanProduccion).where(PlanProduccion.tenant_id == context.tenant_id)
+    if not incluir_inactivos:
+        query = query.where(PlanProduccion.activo == True)  # noqa: E712
+    if linea_id:
+        query = query.where(PlanProduccion.linea_id == linea_id)
+    if estado:
+        query = query.where(PlanProduccion.estado == estado)
+    query = query.order_by(PlanProduccion.fecha_inicio.desc())
+    return db.exec(query).all()
+
+
+@router.get("/planes/{plan_id}", response_model=PlanConOrdenes)
+def obtener_plan(
+    plan_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    return _armar_plan_con_ordenes(db, context.tenant_id, plan)
+
+
+@router.delete("/planes/{plan_id}")
+def desactivar_plan(
+    plan_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    """Baja lógica. No borra las órdenes que agrupaba -- quedan sueltas
+    (plan_id sigue apuntando a un plan inactivo, se preservan tal cual
+    para no romper trazabilidad histórica de lo que ya se produjo)."""
+    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    plan.activo = False
+    db.add(plan)
+    db.commit()
+    return {"mensaje": "Plan desactivado."}
 
 
 # ==========================================

@@ -11,6 +11,7 @@ from app.models.domain import (
     ParadaDetectada, MotivoParada, EstadoParada,
     Estacion, Linea, LiteEventoProduccion, Operario, UsuarioSaaS, RolUsuario, UsuarioPlanta,
     AsignacionTurno, AsignacionSupervisor, Turno, Supervisor,
+    PlanProduccion, OrdenProduccion, EstadoPlan, EstadoOrden,
 )
 
 router = APIRouter(prefix="/supervisor", tags=["Operacion (UI Supervisor)"])
@@ -275,6 +276,100 @@ def _validar_linea_en_planta(linea_id: uuid.UUID, context: TenantContext, db: Se
     if context.sub_tenant_id and str(linea.planta_id) != str(context.sub_tenant_id):
         raise HTTPException(status_code=404, detail="Línea no encontrada en la planta activa.")
     return linea
+
+
+# ==========================================
+# PLAN DE PRODUCCIÓN -- AVANZAR DE ORDEN (Fase AA, pedido de Green Mills)
+# CRUD del Plan (crear/listar/ver/desactivar) vive en configuracion.py,
+# junto al resto de los maestros. Esto es distinto: una ACCIÓN operativa
+# (cambia qué orden clasifican los próximos escaneos en vivo), no una
+# consulta ni una edición de config -- por eso vive acá, con el resto de
+# las acciones de supervisor (clasificar_parada, asignar_dotacion).
+# ==========================================
+class PlanAvanzarResponse(BaseModel):
+    plan_id: uuid.UUID
+    estado: str
+    orden_cerrada_id_orden: Optional[str] = None
+    orden_activa_id_orden: Optional[str] = None
+    orden_activa_sku_fk: Optional[str] = None
+
+
+@router.post("/planes/{plan_id}/avanzar-orden/", response_model=PlanAvanzarResponse)
+def avanzar_orden(
+    plan_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Cierra la orden activa del plan "en el estado en el que esté" --
+    no valida cantidad producida contra la esperada, no hay nada que
+    reconciliar: lo realmente producido siempre se calcula al vuelo
+    sumando LiteEventoProduccion (ver _armar_plan_con_ordenes en
+    configuracion.py), nunca se lee de un contador que haya que cuadrar
+    a mano. Activa la siguiente orden por secuencia (siempre la que
+    sigue, nunca una a elección -- confirmado con el usuario). Si no
+    queda ninguna, el plan se cierra solo (también confirmado).
+
+    Sólo Supervisor, Gerencia, Producción o SuperAdmin: es una acción
+    operativa real que cambia en vivo qué SKU/tiempo ideal clasifican
+    los próximos escaneos de la línea (ver resolver_orden_activa en
+    clasificacion.py) -- un Operario no la dispara."""
+    validar_planta(context, usuario, db)
+    if usuario.rol not in (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN):
+        raise HTTPException(status_code=403, detail="Sólo Supervisor, Gerencia, Producción o SuperAdmin pueden avanzar un plan.")
+
+    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    if context.sub_tenant_id:
+        _validar_linea_en_planta(plan.linea_id, context, db)
+    if plan.estado == EstadoPlan.CERRADO:
+        raise HTTPException(status_code=409, detail="El plan ya está cerrado -- no quedan más órdenes para avanzar.")
+
+    orden_cerrada_id = None
+    secuencia_actual = -1  # -1 = "todavía no arrancó" -> avanzar activa la primera de la secuencia
+    if plan.orden_activa_fk:
+        orden_actual = db.exec(
+            select(OrdenProduccion).where(
+                OrdenProduccion.id == plan.orden_activa_fk,
+                OrdenProduccion.tenant_id == context.tenant_id,
+            )
+        ).first()
+        if orden_actual:
+            orden_actual.estado = EstadoOrden.CERRADA
+            db.add(orden_actual)
+            orden_cerrada_id = orden_actual.id_orden
+            secuencia_actual = orden_actual.secuencia
+
+    siguiente = db.exec(
+        select(OrdenProduccion)
+        .where(
+            OrdenProduccion.tenant_id == context.tenant_id,
+            OrdenProduccion.plan_id == plan.id,
+            OrdenProduccion.secuencia > secuencia_actual,
+            OrdenProduccion.estado != EstadoOrden.CERRADA,
+        )
+        .order_by(OrdenProduccion.secuencia)
+    ).first()
+
+    if siguiente:
+        siguiente.estado = EstadoOrden.EN_PROGRESO
+        db.add(siguiente)
+        plan.orden_activa_fk = siguiente.id
+    else:
+        plan.orden_activa_fk = None
+        plan.estado = EstadoPlan.CERRADO
+
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+
+    return PlanAvanzarResponse(
+        plan_id=plan.id, estado=plan.estado,
+        orden_cerrada_id_orden=orden_cerrada_id,
+        orden_activa_id_orden=siguiente.id_orden if siguiente else None,
+        orden_activa_sku_fk=siguiente.sku_fk if siguiente else None,
+    )
 
 
 # ==========================================

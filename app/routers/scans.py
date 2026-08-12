@@ -14,12 +14,12 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
-from app.core.clasificacion import resolver_umbrales_evento
+from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
-    Maquina, MaquinaEstacion, OrdenProduccion, EstadoOrden
+    Maquina, MaquinaEstacion,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,25 +180,23 @@ def registrar_escaneo_rapido(
         except Exception:
             pass
 
-    # 1.b FALLBACK: orden EN_PROGRESO de la línea (Fase P). orden_activa_fk/
+    # 1.b FALLBACK: orden activa de la línea (Fase P, Fase AA). orden_activa_fk/
     # sku_activo_fk de la Estación nunca los escribe nadie (siguen NULL
     # siempre) -- confirmado al construir /analytics/linea-en-vivo/, que
-    # usa esta misma resolución para lo que muestra en pantalla. Para un
-    # PLC ciego (sin codigo_pieza, ej. Green Mills) esta es la ÚNICA fuente
-    # posible de orden/SKU. No pisa un orden_final ya resuelto por el regex
-    # de arriba -- sku_final sí se resuelve siempre acá porque hoy no existe
-    # ningún otro camino que lo asigne.
+    # usa esta misma resolución (resolver_orden_activa, clasificacion.py)
+    # para lo que muestra en pantalla -- una sola fuente de verdad para
+    # los dos. Para un PLC ciego (sin codigo_pieza, ej. Green Mills) esta
+    # es la ÚNICA fuente posible de orden/SKU. No pisa un orden_final ya
+    # resuelto por el regex de arriba -- sku_final sí se resuelve siempre
+    # acá porque hoy no existe ningún otro camino que lo asigne.
+    #
+    # Fase AA: si la línea tiene un Plan de Producción ABIERTO con una
+    # orden activa explícita (decidida por un supervisor vía
+    # avanzar_orden), esa gana sobre el heurístico "EN_PROGRESO más
+    # reciente" -- ver resolver_orden_activa. Líneas sin Plan siguen
+    # exactamente igual que antes.
     if linea and (orden_final is None or sku_final is None):
-        orden_activa = db.exec(
-            select(OrdenProduccion)
-            .where(
-                OrdenProduccion.tenant_id == dispositivo.tenant_id,
-                OrdenProduccion.linea_id == linea.id,
-                OrdenProduccion.estado == EstadoOrden.EN_PROGRESO,
-                OrdenProduccion.activo == True,  # noqa: E712
-            )
-            .order_by(OrdenProduccion.id_orden.desc())
-        ).first()
+        orden_activa = resolver_orden_activa(db, dispositivo.tenant_id, linea.id)
         if orden_activa:
             if orden_final is None:
                 orden_final = orden_activa.id_orden
