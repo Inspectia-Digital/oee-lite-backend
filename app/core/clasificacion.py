@@ -45,6 +45,32 @@ def resolver_tolerancia(valor_estacion: Optional[float], valor_linea: Optional[f
     return default_tenant
 
 
+def validar_orden_lento_alerta(lento: Optional[float], alerta: Optional[float]) -> None:
+    """Fase AB (hallazgo real revisando la cascada completa de umbrales/
+    tolerancias a pedido de Green Mills): ni Linea/Estacion (Create y
+    Update) ni Tenant (PATCH /mi-empresa/tenant) validaban que 'lento'
+    fuera menor que 'alerta' -- ni en el schema Pydantic ni en el
+    endpoint. Si quedan invertidos (ej. umbral_lento=300, umbral_alerta=
+    200, o tolerancia_lento_pct=0.30 > tolerancia_alerta_pct=0.15),
+    scans.py evalúa "delta_t > t_alerta" ANTES que "delta_t > t_lento"
+    (ver clasificacion.py / registrar_escaneo_rapido): con alerta más
+    chico que lento, todo lo que supera el umbral de lento YA superó
+    antes el de alerta -- el nivel LENTO queda matemáticamente
+    inalcanzable, en silencio, sin ningún error. La estación parece
+    saltar directo de "óptimo" a "alerta" y nadie se entera de por qué.
+
+    Sólo valida cuando LOS DOS están definidos como valores concretos en
+    la misma fila (no intenta resolver la cascada de herencia completa
+    Estación/Línea/Tenant en el momento de guardar) -- eso alcanza para
+    atajar el error real de tipeo/carga sin tener que reconstruir toda
+    la resolución en el momento del PATCH."""
+    if lento is not None and alerta is not None and lento >= alerta:
+        raise ValueError(
+            f"El valor de 'lento' ({lento}) tiene que ser menor que el de 'alerta' ({alerta}) -- "
+            "si no, el nivel LENTO nunca se alcanza (todo lo que supera 'lento' ya superó 'alerta' antes)."
+        )
+
+
 @dataclass
 class UmbralesResueltos:
     """Resultado de resolver_umbrales_evento(): todo lo que hace falta

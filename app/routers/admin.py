@@ -15,6 +15,7 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
 from app.core.auth0_management import crear_ticket_cambio_password
+from app.core.clasificacion import validar_orden_lento_alerta
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso
 
 # Roles a los que no se les asigna alcance por planta -- ven todo el tenant
@@ -208,7 +209,12 @@ def actualizar_mi_tenant(
     update_data = datos.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(tenant_db, key, value)
-        
+
+    try:
+        validar_orden_lento_alerta(tenant_db.tolerancia_lento_pct, tenant_db.tolerancia_alerta_pct)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     db.add(tenant_db)
     db.commit()
     db.refresh(tenant_db)
