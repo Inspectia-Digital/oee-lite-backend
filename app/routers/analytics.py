@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 from sqlalchemy import cast, String  # <-- IMPORTANTE: Para el casteo de UUID a String
 from datetime import datetime, time, date, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import Dict, List, Optional
 import uuid
 
 from app.core.database import get_session
@@ -14,7 +14,7 @@ from app.models.domain import (
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada,
-    AsignacionSupervisor, Supervisor,
+    AsignacionSupervisor, Supervisor, Maquina,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -59,6 +59,17 @@ class ReporteOperarioSpringwall(BaseModel):
     diferencia_pct: float
 
 class ParetoParadas(BaseModel):
+    motivo: str
+    tipo: str
+    frecuencia: int
+    minutos_totales: float
+
+class ParadasPorSku(BaseModel):
+    """Fase AF: mismo shape que ParetoParadas (motivo/tipo/frecuencia/
+    minutos), con el SKU como dimensión adicional -- una fila por (SKU,
+    motivo). sku="Sin SKU asociado" agrupa las paradas cuyo orden_fk es
+    NULL (paradas de antes de este campo, o sin ninguna orden resuelta)."""
+    sku: str
     motivo: str
     tipo: str
     frecuencia: int
@@ -167,6 +178,18 @@ class RendimientoOperarioRow(BaseModel):
     tiempo_promedio_seg: float
     distribucion_desempeno: dict  # {"optimo": pct, "lento": pct, "alerta": pct}
     eficiencia_global: float  # % óptimo sobre el total de eventos
+
+class RendimientoMaquinaRow(BaseModel):
+    """Fase AD: real vs. teórico por MÁQUINA física (no por estación) y
+    por turno -- misma metodología asimétrica de Fase V (ver comentario
+    largo en CuelloBotella.desvio_pct), tercera aplicación (estación,
+    operario/turno acá, y ahora máquina)."""
+    maquina_id: uuid.UUID
+    maquina_nombre: str
+    turno_nombre: str  # "Sin turno" si el evento no cae en ninguna ventana horaria configurada
+    eventos_totales: int
+    unidades_producidas: int
+    rendimiento_pct: float
 
 class CommandCenterPlanta(BaseModel):
     id: uuid.UUID
@@ -647,8 +670,9 @@ def obtener_pareto_paradas(
 ):
     """Fase O (auditoría de producción del front #2): fecha_desde/
     fecha_hasta/linea_id para que los filtros del dashboard tengan efecto
-    real. Sin filtro por orden -- ParadaDetectada no tiene relación con
-    OrdenProduccion, el "Plan" no aplica a este reporte."""
+    real. Sin filtro por orden acá -- desde Fase AF ParadaDetectada sí
+    tiene orden_fk, pero el desglose por SKU/orden vive en su propio
+    reporte (/analytics/paradas-por-sku/), no se mezcla con este."""
     try:
         validar_planta(context)
         if fecha is not None:
@@ -1356,6 +1380,36 @@ def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
     return dia_iso in dias
 
 
+def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
+    """Hora LOCAL de planta de un timestamp (naive UTC) -- mismo criterio
+    de conversión que _fecha_planta/_ahora_planta, pero devuelve la hora
+    (time), no la fecha, para resolver contra Turno.hora_inicio/fin
+    (Fase AD)."""
+    try:
+        tz = ZoneInfo(planta.timezone) if planta and planta.timezone else ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    except Exception:
+        tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
+    return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).time()
+
+
+def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
+    """Qué Turno (de una lista ya acotada a una línea) está vigente para
+    una hora+día puntuales -- mismo criterio que turno_actual en
+    /analytics/linea-en-vivo/ (horario + día de semana, primer match
+    gana), generalizado para resolver un timestamp CUALQUIERA (no sólo
+    "ahora"). None si ninguno matchea -- no se inventa un turno."""
+    for t in turnos:
+        if not _dia_en_dias_semana(dia_iso, t.dias_semana):
+            continue
+        if t.hora_inicio <= t.hora_fin:
+            en_turno = t.hora_inicio <= hora_local <= t.hora_fin
+        else:
+            en_turno = hora_local >= t.hora_inicio or hora_local <= t.hora_fin
+        if en_turno:
+            return t
+    return None
+
+
 @router.get("/analytics/linea-en-vivo/", response_model=LineaEnVivoResumen)
 def obtener_linea_en_vivo(
     linea_id: uuid.UUID,
@@ -1769,3 +1823,187 @@ def obtener_resumen_command_center(
             estaciones_activas=len(estaciones_activas), estaciones_total=len(estaciones_total),
         ),
     )
+
+
+@router.get("/analytics/rendimiento-maquinas/", response_model=list[RendimientoMaquinaRow])
+def obtener_rendimiento_maquinas(
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase AD (pedido de Green Mills, "gráficos por máquina: real vs.
+    teórico, por turno"): rendimiento real vs. teórico por MÁQUINA física
+    (no por estación) y por turno -- una estación puede tener más de una
+    máquina asociada a lo largo del tiempo (Fase G, Maquina/
+    MaquinaEstacion); agrupar sólo por estación esconde diferencias
+    reales entre máquinas físicas que procesan la misma estación.
+
+    Ideal por evento: reutiliza LiteEventoProduccion.tiempo_ideal_seg, el
+    snapshot inmutable que ya graba scans.py (confirmado con el usuario:
+    "no hace falta un campo nuevo ni CRUD, esto es sólo un reporte nuevo
+    sobre datos que ya existen") -- con la cascada de Fase AC (SKU×
+    Estación > SKU > Línea) ese snapshot ya refleja el perfil de tiempos
+    vigente en el momento del evento, sin importar de qué nivel salió.
+
+    Metodología: misma fórmula asimétrica de Fase V (ideal_total /
+    (ideal_total + lentitud_total)), tercera aplicación (después de
+    Cuellos de Botella/Performance por Estación y Rendimiento Secuencial).
+
+    Turno: se resuelve por horario + día de semana (mismo criterio que
+    turno_actual en /analytics/linea-en-vivo/, generalizado acá a
+    CUALQUIER timestamp, no sólo "ahora") contra los Turnos de la línea
+    del evento -- si ninguno matchea, "Sin turno" (no se inventa uno)."""
+    try:
+        validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
+        hoy = datetime.utcnow().date()
+        hasta = fecha_hasta or hoy
+        desde = fecha_desde or (hasta - timedelta(days=6))
+        if hasta < desde:
+            raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+
+        inicio = datetime.combine(desde, time.min)
+        fin = datetime.combine(hasta, time.max)
+
+        # Inner join a Maquina: sólo eventos con máquina resuelta entran a
+        # este reporte -- si el hardware no informó maquina_id (Fase E1,
+        # el evento se acepta igual en scans.py), no hay a qué máquina
+        # atribuirlo, y no se inventa un valor.
+        query = (
+            select(LiteEventoProduccion, Estacion, Maquina, Linea)
+            .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
+            .join(Linea, Estacion.linea_id == Linea.id)
+            .join(Maquina, LiteEventoProduccion.maquina_id == Maquina.id)
+            .where(
+                LiteEventoProduccion.tenant_id == context.tenant_id,
+                Linea.planta_id == context.sub_tenant_id,
+                LiteEventoProduccion.timestamp >= inicio,
+                LiteEventoProduccion.timestamp <= fin,
+                LiteEventoProduccion.incluido_oee == True,  # noqa: E712
+            )
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        eventos = db.exec(query).all()
+        if not eventos:
+            return []
+
+        planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
+        turnos_todos = db.exec(
+            select(Turno).where(Turno.tenant_id == context.tenant_id, Turno.activo == True)  # noqa: E712
+        ).all()
+        turnos_por_linea: Dict[uuid.UUID, List[Turno]] = {}
+        for t in turnos_todos:
+            if t.linea_id:
+                turnos_por_linea.setdefault(t.linea_id, []).append(t)
+
+        agrupado: Dict[tuple, dict] = {}
+        metodologia: Dict[tuple, dict] = {}
+        for evento, estacion, maquina, linea in eventos:
+            hora_local = _hora_planta(evento.timestamp, planta)
+            dia_iso = _fecha_planta(evento.timestamp, planta).isoweekday()
+            turno = _resolver_turno_por_horario(hora_local, dia_iso, turnos_por_linea.get(linea.id, []))
+            clave = (maquina.id, turno.id if turno else None)
+
+            g = agrupado.setdefault(clave, {
+                "maquina_id": maquina.id, "maquina_nombre": maquina.nombre or maquina.codigo_externo,
+                "turno_nombre": turno.nombre if turno else "Sin turno",
+                "eventos": 0, "unidades": 0,
+            })
+            g["eventos"] += 1
+            g["unidades"] += evento.unidades_procesadas
+
+            m = metodologia.setdefault(clave, {"ideal": 0.0, "lentitud": 0.0})
+            m["ideal"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
+            if evento.estado == "LENTO":
+                m["lentitud"] += max(0.0, (evento.delta_t_segundos or 0.0) - evento.tiempo_ideal_seg * evento.unidades_procesadas)
+
+        resultado = []
+        for clave, g in agrupado.items():
+            m = metodologia.get(clave, {"ideal": 0.0, "lentitud": 0.0})
+            rendimiento_pct = (
+                round(min(100.0, (m["ideal"] / (m["ideal"] + m["lentitud"])) * 100), 1)
+                if m["ideal"] > 0 else 0.0
+            )
+            resultado.append(RendimientoMaquinaRow(
+                maquina_id=g["maquina_id"], maquina_nombre=g["maquina_nombre"],
+                turno_nombre=g["turno_nombre"], eventos_totales=g["eventos"],
+                unidades_producidas=g["unidades"], rendimiento_pct=rendimiento_pct,
+            ))
+        resultado.sort(key=lambda r: (r.maquina_nombre, r.turno_nombre))
+        return resultado
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en rendimiento de máquinas: {e}")
+        return []
+
+
+@router.get("/analytics/paradas-por-sku/", response_model=list[ParadasPorSku])
+def obtener_paradas_por_sku(
+    fecha: date = None, fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase AF (pedido de Green Mills, "análisis de paradas por SKU"):
+    mismo reporte que /analytics/pareto-paradas/ (motivo/tipo/frecuencia/
+    minutos), agrupado también por SKU -- qué SKU concentra más tiempo
+    perdido y por qué motivo.
+
+    orden_fk en ParadaDetectada (Fase AF) se completa recién desde este
+    cambio -- paradas anteriores quedan con orden_fk=NULL y se agrupan
+    como "Sin SKU asociado", no se pierden ni se inventa un valor."""
+    try:
+        validar_planta(context)
+        if fecha is not None:
+            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+        else:
+            inicio_dia, _ = obtener_rango_dia(fecha_desde)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+
+        query = (
+            select(ParadaDetectada, MotivoParada, OrdenProduccion)
+            .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+            .join(Linea, Estacion.linea_id == Linea.id)
+            .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
+            .outerjoin(OrdenProduccion, ParadaDetectada.orden_fk == OrdenProduccion.id)
+            .where(
+                ParadaDetectada.tenant_id == context.tenant_id,
+                Linea.planta_id == context.sub_tenant_id,
+                ParadaDetectada.inicio >= inicio_dia,
+                ParadaDetectada.inicio <= fin_dia,
+            )
+        )
+        if linea_id: query = query.where(Linea.id == linea_id)
+        paradas = db.exec(query).all()
+
+        agrupado = {}
+        for parada, motivo, orden in paradas:
+            sku = (orden.sku_fk if orden else None) or "Sin SKU asociado"
+            nombre_motivo = motivo.nombre if motivo else "Sin Clasificar (Pendiente)"
+            tipo_motivo = str(motivo.tipo_parada).split(".")[-1].upper() if motivo else "DESCONOCIDO"
+
+            clave = (sku, nombre_motivo)
+            if clave not in agrupado:
+                agrupado[clave] = {"tipo": tipo_motivo, "frecuencia": 0, "segundos": 0}
+            agrupado[clave]["frecuencia"] += 1
+            agrupado[clave]["segundos"] += parada.duracion_segundos or 0
+
+        reporte = [
+            ParadasPorSku(
+                sku=sku, motivo=motivo, tipo=v["tipo"], frecuencia=v["frecuencia"],
+                minutos_totales=round(v["segundos"] / 60, 1),
+            )
+            for (sku, motivo), v in agrupado.items()
+        ]
+        reporte.sort(key=lambda x: x.minutos_totales, reverse=True)
+        return reporte
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en paradas por SKU: {e}")
+        return []

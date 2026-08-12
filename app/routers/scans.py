@@ -16,7 +16,7 @@ from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
 from app.models.domain import (
-    Estacion, Linea, MaestroSKU, Tenant, Planta,
+    Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
     Maquina, MaquinaEstacion,
@@ -279,6 +279,23 @@ def registrar_escaneo_rapido(
             # penalizar dos veces (Disponibilidad Y Rendimiento) por el mismo hueco.
             tiempo_perdido_segundos = delta_t_segundos - t_alerta
 
+            # Fase AF: id UUID de la orden activa (si hay una resuelta),
+            # para poder analizar paradas por SKU más adelante -- orden_final
+            # es el id_orden (string, legacy) que ya se usó para clasificar
+            # este evento; acá se resuelve el UUID real (.id) una sola vez,
+            # sólo en el momento en que efectivamente se crea una parada
+            # (no en cada scan), mismo criterio C1/C2 que el resto de las
+            # FKs nuevas desde Fase AA.
+            orden_activa_id = None
+            if orden_final is not None:
+                orden_activa_obj = db.exec(
+                    select(OrdenProduccion).where(
+                        OrdenProduccion.tenant_id == dispositivo.tenant_id,
+                        OrdenProduccion.id_orden == orden_final,
+                    )
+                ).first()
+                orden_activa_id = orden_activa_obj.id if orden_activa_obj else None
+
             # Disparar Parada Automática[cite: 13]
             nueva_parada = ParadaDetectada(
                 tenant_id=dispositivo.tenant_id,
@@ -286,7 +303,8 @@ def registrar_escaneo_rapido(
                 inicio=ultimo_evento.timestamp,
                 fin=evento_timestamp,
                 duracion_segundos=tiempo_perdido_segundos,
-                estado=EstadoParada.PENDIENTE
+                estado=EstadoParada.PENDIENTE,
+                orden_fk=orden_activa_id,
             )
             db.add(nueva_parada)
             # Cap de Rendimiento: limitamos delta_t al tiempo ideal de UN

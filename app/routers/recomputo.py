@@ -109,21 +109,24 @@ def recomputar_eventos(
     # sku_final de un evento ya ingerido se reconstruye desde su orden_fk
     # (inmutable) -> OrdenProduccion.sku_fk VIGENTE -- no hace falta (ni se
     # puede) re-derivar qué orden estaba EN_PROGRESO en su momento, eso ya
-    # quedó fijado para siempre en orden_fk.
-    cache_sku_por_orden: Dict[str, Optional[str]] = {}
+    # quedó fijado para siempre en orden_fk. Fase AF: el mismo lookup
+    # también resuelve el UUID (.id) de la orden, para completar
+    # ParadaDetectada.orden_fk en las paradas que este recómputo crea de
+    # nuevo -- se cachea el objeto entero (no sólo sku_fk) para no
+    # duplicar la query.
+    cache_orden_por_id: Dict[str, Optional[OrdenProduccion]] = {}
 
-    def _sku_de_orden(id_orden: Optional[str]) -> Optional[str]:
+    def _resolver_orden(id_orden: Optional[str]) -> Optional[OrdenProduccion]:
         if id_orden is None:
             return None
-        if id_orden not in cache_sku_por_orden:
-            orden = db.exec(
+        if id_orden not in cache_orden_por_id:
+            cache_orden_por_id[id_orden] = db.exec(
                 select(OrdenProduccion).where(
                     OrdenProduccion.id_orden == id_orden,
                     OrdenProduccion.tenant_id == context.tenant_id,
                 )
             ).first()
-            cache_sku_por_orden[id_orden] = orden.sku_fk if orden else None
-        return cache_sku_por_orden[id_orden]
+        return cache_orden_por_id[id_orden]
 
     eventos_recomputados = 0
     eventos_sin_cambios = 0
@@ -133,7 +136,8 @@ def recomputar_eventos(
     paradas_obsoletas: List[uuid.UUID] = []
 
     for evento in eventos:
-        sku_final = _sku_de_orden(evento.orden_fk)
+        orden_actual = _resolver_orden(evento.orden_fk)
+        sku_final = orden_actual.sku_fk if orden_actual else None
         umbrales = resolver_umbrales_evento(db, context.tenant_id, estacion, linea, sku_final, evento.unidades_procesadas)
 
         nuevo_estado = "OPTIMO"
@@ -195,6 +199,7 @@ def recomputar_eventos(
                         inicio=evento_anterior.timestamp, fin=evento.timestamp,
                         duracion_segundos=nuevo_tiempo_perdido, estado=EstadoParada.PENDIENTE,
                         origen="AUTOMATICA",
+                        orden_fk=orden_actual.id if orden_actual else None,
                     ))
                     paradas_creadas += 1
                 elif parada_existente.estado == EstadoParada.PENDIENTE:
