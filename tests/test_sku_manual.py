@@ -10,7 +10,7 @@ import uuid
 
 from sqlmodel import select
 
-from app.models.domain import Linea, MaestroSKU, Planta
+from app.models.domain import Linea, MaestroSKU, Planta, Tenant
 from tests.conftest import autenticar_como
 
 
@@ -107,6 +107,23 @@ def test_crear_sku_manual_requiere_gerencia(client, db, tenant_a):
         json={"codigo_sku": f"SKU-{uuid.uuid4().hex[:8]}", "descripcion": "No autorizado"},
     )
     assert r.status_code == 403
+
+
+def test_crear_sku_manual_bloqueado_si_origen_erp(client, db, tenant_a, gerente_a):
+    """Reorg carga de SKUs (Green Mills): el alta individual no tenía el
+    mismo guard que el alta masiva por archivo (verificar_permiso_carga_y_linea
+    en importaciones.py) -- un tenant "ERP" podía crear SKUs a mano igual."""
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_a)).first()
+    tenant_db.origen_maestros = "ERP"
+    db.add(tenant_db)
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/erp/skus",
+        json={"codigo_sku": f"SKU-ERP-{uuid.uuid4().hex[:8]}", "descripcion": "Bloqueado"},
+    )
+    assert r.status_code == 409
 
 
 def test_desactivar_sku_por_patch_persiste(client, db, tenant_a, gerente_a):

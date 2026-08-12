@@ -18,7 +18,7 @@ from app.core.clasificacion import validar_perfil_tiempos
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
-    Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion,
+    Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion, Tenant,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -666,6 +666,19 @@ def crear_sku(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
+    # Reorg carga de SKUs (pedido Green Mills): mismo guard que
+    # verificar_permiso_carga_y_linea (importaciones.py), que sólo cubre el
+    # alta MASIVA por archivo (/skus/upload). Este endpoint -- alta
+    # individual, usado por "Nueva SKU" y por el modo manual del
+    # importador -- no tenía ningún chequeo de origen_maestros: un tenant
+    # "ERP" podía crear SKUs a mano igual. Gap real, se cierra acá.
+    tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
+    if tenant and tenant.origen_maestros == "ERP":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP.",
+        )
+
     # codigo_sku sigue siendo PK legacy (C1/C2): el chequeo de duplicado no
     # filtra por `activo` -- un SKU inactivo con el mismo código igual
     # rompería el INSERT por choque de PK, así que hay que detectarlo antes
