@@ -1,14 +1,15 @@
 """Recómputo de eventos ya ingeridos (Fase S).
 
-Motivo: SkuTiempoEstacion (Fase R), Linea/Estacion.tolerancia_*_pct (Fase
-R) y umbral_optimo/lento/alerta (Fase Q) sólo se leen en /api/lite/scans,
-en el momento exacto del ping -- el resultado (tiempo_ideal_seg, estado,
-ParadaDetectada.duracion_segundos) queda congelado ahí para siempre
-(snapshot inmutable, ver LiteEventoProduccion.tiempo_ideal_seg). Cargar un
-override o ajustar una tolerancia DESPUÉS de que ya llegaron eventos no
-cambia nada retroactivamente por sí solo -- de ahí este endpoint: reaplica
-la config VIGENTE sobre eventos que YA existen, sin alterar los hechos
-inmutables de cada evento (timestamp, orden_fk, unidades_procesadas).
+Motivo: el perfil de tiempos (SKU×Estación, SKU genérico, o el piso de
+Línea -- Fase AC, ver clasificacion.resolver_umbrales_evento) sólo se lee
+en /api/lite/scans, en el momento exacto del ping -- el resultado
+(tiempo_ideal_seg, estado, ParadaDetectada.duracion_segundos) queda
+congelado ahí para siempre (snapshot inmutable, ver
+LiteEventoProduccion.tiempo_ideal_seg). Cargar un override o ajustar un
+perfil DESPUÉS de que ya llegaron eventos no cambia nada retroactivamente
+por sí solo -- de ahí este endpoint: reaplica la config VIGENTE sobre
+eventos que YA existen, sin alterar los hechos inmutables de cada evento
+(timestamp, orden_fk, unidades_procesadas).
 
 Por qué no es un DELETE + reingesta: ni LiteEventoProduccion ni
 ParadaDetectada de origen AUTOMATICA tienen endpoint de borrado en todo
@@ -31,7 +32,7 @@ from app.core.database import get_session
 from app.core.rbac import requerir_gerencia_o_superadmin
 from app.models.domain import (
     Estacion, Linea, LiteEventoProduccion, OrdenProduccion, ParadaDetectada,
-    EstadoParada, Tenant, UsuarioSaaS,
+    EstadoParada, UsuarioSaaS,
 )
 
 router = APIRouter(prefix="/config/estaciones", tags=["Recómputo (Fase S)"])
@@ -76,7 +77,6 @@ def recomputar_eventos(
         raise HTTPException(status_code=404, detail="Estación no encontrada.")
 
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
-    tenant_config = db.get(Tenant, context.tenant_id)
 
     desde_dt = datetime.combine(payload.fecha_desde, time.min)
     hasta_dt = datetime.combine(payload.fecha_hasta, time.max)
@@ -134,7 +134,7 @@ def recomputar_eventos(
 
     for evento in eventos:
         sku_final = _sku_de_orden(evento.orden_fk)
-        umbrales = resolver_umbrales_evento(db, context.tenant_id, tenant_config, estacion, linea, sku_final, evento.unidades_procesadas)
+        umbrales = resolver_umbrales_evento(db, context.tenant_id, estacion, linea, sku_final, evento.unidades_procesadas)
 
         nuevo_estado = "OPTIMO"
         nuevo_delta_t = 0.0

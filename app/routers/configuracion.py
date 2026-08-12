@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
-from app.core.clasificacion import validar_orden_lento_alerta
+from app.core.clasificacion import validar_perfil_tiempos
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
@@ -53,19 +53,13 @@ class LineaCreate(BaseModel):
     # duplicaba la misma info en dos lugares y bloqueaba crear líneas.
     planta_id: Optional[uuid.UUID] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperarios] = ModoAsignacionOperarios.MANUAL
-    # Fase Q: default heredable por las estaciones de esta línea que no
-    # configuren el suyo propio. None = sin default de línea (cae al
-    # default de sistema en scans.py).
-    umbral_optimo: Optional[int] = None
-    umbral_lento: Optional[int] = None
-    umbral_alerta: Optional[int] = None
-    # Fase R: % de tolerancia heredable (Estación > Línea > Tenant) sobre
-    # el ciclo ideal de un SKU -- reemplaza usar SIEMPRE el único valor
-    # fijo de Tenant.tolerancia_lento_pct/alerta_pct cuando el evento
-    # resuelve un SKU (scans.py). None = sin default de línea (cae al
-    # tenant, ver _resolver_tolerancia en scans.py).
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
+    # Fase AC: piso de la cascada de umbrales -- se usa siempre que un
+    # evento no resuelve SKU, o resuelve uno con perfil incompleto (ver
+    # clasificacion.resolver_umbrales_evento). Con default: una línea
+    # nueva ya clasifica sin configuración adicional.
+    tiempo_ideal_seg: float = 240.0
+    tiempo_lento_seg: float = 280.0
+    tiempo_alerta_seg: float = 300.0
 
 class LineaUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -73,11 +67,9 @@ class LineaUpdate(BaseModel):
     tipo_produccion: Optional[str] = None
     metodo_calidad: Optional[str] = None
     activo: Optional[bool] = None
-    umbral_optimo: Optional[int] = None
-    umbral_lento: Optional[int] = None
-    umbral_alerta: Optional[int] = None
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
+    tiempo_ideal_seg: Optional[float] = None
+    tiempo_lento_seg: Optional[float] = None
+    tiempo_alerta_seg: Optional[float] = None
 
 class EstacionCreate(BaseModel):
     nombre: str
@@ -86,27 +78,12 @@ class EstacionCreate(BaseModel):
     parent_id: Optional[uuid.UUID] = None
     posicion_linea: int = 1
     ramal: str = "Principal"
-    # Fase Q: None por default (antes 240/280/300 fijos) -- una estación
-    # nueva que no especifica sus propios umbrales hereda los de la Línea
-    # (o el default de sistema si la línea tampoco los tiene, ver scans.py).
-    umbral_optimo: Optional[int] = None
-    umbral_lento: Optional[int] = None
-    umbral_alerta: Optional[int] = None
-    # Fase R: idem umbral_*, pero para el % de tolerancia que se aplica
-    # cuando el evento SÍ resuelve un SKU (None = hereda de la Línea).
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
     codigo_plc: Optional[str] = None
     modo_asignacion_operarios: Optional[ModoAsignacionOperariosEstacion] = ModoAsignacionOperariosEstacion.HEREDAR
 
 class EstacionUpdate(BaseModel):
     nombre: Optional[str] = None
     tipo: Optional[str] = None
-    umbral_optimo: Optional[int] = None
-    umbral_lento: Optional[int] = None
-    umbral_alerta: Optional[int] = None
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
     activa: Optional[bool] = None
     posicion_linea: Optional[int] = None
     ramal: Optional[str] = None
@@ -196,8 +173,7 @@ def crear_linea(
     datos = payload.model_dump(exclude={"planta_id"})
     nueva_linea = Linea(tenant_id=context.tenant_id, planta_id=planta_id, **datos)
     try:
-        validar_orden_lento_alerta(nueva_linea.umbral_lento, nueva_linea.umbral_alerta)
-        validar_orden_lento_alerta(nueva_linea.tolerancia_lento_pct, nueva_linea.tolerancia_alerta_pct)
+        validar_perfil_tiempos(nueva_linea.tiempo_ideal_seg, nueva_linea.tiempo_lento_seg, nueva_linea.tiempo_alerta_seg)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     db.add(nueva_linea)
@@ -244,8 +220,7 @@ def actualizar_linea(
     for key, value in datos.items():
         setattr(linea, key, value)
     try:
-        validar_orden_lento_alerta(linea.umbral_lento, linea.umbral_alerta)
-        validar_orden_lento_alerta(linea.tolerancia_lento_pct, linea.tolerancia_alerta_pct)
+        validar_perfil_tiempos(linea.tiempo_ideal_seg, linea.tiempo_lento_seg, linea.tiempo_alerta_seg)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     db.add(linea)
@@ -285,11 +260,6 @@ def crear_estacion(
         if not linea_db: raise HTTPException(status_code=400, detail="Línea inválida.")
 
     nueva_estacion = Estacion(tenant_id=context.tenant_id, **payload.model_dump())
-    try:
-        validar_orden_lento_alerta(nueva_estacion.umbral_lento, nueva_estacion.umbral_alerta)
-        validar_orden_lento_alerta(nueva_estacion.tolerancia_lento_pct, nueva_estacion.tolerancia_alerta_pct)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     db.add(nueva_estacion)
     db.commit()
     db.refresh(nueva_estacion)
@@ -332,12 +302,6 @@ def actualizar_estacion(
 
     update_data = payload.model_dump(exclude_unset=True)
     for key, value in update_data.items(): setattr(estacion_db, key, value)
-
-    try:
-        validar_orden_lento_alerta(estacion_db.umbral_lento, estacion_db.umbral_alerta)
-        validar_orden_lento_alerta(estacion_db.tolerancia_lento_pct, estacion_db.tolerancia_alerta_pct)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
     db.add(estacion_db)
     db.commit()
@@ -536,7 +500,8 @@ async def importar_skus_csv(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia)
 ):
-    """Importa o actualiza el Maestro de SKUs desde un CSV (codigo_sku, descripcion, tiempo_ciclo_teorico)."""
+    """Importa o actualiza el Maestro de SKUs desde un CSV (codigo_sku, descripcion,
+    tiempo_ideal_seg -- + tiempo_lento_seg/tiempo_alerta_seg opcionales, Fase AC)."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Debe ser un archivo CSV")
 
@@ -555,12 +520,24 @@ async def importar_skus_csv(
                 status_code=400,
                 detail=f"El archivo tiene {len(df)} filas; el máximo soportado por carga es {MAX_FILAS_IMPORT_ERP}.",
             )
-        requeridos = {'codigo_sku', 'descripcion', 'tiempo_ciclo_teorico'}
+        requeridos = {'codigo_sku', 'descripcion', 'tiempo_ideal_seg'}
         if not requeridos.issubset(df.columns):
             raise ValueError(f"Faltan columnas requeridas: {requeridos - set(df.columns)}")
+        # Fase AC: lento/alerta son opcionales -- un SKU sin los dos
+        # (perfil incompleto) cae al piso de Línea, no bloquea la carga.
+        tiene_lento = 'tiempo_lento_seg' in df.columns
+        tiene_alerta = 'tiempo_alerta_seg' in df.columns
 
         skus_procesados = 0
         for _, row in df.iterrows():
+            tiempo_ideal = float(row['tiempo_ideal_seg'])
+            tiempo_lento = float(row['tiempo_lento_seg']) if tiene_lento and not pd.isna(row['tiempo_lento_seg']) else None
+            tiempo_alerta = float(row['tiempo_alerta_seg']) if tiene_alerta and not pd.isna(row['tiempo_alerta_seg']) else None
+            try:
+                validar_perfil_tiempos(tiempo_ideal, tiempo_lento, tiempo_alerta)
+            except ValueError as e:
+                raise ValueError(f"SKU '{row['codigo_sku']}': {e}")
+
             sku_db = db.exec(select(MaestroSKU).where(
                 MaestroSKU.codigo_sku == str(row['codigo_sku']),
                 MaestroSKU.tenant_id == context.tenant_id
@@ -568,13 +545,17 @@ async def importar_skus_csv(
 
             if sku_db:
                 sku_db.descripcion = str(row['descripcion'])
-                sku_db.tiempo_ciclo_teorico = float(row['tiempo_ciclo_teorico'])
+                sku_db.tiempo_ideal_seg = tiempo_ideal
+                sku_db.tiempo_lento_seg = tiempo_lento
+                sku_db.tiempo_alerta_seg = tiempo_alerta
             else:
                 nuevo_sku = MaestroSKU(
                     tenant_id=context.tenant_id,
                     codigo_sku=str(row['codigo_sku']),
                     descripcion=str(row['descripcion']),
-                    tiempo_ciclo_teorico=float(row['tiempo_ciclo_teorico'])
+                    tiempo_ideal_seg=tiempo_ideal,
+                    tiempo_lento_seg=tiempo_lento,
+                    tiempo_alerta_seg=tiempo_alerta,
                 )
                 db.add(nuevo_sku)
             skus_procesados += 1
@@ -623,6 +604,14 @@ def obtener_sku(
 class MaestroSKUUpdate(BaseModel):
     activo: Optional[bool] = None
     descripcion: Optional[str] = None
+    # Fase AC: gap real preexistente -- este PATCH no permitía editar el
+    # perfil de tiempos del SKU (sólo existía el alta con tiempo_ideal_seg
+    # fijo, y bulk-CSV para pisarlo todo junto). tiempo_lento_seg/alerta_seg
+    # en None explícito es un estado válido: perfil incompleto, cae al
+    # piso de Línea (ver clasificacion.resolver_umbrales_evento).
+    tiempo_ideal_seg: Optional[float] = None
+    tiempo_lento_seg: Optional[float] = None
+    tiempo_alerta_seg: Optional[float] = None
 
 
 @router.patch("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
@@ -633,19 +622,20 @@ def actualizar_sku(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
-    # Bug real (encontrado en uso): activo/descripcion eran parámetros
-    # sueltos (no envueltos en un BaseModel) -- FastAPI los interpreta
-    # como QUERY PARAMS por default, no como el body JSON que manda el
-    # front (`apiPatch(url, {descripcion, activo})`). El endpoint
-    # devolvía 200 sin error, pero activo/descripcion siempre llegaban
-    # None -- activar/desactivar un SKU no hacía nada, en silencio.
     sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo_sku, MaestroSKU.tenant_id == context.tenant_id)).first()
     if not sku:
         raise HTTPException(status_code=404, detail="SKU no encontrado.")
-    if payload.activo is not None:
-        sku.activo = payload.activo
-    if payload.descripcion is not None:
-        sku.descripcion = payload.descripcion
+    # exclude_unset (no el chequeo manual "is not None" que tenía antes
+    # este endpoint): así un cliente puede mandar tiempo_lento_seg=null
+    # a propósito para BORRAR un perfil mal cargado y volver a heredar
+    # de Línea, distinguido de "no mandé ese campo, no lo toques".
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(sku, key, value)
+    try:
+        validar_perfil_tiempos(sku.tiempo_ideal_seg, sku.tiempo_lento_seg, sku.tiempo_alerta_seg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.add(sku)
     db.commit()
     db.refresh(sku)
@@ -659,7 +649,12 @@ def actualizar_sku(
 class MaestroSKUCreate(BaseModel):
     codigo_sku: str
     descripcion: str
-    tiempo_ciclo_teorico: float = 240.0
+    tiempo_ideal_seg: float = 240.0
+    # Fase AC: opcionales -- un SKU nuevo puede cargarse sólo con su
+    # tiempo ideal (perfil incompleto, clasifica con el piso de Línea
+    # hasta que alguien complete lento/alerta).
+    tiempo_lento_seg: Optional[float] = None
+    tiempo_alerta_seg: Optional[float] = None
     unidades_por_ciclo: int = 1
     linea_id: Optional[uuid.UUID] = None
 
@@ -689,6 +684,11 @@ def crear_sku(
         if not linea:
             raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
 
+    try:
+        validar_perfil_tiempos(payload.tiempo_ideal_seg, payload.tiempo_lento_seg, payload.tiempo_alerta_seg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     nuevo = MaestroSKU(tenant_id=context.tenant_id, **payload.model_dump())
     db.add(nuevo)
     db.commit()
@@ -697,20 +697,25 @@ def crear_sku(
 
 
 # ==========================================
-# ⏱️ TIEMPO IDEAL POR SKU × ESTACIÓN (Fase R)
-# MaestroSKU.tiempo_ciclo_teorico es un único valor genérico por SKU, pero
-# un mismo SKU puede tardar distinto según qué estación lo procesa. Esta
-# tabla es un override OPCIONAL por (SKU, Estación) -- si no hay fila acá,
-# scans.py cae al tiempo_ciclo_teorico genérico del SKU (no bloquea nada,
-# sólo hace falta cargar el override donde realmente difiera).
+# ⏱️ TIEMPO IDEAL POR SKU × ESTACIÓN (Fase R, perfil completo desde Fase AC)
+# MaestroSKU.tiempo_ideal_seg (+ lento/alerta) es un perfil genérico por
+# SKU, pero un mismo SKU puede tardar distinto según qué estación lo
+# procesa. Esta tabla es un override OPCIONAL por (SKU, Estación) -- si
+# no hay fila acá, scans.py cae al perfil genérico del SKU (o al piso de
+# Línea si ese también está incompleto). Los 3 campos son obligatorios
+# acá: un override, si existe, siempre está completo (ver domain.py).
 # ==========================================
 class SkuTiempoEstacionCreate(BaseModel):
     estacion_id: uuid.UUID
-    tiempo_ciclo_teorico: float
+    tiempo_ideal_seg: float
+    tiempo_lento_seg: float
+    tiempo_alerta_seg: float
 
 
 class SkuTiempoEstacionUpdate(BaseModel):
-    tiempo_ciclo_teorico: Optional[float] = None
+    tiempo_ideal_seg: Optional[float] = None
+    tiempo_lento_seg: Optional[float] = None
+    tiempo_alerta_seg: Optional[float] = None
     activo: Optional[bool] = None
 
 
@@ -752,9 +757,15 @@ def crear_tiempo_sku_estacion(
             ),
         )
 
+    try:
+        validar_perfil_tiempos(payload.tiempo_ideal_seg, payload.tiempo_lento_seg, payload.tiempo_alerta_seg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     nuevo = SkuTiempoEstacion(
         tenant_id=context.tenant_id, sku_fk=codigo_sku,
-        estacion_id=payload.estacion_id, tiempo_ciclo_teorico=payload.tiempo_ciclo_teorico,
+        estacion_id=payload.estacion_id, tiempo_ideal_seg=payload.tiempo_ideal_seg,
+        tiempo_lento_seg=payload.tiempo_lento_seg, tiempo_alerta_seg=payload.tiempo_alerta_seg,
     )
     db.add(nuevo)
     db.commit()
@@ -805,6 +816,16 @@ def actualizar_tiempo_sku_estacion(
     datos = payload.model_dump(exclude_unset=True)
     for key, value in datos.items():
         setattr(registro, key, value)
+    # Fase AC: a diferencia del perfil de SKU genérico, un override
+    # SKU×Estación no puede quedar incompleto -- si un PATCH intentara
+    # dejar algún campo en None (columna NOT NULL), es más claro
+    # devolver 400 acá que dejar que explote el commit por IntegrityError.
+    if registro.tiempo_ideal_seg is None or registro.tiempo_lento_seg is None or registro.tiempo_alerta_seg is None:
+        raise HTTPException(status_code=400, detail="El override SKU×Estación no puede quedar con campos vacíos -- desactivalo (activo=false) en vez de vaciarlo, o borrá y recreá con el perfil completo.")
+    try:
+        validar_perfil_tiempos(registro.tiempo_ideal_seg, registro.tiempo_lento_seg, registro.tiempo_alerta_seg)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.add(registro)
     db.commit()
     db.refresh(registro)

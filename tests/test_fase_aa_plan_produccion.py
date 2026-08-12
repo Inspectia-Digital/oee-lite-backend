@@ -32,10 +32,15 @@ def _preparar_escenario(db, tenant_id):
     return planta, linea, estacion
 
 
-def _crear_sku(db, tenant_id, tiempo_ciclo_teorico=10.0):
+def _crear_sku(db, tenant_id, tiempo_ideal_seg=10.0):
+    # Fase AC: perfil completo (no sólo ideal) -- si faltara lento/alerta
+    # el SKU cae al piso de Línea, y estos tests verifican justamente que
+    # se usa EL IDEAL DE ESTE SKU puntual (ver evento.tiempo_ideal_seg).
     sku = MaestroSKU(
         tenant_id=tenant_id, codigo_sku=f"SKU-{uuid.uuid4().hex[:8]}",
-        descripcion="SKU de prueba", tiempo_ciclo_teorico=tiempo_ciclo_teorico, unidades_por_ciclo=1,
+        descripcion="SKU de prueba", tiempo_ideal_seg=tiempo_ideal_seg,
+        tiempo_lento_seg=tiempo_ideal_seg + 5, tiempo_alerta_seg=tiempo_ideal_seg + 10,
+        unidades_por_ciclo=1,
     )
     db.add(sku)
     db.commit()
@@ -121,8 +126,8 @@ def test_listar_planes_filtra_por_linea(client, db, tenant_a, gerente_a):
 # ---------- avanzar_orden ----------
 
 def _crear_plan_con_dos_ordenes(client, db, tenant_id, planta, linea, headers):
-    sku1 = _crear_sku(db, tenant_id, tiempo_ciclo_teorico=10.0)
-    sku2 = _crear_sku(db, tenant_id, tiempo_ciclo_teorico=20.0)
+    sku1 = _crear_sku(db, tenant_id, tiempo_ideal_seg=10.0)
+    sku2 = _crear_sku(db, tenant_id, tiempo_ideal_seg=20.0)
     plan = client.post(
         "/config/planes/", json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat()}, headers=headers,
     ).json()
@@ -267,7 +272,7 @@ def test_scans_usa_la_orden_activa_del_plan_no_el_heuristico_en_progreso(client,
     from app.models.domain import OrdenProduccion
     orden_ajena = OrdenProduccion(
         tenant_id=tenant_a, id_orden=f"OP-AJENA-{uuid.uuid4().hex[:6]}", linea_id=linea.id,
-        estado=EstadoOrden.EN_PROGRESO, sku_fk=_crear_sku(db, tenant_a, tiempo_ciclo_teorico=999.0).codigo_sku,
+        estado=EstadoOrden.EN_PROGRESO, sku_fk=_crear_sku(db, tenant_a, tiempo_ideal_seg=999.0).codigo_sku,
     )
     db.add(orden_ajena)
     db.commit()
@@ -328,7 +333,7 @@ def test_linea_sin_plan_sigue_con_el_heuristico_de_siempre(client, db, tenant_a,
     """Retrocompatibilidad explícita: una línea que nunca crea un Plan no
     ve NINGÚN cambio de comportamiento -- Plan es opcional."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    sku = _crear_sku(db, tenant_a, tiempo_ciclo_teorico=15.0)
+    sku = _crear_sku(db, tenant_a, tiempo_ideal_seg=15.0)
     from app.models.domain import OrdenProduccion
     orden = OrdenProduccion(
         tenant_id=tenant_a, id_orden=f"OP-SOLA-{uuid.uuid4().hex[:6]}", linea_id=linea.id,

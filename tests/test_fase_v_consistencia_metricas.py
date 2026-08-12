@@ -18,29 +18,62 @@ de los desagregados por estación tiene que reconstruir el total agregado
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.models.domain import Estacion, Linea, Planta
+from app.models.domain import Estacion, EstadoOrden, Linea, MaestroSKU, OrdenProduccion, Planta
 from tests.conftest import autenticar_como
 
 
 def _crear_planta_linea_estacion(db, tenant_id, nombre_sufijo, posicion_linea=1, **kwargs_estacion):
+    # Fase AC: no hay más umbral_optimo/lento/alerta en Estación -- con
+    # una sola estación por línea, el piso de Línea hace exactamente el
+    # mismo papel que antes hacía el umbral de la estación (nadie más
+    # comparte esa línea, así que no hay ambigüedad).
     planta = Planta(tenant_id=tenant_id, nombre=f"Planta V{nombre_sufijo}")
     db.add(planta)
     db.commit()
     db.refresh(planta)
-    linea = Linea(tenant_id=tenant_id, planta_id=planta.id, nombre=f"Línea V{nombre_sufijo}")
+    linea = Linea(
+        tenant_id=tenant_id, planta_id=planta.id, nombre=f"Línea V{nombre_sufijo}",
+        tiempo_ideal_seg=100, tiempo_lento_seg=150, tiempo_alerta_seg=200,
+    )
     db.add(linea)
     db.commit()
     db.refresh(linea)
     estacion = Estacion(
         tenant_id=tenant_id, nombre=f"Estación V{nombre_sufijo}", tipo="sensor", linea_id=linea.id,
         activa=True, posicion_linea=posicion_linea,
-        umbral_optimo=100, umbral_lento=150, umbral_alerta=200,
         **kwargs_estacion,
     )
     db.add(estacion)
     db.commit()
     db.refresh(estacion)
     return planta, linea, estacion
+
+
+def _abrir_orden_con_sku(db, tenant_id, linea_id, tiempo_ideal_seg, tiempo_lento_seg, tiempo_alerta_seg):
+    """Perfil de tiempos vía SKU activo -- para poder darle a dos
+    estaciones de la MISMA línea umbrales distintos (Fase AC: Estación ya
+    no tiene un umbral propio, sólo Línea o un SKU resuelto)."""
+    sku = MaestroSKU(
+        tenant_id=tenant_id, codigo_sku=f"SKU-{uuid.uuid4().hex[:8]}",
+        descripcion="SKU de prueba V", tiempo_ideal_seg=tiempo_ideal_seg,
+        tiempo_lento_seg=tiempo_lento_seg, tiempo_alerta_seg=tiempo_alerta_seg, unidades_por_ciclo=1,
+    )
+    db.add(sku)
+    db.commit()
+    orden = OrdenProduccion(
+        tenant_id=tenant_id, id_orden=f"OP-{uuid.uuid4().hex[:8]}", linea_id=linea_id,
+        estado=EstadoOrden.EN_PROGRESO, sku_fk=sku.codigo_sku,
+    )
+    db.add(orden)
+    db.commit()
+    db.refresh(orden)
+    return orden, sku
+
+
+def _cerrar_orden(db, orden):
+    orden.estado = EstadoOrden.CERRADA
+    db.add(orden)
+    db.commit()
 
 
 def _emitir_credencial(client, gerente, estacion_id):
@@ -62,8 +95,8 @@ def _postear_evento(client, credencial, estacion_id, ts):
 
 def _cargar_secuencia_estandar(client, credencial, estacion_id, inicio):
     """3 eventos: 1ro OPTIMO (delta=0), 2do LENTO (delta=170s, entre
-    umbral_lento=150 y umbral_alerta=200), 3ro ALERTA (delta=250s, > 200).
-    Con tiempo_ideal_seg=100 (umbral_optimo) en los tres:
+    tiempo_lento_seg=150 y tiempo_alerta_seg=200), 3ro ALERTA (delta=250s, > 200).
+    Con tiempo_ideal_seg=100 en los tres:
     ideal_total=300, lentitud=170-100=70 -> rendimiento=300/370=81.081...%
     -> 81.1; desvio_pct=70/300*100=23.333...->23.3."""
     ts1 = inicio
@@ -120,14 +153,8 @@ def test_multiples_estaciones_la_suma_de_lo_desagregado_reconstruye_el_agregado(
     db.add(linea)
     db.commit()
     db.refresh(linea)
-    est1 = Estacion(
-        tenant_id=tenant_a, nombre="Est V-multi 1", tipo="sensor", linea_id=linea.id,
-        activa=True, posicion_linea=1, umbral_optimo=100, umbral_lento=150, umbral_alerta=200,
-    )
-    est2 = Estacion(
-        tenant_id=tenant_a, nombre="Est V-multi 2", tipo="sensor", linea_id=linea.id,
-        activa=True, posicion_linea=2, umbral_optimo=50, umbral_lento=80, umbral_alerta=120,
-    )
+    est1 = Estacion(tenant_id=tenant_a, nombre="Est V-multi 1", tipo="sensor", linea_id=linea.id, activa=True, posicion_linea=1)
+    est2 = Estacion(tenant_id=tenant_a, nombre="Est V-multi 2", tipo="sensor", linea_id=linea.id, activa=True, posicion_linea=2)
     db.add(est1)
     db.add(est2)
     db.commit()
@@ -137,11 +164,19 @@ def test_multiples_estaciones_la_suma_de_lo_desagregado_reconstruye_el_agregado(
     cred1 = _emitir_credencial(client, gerente_a, est1.id)
     cred2 = _emitir_credencial(client, gerente_a, est2.id)
 
+    # Fase AC: Estación ya no tiene umbral propio -- dos estaciones de la
+    # MISMA línea con perfiles distintos sólo se logran vía SKU activo
+    # (Línea es un piso único, compartido). Se abre un SKU/orden, se
+    # postean los eventos de esa estación, se cierra, se abre el otro.
+    orden1, _ = _abrir_orden_con_sku(db, tenant_a, linea.id, 100, 150, 200)
     ahora = datetime.now(timezone.utc) - timedelta(hours=1)
     # Est 1: misma secuencia estándar -> ideal=300, lentitud=70.
     _cargar_secuencia_estandar(client, cred1, est1.id, ahora)
+    _cerrar_orden(db, orden1)
+
+    orden2, _ = _abrir_orden_con_sku(db, tenant_a, linea.id, 50, 80, 120)
     # Est 2: 2 eventos, ideal=50 c/u -> ideal_total=100. 1ro OPTIMO (delta=0).
-    # 2do LENTO (delta=90s > umbral_lento(80), <= umbral_alerta(120)) ->
+    # 2do LENTO (delta=90s > tiempo_lento_seg(80), <= tiempo_alerta_seg(120)) ->
     # lentitud=90-50=40.
     _postear_evento(client, cred2, est2.id, ahora)
     _postear_evento(client, cred2, est2.id, ahora + timedelta(seconds=90))

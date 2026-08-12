@@ -27,8 +27,6 @@ def seed_data():
                 id=SUPERADMIN_TENANT_ID,
                 nombre="InspectIA Platform Admin",
                 origen_maestros="MANUAL",
-                tolerancia_lento_pct=1.15,
-                tolerancia_alerta_pct=1.25
             )
             db.add(tenant_master)
             db.commit()
@@ -70,8 +68,6 @@ def seed_data():
                 id="springwall",
                 nombre="Springwall S.A.",
                 origen_maestros="MANUAL",
-                tolerancia_lento_pct=1.15,
-                tolerancia_alerta_pct=1.25
             )
             db.add(sw_tenant)
             db.commit()
@@ -111,8 +107,6 @@ def seed_data():
                 id="green_mills",
                 nombre="Green Mills S.A. (New Garden)",
                 origen_maestros="MANUAL",
-                tolerancia_lento_pct=1.20,
-                tolerancia_alerta_pct=1.30
             )
             db.add(gm_tenant)
             db.commit()

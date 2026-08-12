@@ -12,14 +12,16 @@ def _preparar_escenario(db, tenant_id):
     db.commit()
     db.refresh(planta)
 
-    linea = Linea(tenant_id=tenant_id, planta_id=planta.id, nombre="Línea I")
+    # Fase AC: el perfil de tiempos vive en Línea (Estación ya no tiene
+    # uno propio).
+    linea = Linea(tenant_id=tenant_id, planta_id=planta.id, nombre="Línea I", tiempo_ideal_seg=100)
     db.add(linea)
     db.commit()
     db.refresh(linea)
 
     estacion = Estacion(
         tenant_id=tenant_id, nombre="Estación I", tipo="sensor", linea_id=linea.id,
-        umbral_optimo=100, posicion_linea=1, activa=True,
+        posicion_linea=1, activa=True,
     )
     db.add(estacion)
     db.commit()
@@ -77,7 +79,7 @@ def test_cascada_etapas_decrecen_monotonicamente(client, db, tenant_a, gerente_a
 
 def test_rendimiento_secuencial_ordenado_por_posicion(client, db, tenant_a, gerente_a):
     planta, linea, estacion1 = _preparar_escenario(db, tenant_a)
-    estacion2 = Estacion(tenant_id=tenant_a, nombre="Estación I2", tipo="sensor", linea_id=linea.id, umbral_optimo=50, posicion_linea=2)
+    estacion2 = Estacion(tenant_id=tenant_a, nombre="Estación I2", tipo="sensor", linea_id=linea.id, posicion_linea=2)
     db.add(estacion2)
     db.commit()
     db.refresh(estacion2)
@@ -94,17 +96,13 @@ def test_rendimiento_secuencial_ordenado_por_posicion(client, db, tenant_a, gere
     assert [f["posicion_linea"] for f in filas] == sorted(f["posicion_linea"] for f in filas)
 
 
-def test_rendimiento_secuencial_no_rompe_si_estacion_no_tiene_umbral_optimo(client, db, tenant_a, gerente_a):
-    """Fase Q (ronda 3): objetivo usaba estacion.umbral_optimo directo --
-    Optional[int] desde Fase Q, podía romper la construcción del modelo
-    (RendimientoSecuencialRow.objetivo: float, requerido) con un 500
-    para cualquier estación sin umbral propio (el caso nuevo por
-    default). Ahora objetivo sale de tiempo_ideal_seg del evento, que
-    siempre tiene un valor numérico (default 0.0)."""
+def test_rendimiento_secuencial_no_rompe_sin_sku_activo(client, db, tenant_a, gerente_a):
+    """Fase AC: Estación ya no tiene ningún campo de umbral propio (antes
+    era Optional[int], podía romper la construcción del modelo con un
+    500 si quedaba None). Ahora, sin SKU resuelto, el evento cae al piso
+    de Línea -- que SIEMPRE tiene un valor (NOT NULL) -- así que el caso
+    "nada configurado por SKU" sigue devolviendo un objetivo numérico válido."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    estacion.umbral_optimo = None
-    db.add(estacion)
-    db.commit()
     credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
     _emitir_evento(client, credencial, estacion.id)
     _emitir_evento(client, credencial, estacion.id)  # 2do evento: el 1ro nunca tiene delta_t > 0
@@ -112,6 +110,7 @@ def test_rendimiento_secuencial_no_rompe_si_estacion_no_tiene_umbral_optimo(clie
     autenticar_como(gerente_a.id)
     r = client.get(f"/analytics/rendimiento-secuencial/?linea_id={linea.id}", headers={"X-Sub-Tenant-Id": str(planta.id)})
     assert r.status_code == 200
+    assert r.json()[0]["objetivo"] == 100.0  # Línea.tiempo_ideal_seg configurado en _preparar_escenario
 
 
 def test_rendimiento_secuencial_acepta_fecha_desde_fecha_hasta(client, db, tenant_a, gerente_a):
@@ -149,25 +148,29 @@ def test_rendimiento_secuencial_acepta_fecha_desde_fecha_hasta(client, db, tenan
 
 # ---------- cuellos-botella ----------
 
-def test_cuellos_botella_esperado_usa_snapshot_del_evento_no_el_umbral_de_estacion(client, db, tenant_a, gerente_a):
-    """Fase Q (ronda 3): "esperado" usaba estacion.umbral_optimo directo
-    -- desalineado del todo cuando el evento resuelve un SKU (tiempo_ideal_seg
-    pasa a ser el tiempo_ciclo_teorico del SKU, no el umbral de la
-    estación -- ver scans.py). Acá la estación tiene un umbral propio
-    deliberadamente DISTINTO del ciclo ideal del SKU, para probar que el
-    endpoint usa el snapshot del evento, no el umbral de estación."""
+def test_cuellos_botella_esperado_usa_snapshot_del_evento_no_el_piso_de_linea(client, db, tenant_a, gerente_a):
+    """Fase Q (ronda 3), reformulado en Fase AC: "esperado" usaba
+    estacion.umbral_optimo directo -- desalineado del todo cuando el
+    evento resuelve un SKU (tiempo_ideal_seg pasa a ser el ideal del SKU,
+    no el piso de la línea -- ver scans.py). Acá la LÍNEA tiene un piso
+    deliberadamente DISTINTO del ciclo ideal del SKU (que sí tiene perfil
+    completo), para probar que el endpoint usa el snapshot del evento,
+    no el piso de línea."""
     from app.models.domain import EstadoOrden, MaestroSKU, OrdenProduccion
 
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    estacion.umbral_optimo = 999  # deliberadamente distinto -- no debería usarse
-    db.add(estacion)
+    linea.tiempo_ideal_seg, linea.tiempo_lento_seg, linea.tiempo_alerta_seg = 999, 1000, 1001  # deliberadamente distinto -- no debería usarse
+    db.add(linea)
 
     # codigo_sku/id_orden con sufijo random (Bug real encontrado corriendo
     # la suite dos veces seguidas contra el mismo Postgres persistente:
     # codigo_sku sigue siendo PK legacy global -- ver nota C1/C2 en
     # MaestroSKU -- un literal fijo choca en la segunda corrida).
     codigo_sku = f"SKU-CB-{uuid.uuid4().hex[:8]}"
-    sku = MaestroSKU(tenant_id=tenant_a, codigo_sku=codigo_sku, descripcion="Test", tiempo_ciclo_teorico=20.0)
+    sku = MaestroSKU(
+        tenant_id=tenant_a, codigo_sku=codigo_sku, descripcion="Test",
+        tiempo_ideal_seg=20.0, tiempo_lento_seg=25.0, tiempo_alerta_seg=30.0,
+    )
     db.add(sku)
     db.commit()
     orden = OrdenProduccion(tenant_id=tenant_a, id_orden=f"OP-CB-{uuid.uuid4().hex[:8]}", linea_id=linea.id, estado=EstadoOrden.EN_PROGRESO, sku_fk=sku.codigo_sku)
@@ -196,19 +199,16 @@ def test_cuellos_botella_esperado_usa_snapshot_del_evento_no_el_umbral_de_estaci
     assert r.status_code == 200
     filas = r.json()
     assert len(filas) == 1
-    # tiempo_ideal_seg del 2do evento = 20.0 (tiempo_ciclo_teorico del SKU,
-    # unidades_procesadas=1) -- nunca 999 (el umbral de la estación).
+    # tiempo_ideal_seg del 2do evento = 20.0 (ideal del SKU, unidades_procesadas=1)
+    # -- nunca 999 (el piso de línea).
     assert filas[0]["tiempo_esperado_seg"] == 20.0
 
 
-def test_cuellos_botella_no_rompe_si_estacion_no_tiene_umbral_optimo(client, db, tenant_a, gerente_a):
-    """Contraparte station-only (sin SKU/orden) del test anterior: antes
-    de este fix, estacion.umbral_optimo=None rompía la construcción del
-    modelo (CuelloBotella.tiempo_esperado_seg: float, requerido)."""
+def test_cuellos_botella_no_rompe_sin_sku_activo(client, db, tenant_a, gerente_a):
+    """Contraparte sin SKU/orden del test anterior -- confirma que el piso
+    de Línea (siempre NOT NULL, Fase AC) resuelve un tiempo_esperado_seg
+    numérico válido sin necesitar ningún dato adicional."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    estacion.umbral_optimo = None
-    db.add(estacion)
-    db.commit()
     credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
     _emitir_evento(client, credencial, estacion.id)
     _emitir_evento(client, credencial, estacion.id)

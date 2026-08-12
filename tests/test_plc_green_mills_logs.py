@@ -27,22 +27,26 @@ FIXTURES = Path(__file__).parent / "fixtures" / "plc_green_mills"
 
 
 def _preparar_armadora_de_pan(db, tenant_id):
-    """Umbrales calcados de las anotaciones del propio log-3
-    (>15s = LENTO, >60s = ALERTA/parada) -- así el test valida
-    exactamente el escenario que Green Mills diseñó."""
+    """Perfil de tiempos (Línea, Fase AC) calcado de las anotaciones del
+    propio log-3 (>15s = LENTO, >60s = ALERTA/parada) -- así el test
+    valida exactamente el escenario que Green Mills diseñó."""
     planta = Planta(tenant_id=tenant_id, nombre="Planta Armadora de Pan")
     db.add(planta)
     db.commit()
     db.refresh(planta)
 
-    linea = Linea(tenant_id=tenant_id, planta_id=planta.id, nombre="Armadora", tipo_produccion=TipoProduccion.POR_LOTES)
+    # Fase AC: el perfil de tiempos vive en Línea (Estación ya no tiene
+    # uno propio).
+    linea = Linea(
+        tenant_id=tenant_id, planta_id=planta.id, nombre="Armadora", tipo_produccion=TipoProduccion.POR_LOTES,
+        tiempo_ideal_seg=10, tiempo_lento_seg=15, tiempo_alerta_seg=60,
+    )
     db.add(linea)
     db.commit()
     db.refresh(linea)
 
     estacion = Estacion(
-        tenant_id=tenant_id, nombre="PLC Siemens LOGO!", tipo="sensor", linea_id=linea.id,
-        umbral_optimo=10, umbral_lento=15, umbral_alerta=60, activa=True,
+        tenant_id=tenant_id, nombre="PLC Siemens LOGO!", tipo="sensor", linea_id=linea.id, activa=True,
     )
     db.add(estacion)
     db.commit()
@@ -89,7 +93,7 @@ def test_parser_reconoce_todas_las_lecturas_de_los_tres_logs():
 
 def test_log3_clasifica_micro_retraso_como_lento_sin_generar_parada(client, db, tenant_a, gerente_a):
     """El hueco de 30s ("MICRO-RETRASO (CICLO LENTO > 15s)" en el propio
-    log) supera umbral_lento(15) pero no umbral_alerta(60): debe
+    log) supera tiempo_lento_seg(15) pero no tiempo_alerta_seg(60): debe
     clasificar LENTO y NO debe abrir ninguna ParadaDetectada."""
     planta, linea, estacion = _preparar_armadora_de_pan(db, tenant_a)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
@@ -108,8 +112,8 @@ def test_log3_clasifica_micro_retraso_como_lento_sin_generar_parada(client, db, 
 
 def test_log3_clasifica_parada_mayor_como_alerta_y_abre_una_parada_detectada(client, db, tenant_a, gerente_a):
     """El hueco de 240s ("PARADA MAYOR (HUECO > 60s)") supera
-    umbral_alerta(60): debe abrir exactamente una ParadaDetectada, con
-    duracion_segundos = delta - umbral_alerta = 240 - 60 = 180 (sólo el
+    tiempo_alerta_seg(60): debe abrir exactamente una ParadaDetectada, con
+    duracion_segundos = delta - tiempo_alerta_seg = 240 - 60 = 180 (sólo el
     EXCEDENTE sobre la tolerancia cuenta como tiempo perdido, regla de
     Fase E2 -- nunca el hueco completo)."""
     planta, linea, estacion = _preparar_armadora_de_pan(db, tenant_a)

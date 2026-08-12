@@ -1,85 +1,80 @@
-"""Resolución de tiempo ideal y tolerancia para clasificar un evento
-OPTIMO/LENTO/ALERTA (Fase S).
+"""Resolución de tiempo ideal y umbrales para clasificar un evento
+OPTIMO/LENTO/ALERTA (Fase S, rediseñado en Fase AC).
 
 Extraído de scans.py -- antes esta lógica vivía inline en
 registrar_escaneo_rapido() y sólo corría en el momento del ping. Fase S
 necesita la MISMA lógica, con los MISMOS resultados, para poder
 recomputar eventos ya persistidos con la config vigente (ver
 app/routers/recomputo.py) -- de ahí que se factoree acá en vez de
-reimplementarla: cualquier cambio a las cascadas de herencia (Fase Q/R)
-tiene que aplicar igual a la ingesta en vivo y al recompute, nunca una
-sola de las dos.
+reimplementarla: cualquier cambio a la cascada de resolución tiene que
+aplicar igual a la ingesta en vivo y al recompute, nunca una sola de
+las dos.
+
+Fase AC (pedido explícito de Green Mills tras usar el sistema): el
+modelo de Fases Q/R -- 5 campos en Estación, 5 en Línea, 2 en Tenant,
+mezclando segundos y porcentaje según si el evento resolvía SKU o no --
+resultó "desprolijo, difícil de entender, propenso a errores". Se
+reemplaza por UN solo concepto en TODA la cascada: un "perfil de
+tiempos" son siempre 3 números en segundos (ideal, lento, alerta), que
+viajan juntos. Nunca porcentaje, nunca un campo suelto. La cascada
+pasa de 4 niveles (Estación/Línea/Tenant + rama SKU aparte) a 3, todos
+resolviendo el mismo perfil de 3 campos:
+
+    SKU × Estación  (override puntual, opcional, SIEMPRE completo)
+        -> SKU genérico  (MaestroSKU, opcional -- incompleto = ausente)
+            -> Línea  (piso obligatorio, siempre completo)
+
+Estación y Empresa/Tenant dejan de ser niveles de la cascada. Estación
+sigue existiendo como parte de la CLAVE del override más específico
+(SKU×Estación), pero no tiene un perfil propio independiente de un SKU.
 """
 from dataclasses import dataclass
 from typing import Optional
 
 from sqlmodel import Session, select
 
-from app.models.domain import (
-    Estacion, EstadoOrden, EstadoPlan, Linea, MaestroSKU, OrdenProduccion,
-    PlanProduccion, SkuTiempoEstacion, Tenant,
-)
-
-# Fase Q: default de sistema cuando ni la Estación ni su Línea configuraron
-# umbrales -- son los mismos valores que antes eran el default duro de
-# Estacion.umbral_optimo/lento/alerta (240/280/300).
-UMBRAL_OPTIMO_DEFAULT_SISTEMA = 240
-UMBRAL_LENTO_DEFAULT_SISTEMA = 280
-UMBRAL_ALERTA_DEFAULT_SISTEMA = 300
+from app.models.domain import Estacion, EstadoOrden, EstadoPlan, Linea, MaestroSKU, OrdenProduccion, PlanProduccion, SkuTiempoEstacion
 
 
-def resolver_umbral(valor_estacion: Optional[int], valor_linea: Optional[int], default_sistema: int) -> int:
-    """Cadena de herencia Estación > Línea > default de sistema (Fase Q)."""
-    if valor_estacion is not None:
-        return valor_estacion
-    if valor_linea is not None:
-        return valor_linea
-    return default_sistema
+def validar_perfil_tiempos(ideal: float, lento: Optional[float], alerta: Optional[float]) -> None:
+    """Fase AC (generaliza validar_orden_lento_alerta de Fase AB): un
+    perfil de tiempos válido cumple ideal <= lento < alerta. Sólo valida
+    cuando lento Y alerta están los dos presentes -- un perfil con sólo
+    uno de los dos cargado es un perfil INCOMPLETO (ver
+    resolver_umbrales_evento), no uno inválido; no bloquea la carga
+    parcial, sólo ataja números concretos que quedaron mal cargados.
 
-
-def resolver_tolerancia(valor_estacion: Optional[float], valor_linea: Optional[float], default_tenant: float) -> float:
-    """Misma cascada que resolver_umbral (Estación > Línea > default),
-    separada porque acá el default no es una constante de sistema sino
-    Tenant.tolerancia_lento_pct/alerta_pct (float, Fase R)."""
-    if valor_estacion is not None:
-        return valor_estacion
-    if valor_linea is not None:
-        return valor_linea
-    return default_tenant
-
-
-def validar_orden_lento_alerta(lento: Optional[float], alerta: Optional[float]) -> None:
-    """Fase AB (hallazgo real revisando la cascada completa de umbrales/
-    tolerancias a pedido de Green Mills): ni Linea/Estacion (Create y
-    Update) ni Tenant (PATCH /mi-empresa/tenant) validaban que 'lento'
-    fuera menor que 'alerta' -- ni en el schema Pydantic ni en el
-    endpoint. Si quedan invertidos (ej. umbral_lento=300, umbral_alerta=
-    200, o tolerancia_lento_pct=0.30 > tolerancia_alerta_pct=0.15),
+    Sin este chequeo, si alerta queda <= lento (ej. tipeo invertido),
     scans.py evalúa "delta_t > t_alerta" ANTES que "delta_t > t_lento"
-    (ver clasificacion.py / registrar_escaneo_rapido): con alerta más
-    chico que lento, todo lo que supera el umbral de lento YA superó
-    antes el de alerta -- el nivel LENTO queda matemáticamente
-    inalcanzable, en silencio, sin ningún error. La estación parece
-    saltar directo de "óptimo" a "alerta" y nadie se entera de por qué.
-
-    Sólo valida cuando LOS DOS están definidos como valores concretos en
-    la misma fila (no intenta resolver la cascada de herencia completa
-    Estación/Línea/Tenant en el momento de guardar) -- eso alcanza para
-    atajar el error real de tipeo/carga sin tener que reconstruir toda
-    la resolución en el momento del PATCH."""
-    if lento is not None and alerta is not None and lento >= alerta:
+    (ver más abajo / registrar_escaneo_rapido en scans.py): el nivel
+    LENTO queda matemáticamente inalcanzable, en silencio -- la estación
+    parece saltar directo de OPTIMO a ALERTA y nadie se entera de por qué.
+    Este bug fue real en producción (Fase AB) antes de existir este chequeo."""
+    if lento is None or alerta is None:
+        return
+    if ideal > lento:
         raise ValueError(
-            f"El valor de 'lento' ({lento}) tiene que ser menor que el de 'alerta' ({alerta}) -- "
+            f"El tiempo 'ideal' ({ideal}s) no puede ser mayor que 'lento' ({lento}s) -- "
+            "un ciclo a ritmo ideal tiene que clasificar OPTIMO, nunca LENTO."
+        )
+    if lento >= alerta:
+        raise ValueError(
+            f"El tiempo 'lento' ({lento}s) tiene que ser menor que 'alerta' ({alerta}s) -- "
             "si no, el nivel LENTO nunca se alcanza (todo lo que supera 'lento' ya superó 'alerta' antes)."
         )
 
 
 @dataclass
 class UmbralesResueltos:
-    """Resultado de resolver_umbrales_evento(): todo lo que hace falta
-    para clasificar UN evento (t_optimo/t_lento/t_alerta) y, si el
-    evento resolvió un SKU, el tiempo ideal de UN ciclo completo (ya
-    multiplicado por las unidades del evento) para el cap de Rendimiento."""
+    """Resultado de resolver_umbrales_evento() para UN evento.
+
+    t_optimo es el ideal POR UNIDAD, sin escalar -- así lo consume
+    scans.py para el snapshot inmutable LiteEventoProduccion.tiempo_ideal_seg
+    (Rendimiento se calcula aguas abajo como tiempo_ideal_seg *
+    unidades_procesadas, ver analytics.py). t_lento/t_alerta y
+    tiempo_ideal_por_ciclo SÍ vienen escalados por las unidades de ESTE
+    evento -- son los umbrales absolutos contra los que se compara
+    delta_t (segundos transcurridos desde el evento anterior)."""
     t_optimo: float
     t_lento: float
     t_alerta: float
@@ -87,34 +82,57 @@ class UmbralesResueltos:
     sku_resuelto: Optional[MaestroSKU]
 
 
+def _perfil_sku_completo(sku: MaestroSKU) -> Optional[tuple]:
+    """Un SKU siempre tiene tiempo_ideal_seg (default 240.0), pero eso
+    solo no alcanza para clasificar -- hace falta lento Y alerta. Si
+    falta cualquiera de los dos, el perfil se trata como AUSENTE (nunca
+    se mezcla el ideal del SKU con el lento/alerta de otra fuente)."""
+    if sku.tiempo_lento_seg is None or sku.tiempo_alerta_seg is None:
+        return None
+    return (sku.tiempo_ideal_seg, sku.tiempo_lento_seg, sku.tiempo_alerta_seg)
+
+
 def resolver_umbrales_evento(
     db: Session,
     tenant_id: str,
-    tenant_config: Optional[Tenant],
     estacion: Estacion,
     linea: Optional[Linea],
     sku_final: Optional[str],
     unidades_a_sumar: int,
 ) -> UmbralesResueltos:
-    """Misma resolución que la sección 2/2.b de scans.py, factoreada:
+    """Resuelve el perfil de tiempos (ideal, lento, alerta) para UN
+    evento, cascada SKU×Estación -> SKU -> Línea (Fase AC):
 
-    - Rama A (sin SKU resuelto): umbral_optimo/lento/alerta heredable
-      Estación > Línea > default de sistema (segundos absolutos).
-    - Rama B (con SKU resuelto): tiempo_ciclo_teorico del SKU, salvo que
-      exista un override en SkuTiempoEstacion para este (SKU, Estación)
-      puntual (Fase R); tolerancia % heredable Estación > Línea > Tenant.
-    """
-    t_optimo = resolver_umbral(estacion.umbral_optimo, linea.umbral_optimo if linea else None, UMBRAL_OPTIMO_DEFAULT_SISTEMA)
-    t_lento = resolver_umbral(estacion.umbral_lento, linea.umbral_lento if linea else None, UMBRAL_LENTO_DEFAULT_SISTEMA)
-    t_alerta = resolver_umbral(estacion.umbral_alerta, linea.umbral_alerta if linea else None, UMBRAL_ALERTA_DEFAULT_SISTEMA)
+    1. Si el evento resuelve un SKU y existe un override activo para
+       (SKU, Estación), se usa ese perfil completo (los 3 campos son
+       NOT NULL en SkuTiempoEstacion -- siempre está completo si existe).
+    2. Si no hay override pero el SKU tiene su propio perfil completo
+       (tiempo_lento_seg y tiempo_alerta_seg cargados), se usa ese.
+    3. En cualquier otro caso (sin SKU resuelto, o SKU con perfil
+       incompleto) se cae ENTERO al piso de Línea -- nunca se mezclan
+       campos de dos fuentes distintas para el mismo evento.
 
+    Escalado por unidades_a_sumar -- SÓLO cuando el perfil viene de un
+    SKU (con o sin override): ahí ideal/lento/alerta son "por unidad" en
+    un sentido real (un SKU define un ritmo de producción). El piso de
+    Línea, en cambio, es "por EVENTO/scan" -- exactamente el mismo
+    concepto que la vieja Rama A (Fase Q), que nunca escalaba. Regresión
+    real encontrada con datos de Green Mills (Fase AC, antes de shippear):
+    su ingesta PLC-ciega manda unidades_procesadas explícito (Fase P,
+    conteo edge-autoritativo) SIN resolver ningún SKU -- escalar el piso
+    de línea por esas unidades multiplicaba t_alerta x5, y una parada
+    real de 240s dejaba de detectarse. t_optimo tampoco se escala nunca
+    (se devuelve por unidad), porque scans.py lo persiste tal cual como
+    snapshot inmutable del evento."""
     sku_resuelto = None
+    perfil = None  # (ideal, lento, alerta) por unidad, o None si no hay perfil de SKU utilizable
+
     if sku_final:
         sku_resuelto = db.exec(
             select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_final, MaestroSKU.tenant_id == tenant_id)
         ).first()
         if sku_resuelto:
-            override_tiempo = db.exec(
+            override = db.exec(
                 select(SkuTiempoEstacion).where(
                     SkuTiempoEstacion.tenant_id == tenant_id,
                     SkuTiempoEstacion.sku_fk == sku_resuelto.codigo_sku,
@@ -122,29 +140,33 @@ def resolver_umbrales_evento(
                     SkuTiempoEstacion.activo == True,  # noqa: E712
                 )
             ).first()
-            tiempo_ciclo_efectivo = override_tiempo.tiempo_ciclo_teorico if override_tiempo else sku_resuelto.tiempo_ciclo_teorico
-            t_optimo = tiempo_ciclo_efectivo
+            if override:
+                perfil = (override.tiempo_ideal_seg, override.tiempo_lento_seg, override.tiempo_alerta_seg)
+            else:
+                perfil = _perfil_sku_completo(sku_resuelto)
 
-    if sku_resuelto:
-        tiempo_ideal_por_ciclo = t_optimo * unidades_a_sumar
-        tolerancia_lento_pct = resolver_tolerancia(
-            estacion.tolerancia_lento_pct,
-            linea.tolerancia_lento_pct if linea else None,
-            tenant_config.tolerancia_lento_pct if tenant_config else 1.15,
-        )
-        tolerancia_alerta_pct = resolver_tolerancia(
-            estacion.tolerancia_alerta_pct,
-            linea.tolerancia_alerta_pct if linea else None,
-            tenant_config.tolerancia_alerta_pct if tenant_config else 1.25,
-        )
-        t_lento = tiempo_ideal_por_ciclo * tolerancia_lento_pct
-        t_alerta = tiempo_ideal_por_ciclo * tolerancia_alerta_pct
+    if perfil is not None:
+        ideal, lento, alerta = perfil
+        factor = unidades_a_sumar
+    elif linea is not None:
+        ideal, lento, alerta = linea.tiempo_ideal_seg, linea.tiempo_lento_seg, linea.tiempo_alerta_seg
+        factor = 1  # piso de línea: umbral por EVENTO, no por unidad -- nunca se escala
     else:
-        tiempo_ideal_por_ciclo = t_optimo  # = umbral_optimo resuelto; usado en el cap de Rendimiento
+        # Defensivo: una estación sin línea asociada es un estado
+        # inconsistente que no debería darse en la práctica (Estacion.linea_id
+        # es obligatoria desde la migración C1). No hay ningún otro piso
+        # configurable por debajo de Línea -- este es el único lugar del
+        # sistema con un valor fijo, y sólo se alcanza si ese invariante
+        # se rompe.
+        ideal, lento, alerta = 240.0, 280.0, 300.0
+        factor = 1
 
     return UmbralesResueltos(
-        t_optimo=t_optimo, t_lento=t_lento, t_alerta=t_alerta,
-        tiempo_ideal_por_ciclo=tiempo_ideal_por_ciclo, sku_resuelto=sku_resuelto,
+        t_optimo=ideal,
+        t_lento=lento * factor,
+        t_alerta=alerta * factor,
+        tiempo_ideal_por_ciclo=ideal * factor,
+        sku_resuelto=sku_resuelto,
     )
 
 

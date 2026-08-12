@@ -28,9 +28,15 @@ def _preparar_escenario(db, tenant_id, tipo_produccion=TipoProduccion.POR_LOTES)
     db.commit()
     db.refresh(linea)
 
+    # Fase AC: el perfil de tiempos vive en Línea (Estación ya no tiene
+    # uno propio) -- se setea acá en vez de en Linea(...) de arriba para
+    # tocar el mínimo del resto de este archivo.
+    linea.tiempo_ideal_seg, linea.tiempo_lento_seg, linea.tiempo_alerta_seg = 10, 15, 25
+    db.add(linea)
+    db.commit()
+
     estacion = Estacion(
-        tenant_id=tenant_id, nombre="Armadora", tipo="sensor", linea_id=linea.id,
-        umbral_optimo=10, umbral_lento=15, umbral_alerta=25, activa=True,
+        tenant_id=tenant_id, nombre="Armadora", tipo="sensor", linea_id=linea.id, activa=True,
     )
     db.add(estacion)
     db.commit()
@@ -194,16 +200,20 @@ def test_codigo_pieza_regex_sigue_teniendo_prioridad_sobre_la_orden_en_progreso(
 def test_por_lotes_umbral_de_parada_es_por_ciclo_no_por_unidad(client, db, tenant_a, gerente_a):
     """Bug real encontrado al preparar la carga de Green Mills: delta_t
     (tiempo entre EVENTOS/bandejas consecutivas) se comparaba contra un
-    umbral derivado de tiempo_ciclo_teorico SIN escalar por
-    unidades_por_ciclo -- ese campo es "segundos ideales POR UNIDAD"
-    (ver MaestroSKU.tiempo_ciclo_teorico), así que compararlo tal cual
-    contra delta_t (que mide tiempo por CICLO) marcaba cada bandeja normal
-    como una parada grande. Nunca se detectó porque sku_final nunca se
+    umbral derivado de tiempo_ideal_seg SIN escalar por unidades_por_ciclo
+    -- ese campo es "segundos ideales POR UNIDAD" (ver
+    MaestroSKU.tiempo_ideal_seg), así que compararlo tal cual contra
+    delta_t (que mide tiempo por CICLO) marcaba cada bandeja normal como
+    una parada grande. Nunca se detectó porque sku_final nunca se
     resolvía antes de este fix (Fase P, sección 1.b) -- esta rama jamás
     había corrido con un SKU real."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a, TipoProduccion.POR_LOTES)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, unidades_por_ciclo=5)
-    sku.tiempo_ciclo_teorico = 2.0  # seg/unidad -> ciclo ideal de 5 unidades = 10s
+    # seg/unidad -> ciclo ideal de 5 unidades = 10s (lento/alerta con el
+    # mismo multiplicador 1.15/1.25 que antes era el default del tenant).
+    sku.tiempo_ideal_seg = 2.0
+    sku.tiempo_lento_seg = 2.3
+    sku.tiempo_alerta_seg = 2.5
     db.add(sku)
     db.commit()
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
@@ -246,7 +256,7 @@ def test_por_lotes_umbral_de_parada_es_por_ciclo_no_por_unidad(client, db, tenan
 
     paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
     assert len(paradas) == 1
-    # t_alerta = tiempo_ideal_por_ciclo(10) * tolerancia_alerta_pct(1.25) = 12.5
+    # t_alerta = tiempo_alerta_seg del SKU(2.5) * unidades_por_ciclo(5) = 12.5
     # tiempo_perdido = delta_t(100) - t_alerta(12.5) = 87.5
     assert paradas[0].duracion_segundos == 87.5
 
@@ -279,7 +289,7 @@ def test_cambio_de_orden_activa_no_genera_parada_aunque_el_hueco_sea_grande(clie
     db.commit()
     orden2, _ = _crear_orden_en_progreso(db, tenant_a, linea.id)
 
-    # Hueco de 2 horas -- de sobra para cruzar cualquier umbral_alerta razonable.
+    # Hueco de 2 horas -- de sobra para cruzar cualquier perfil de tiempos razonable.
     # El evento 2 va "ahora" (el 1 quedó hace 2h): /api/lite/scans rechaza
     # timestamps en el futuro, por eso el hueco se arma hacia atrás.
     r2 = client.post(

@@ -1,11 +1,10 @@
 """Fase S: /config/estaciones/{id}/recomputar-eventos/.
 
-SkuTiempoEstacion (Fase R), tolerancia_*_pct heredable (Fase R) y
-umbral_optimo/lento/alerta (Fase Q) sólo se leen en /api/lite/scans, en
-el momento exacto del ping -- cargar un override o ajustar una
-tolerancia DESPUÉS de que ya llegaron eventos no cambia nada
-retroactivamente por sí solo (snapshot inmutable). Este recómputo
-reaplica la config vigente sobre eventos ya persistidos.
+El perfil de tiempos (SKU×Estación, SKU genérico, o el piso de Línea --
+Fase AC) sólo se lee en /api/lite/scans, en el momento exacto del ping --
+cargar un override o editar un perfil DESPUÉS de que ya llegaron eventos
+no cambia nada retroactivamente por sí solo (snapshot inmutable). Este
+recómputo reaplica la config vigente sobre eventos ya persistidos.
 """
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -46,10 +45,12 @@ def _emitir_credencial(client, gerente, estacion_id):
     return r.json()["credencial_completa"]
 
 
-def _crear_orden_en_progreso(db, tenant_id, linea_id, tiempo_ciclo_teorico=10.0):
+def _crear_orden_en_progreso(db, tenant_id, linea_id, tiempo_ideal_seg=10.0, tiempo_lento_seg=None, tiempo_alerta_seg=None):
     sku = MaestroSKU(
         tenant_id=tenant_id, codigo_sku=f"SKU-{uuid.uuid4().hex[:8]}",
-        descripcion="SKU de prueba", tiempo_ciclo_teorico=tiempo_ciclo_teorico, unidades_por_ciclo=1,
+        descripcion="SKU de prueba", tiempo_ideal_seg=tiempo_ideal_seg,
+        tiempo_lento_seg=tiempo_lento_seg, tiempo_alerta_seg=tiempo_alerta_seg,
+        unidades_por_ciclo=1,
     )
     db.add(sku)
     db.commit()
@@ -95,7 +96,7 @@ def test_recomputar_aplica_override_sku_estacion_cargado_despues_del_evento(clie
     """El caso real que motivó Fase S: el override se carga DESPUÉS de que
     el evento ya se ingirió -- no cambia nada solo, hace falta el recómputo."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
@@ -105,14 +106,14 @@ def test_recomputar_aplica_override_sku_estacion_cargado_despues_del_evento(clie
 
     eventos = _eventos(db, estacion.id)
     assert eventos[1].tiempo_ideal_seg == 2.0
-    assert eventos[1].estado == "ALERTA"  # 21s contra t_alerta=2.5s (2.0*1.25 default)
+    assert eventos[1].estado == "ALERTA"  # 21s contra t_alerta=2.5s (perfil genérico del SKU)
     parada = _paradas(db, estacion.id)[0]
     assert parada.duracion_segundos == 18.5  # 21 - 2.5
 
     # Override cargado DESPUÉS -- nada lo refleja todavía sin recomputar.
     db.add(SkuTiempoEstacion(
         tenant_id=tenant_a, sku_fk=sku.codigo_sku, estacion_id=estacion.id,
-        tiempo_ciclo_teorico=20.0, activo=True,
+        tiempo_ideal_seg=20.0, tiempo_lento_seg=23.0, tiempo_alerta_seg=25.0, activo=True,
     ))
     db.commit()
     assert _eventos(db, estacion.id)[1].tiempo_ideal_seg == 2.0
@@ -132,15 +133,15 @@ def test_recomputar_aplica_override_sku_estacion_cargado_despues_del_evento(clie
     assert eventos[1].estado == "OPTIMO"  # 21s < t_alerta(25) con el override
 
 
-def test_recomputar_crea_parada_nueva_cuando_se_endurece_tolerancia(client, db, tenant_a, gerente_a):
+def test_recomputar_crea_parada_nueva_cuando_se_endurece_el_perfil_del_sku(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=10.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=10.0, tiempo_lento_seg=11.5, tiempo_alerta_seg=12.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
-    # 11s: con la tolerancia default del tenant (1.15/1.25 -> t_lento=11.5,
-    # t_alerta=12.5) queda OPTIMO -- ninguna parada todavía.
+    # 11s: con el perfil inicial del SKU (t_lento=11.5, t_alerta=12.5)
+    # queda OPTIMO -- ninguna parada todavía.
     ts2 = ahora + timedelta(seconds=11)
     assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
 
@@ -148,10 +149,10 @@ def test_recomputar_crea_parada_nueva_cuando_se_endurece_tolerancia(client, db, 
     assert eventos[1].estado == "OPTIMO"
     assert len(_paradas(db, estacion.id)) == 0
 
-    # Endurecemos la estación: alerta a partir de 10.5s (10*1.05).
-    estacion.tolerancia_lento_pct = 1.02
-    estacion.tolerancia_alerta_pct = 1.05
-    db.add(estacion)
+    # Endurecemos el perfil del SKU: alerta a partir de 10.5s.
+    sku.tiempo_lento_seg = 10.2
+    sku.tiempo_alerta_seg = 10.5
+    db.add(sku)
     db.commit()
 
     hoy = ahora.date()
@@ -171,7 +172,7 @@ def test_recomputar_crea_parada_nueva_cuando_se_endurece_tolerancia(client, db, 
 
 def test_recomputar_actualiza_duracion_de_parada_pendiente_existente(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
@@ -186,7 +187,7 @@ def test_recomputar_actualiza_duracion_de_parada_pendiente_existente(client, db,
     # Override que sigue dejando el evento en ALERTA, pero con otra duración.
     db.add(SkuTiempoEstacion(
         tenant_id=tenant_a, sku_fk=sku.codigo_sku, estacion_id=estacion.id,
-        tiempo_ciclo_teorico=5.0, activo=True,  # t_alerta = 5*1.25 = 6.25
+        tiempo_ideal_seg=5.0, tiempo_lento_seg=6.0, tiempo_alerta_seg=6.25, activo=True,
     ))
     db.commit()
 
@@ -206,7 +207,7 @@ def test_recomputar_actualiza_duracion_de_parada_pendiente_existente(client, db,
 
 def test_recomputar_nunca_toca_una_parada_ya_clasificada(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
@@ -229,9 +230,9 @@ def test_recomputar_nunca_toca_una_parada_ya_clasificada(client, db, tenant_a, g
     assert r.status_code == 200
     duracion_original = r.json()["duracion_segundos"]
 
-    # Aflojamos mucho -- el hueco ya no calificaría ALERTA con la config nueva.
-    estacion.tolerancia_alerta_pct = 20.0
-    db.add(estacion)
+    # Aflojamos mucho el perfil del SKU -- el hueco ya no calificaría ALERTA.
+    sku.tiempo_alerta_seg = 999.0
+    db.add(sku)
     db.commit()
 
     hoy = ahora.date()
@@ -250,7 +251,7 @@ def test_recomputar_nunca_toca_una_parada_ya_clasificada(client, db, tenant_a, g
 
 def test_recomputar_reporta_parada_pendiente_obsoleta_sin_borrarla(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
@@ -260,13 +261,13 @@ def test_recomputar_reporta_parada_pendiente_obsoleta_sin_borrarla(client, db, t
 
     parada_id = _paradas(db, estacion.id)[0].id
 
-    # Aflojamos LAS DOS tolerancias -- si sólo se afloja alerta, el hueco
-    # (21s) sigue superando t_lento (2*1.15=2.3 default) y queda LENTO, no
-    # OPTIMO (el objetivo acá es que deje de ser ALERTA sin quedar en otro
-    # estado clasificable, para probar el caso "ya no califica").
-    estacion.tolerancia_lento_pct = 15.0
-    estacion.tolerancia_alerta_pct = 20.0  # t_alerta = 2*20 = 40s > 21s: ya no califica
-    db.add(estacion)
+    # Aflojamos LOS DOS campos del perfil -- si sólo se afloja alerta, el
+    # hueco (21s) sigue superando lento (30) y queda LENTO, no OPTIMO (el
+    # objetivo acá es que deje de ser ALERTA sin quedar en otro estado
+    # clasificable, para probar el caso "ya no califica").
+    sku.tiempo_lento_seg = 30.0
+    sku.tiempo_alerta_seg = 40.0  # 40s > 21s: ya no califica
+    db.add(sku)
     db.commit()
 
     hoy = ahora.date()
@@ -289,7 +290,7 @@ def test_recomputar_respeta_continuidad_de_orden(client, db, tenant_a, gerente_a
     """Un cambio de orden entre dos eventos consecutivos sigue sin
     clasificarse ni generar/tocar parada, aunque cambie la config."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden1, sku1 = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden1, sku1 = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
     hace_2_horas = ahora - timedelta(hours=2)
@@ -299,7 +300,7 @@ def test_recomputar_respeta_continuidad_de_orden(client, db, tenant_a, gerente_a
     orden1.estado = EstadoOrden.CERRADA
     db.add(orden1)
     db.commit()
-    orden2, sku2 = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden2, sku2 = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
 
@@ -307,8 +308,12 @@ def test_recomputar_respeta_continuidad_de_orden(client, db, tenant_a, gerente_a
     assert eventos_antes[1].estado == "OPTIMO"
     assert len(_paradas(db, estacion.id)) == 0
 
-    estacion.tolerancia_alerta_pct = 0.001  # brutalmente estricto
-    db.add(estacion)
+    # Brutalmente estricto en los dos SKUs -- si la protección de
+    # continuidad de orden fallara, cualquiera de los dos generaría ALERTA.
+    sku1.tiempo_lento_seg, sku1.tiempo_alerta_seg = 0.001, 0.002
+    sku2.tiempo_lento_seg, sku2.tiempo_alerta_seg = 0.001, 0.002
+    db.add(sku1)
+    db.add(sku2)
     db.commit()
 
     r = _recomputar(client, gerente_a, estacion.id, hace_2_horas.date(), ahora.date())
@@ -324,7 +329,7 @@ def test_recomputar_respeta_continuidad_de_orden(client, db, tenant_a, gerente_a
 
 def test_recomputar_no_toca_eventos_fuera_del_rango(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=2.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
 
@@ -334,7 +339,7 @@ def test_recomputar_no_toca_eventos_fuera_del_rango(client, db, tenant_a, gerent
 
     db.add(SkuTiempoEstacion(
         tenant_id=tenant_a, sku_fk=sku.codigo_sku, estacion_id=estacion.id,
-        tiempo_ciclo_teorico=20.0, activo=True,
+        tiempo_ideal_seg=20.0, tiempo_lento_seg=23.0, tiempo_alerta_seg=25.0, activo=True,
     ))
     db.commit()
 
