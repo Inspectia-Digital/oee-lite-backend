@@ -1580,8 +1580,20 @@ def obtener_rendimiento_operarios(
         if not eventos:
             return []
 
+        # Fase AB.2 (bug real, confirmado auditando "confirmar que
+        # Rendimiento Operarios funcione correctamente"): agrupaba por
+        # evento.timestamp.date() -- la fecha CALENDARIO EN UTC del
+        # timestamp persistido -- para buscar en AsignacionTurno.fecha,
+        # que un supervisor carga pensando en el día de PLANTA, no en UTC.
+        # Con Green Mills en UTC-3, cualquier evento después de las 21hs
+        # hora local cae en el día siguiente en UTC: el lookup fallaba en
+        # silencio (sin excepción, sin log) y esos eventos quedaban fuera
+        # del reporte por falta de operario resuelto -- exactamente el
+        # mismo tipo de bug que Fase Q ya había corregido en
+        # /analytics/linea-en-vivo/ (_fecha_planta), pero nunca se aplicó acá.
+        planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
         estacion_ids = {est.id for _, est in eventos}
-        fechas = {e.timestamp.date() for e, _ in eventos}
+        fechas = {_fecha_planta(e.timestamp, planta) for e, _ in eventos}
         asignaciones = db.exec(
             select(AsignacionTurno).where(
                 AsignacionTurno.tenant_id == context.tenant_id,
@@ -1593,7 +1605,7 @@ def obtener_rendimiento_operarios(
 
         agrupado = {}
         for evento, estacion in eventos:
-            op_id = operario_por_estacion_fecha.get((estacion.id, evento.timestamp.date()))
+            op_id = operario_por_estacion_fecha.get((estacion.id, _fecha_planta(evento.timestamp, planta)))
             if not op_id:
                 continue
             if operario_id and op_id != operario_id:
