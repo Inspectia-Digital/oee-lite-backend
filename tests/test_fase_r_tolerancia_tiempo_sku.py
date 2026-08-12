@@ -4,9 +4,14 @@
   Estación puntual (CRUD + efecto real en /api/lite/scans). Antes
   MaestroSKU.tiempo_ciclo_teorico era el único valor posible, sin importar
   qué estación procesara el SKU.
-- tolerancia_lento_pct / tolerancia_alerta_pct heredable Estación > Línea >
-  Tenant (antes un único valor fijo por tenant, sin importar qué línea o
-  estación reportara el evento).
+
+Fase AC (rediseño de umbrales/tolerancias): el override ahora es un
+PERFIL completo (tiempo_ideal_seg/tiempo_lento_seg/tiempo_alerta_seg, los
+3 siempre juntos y NOT NULL -- antes era 1 solo campo + la tolerancia %
+heredable Estación>Línea>Tenant aplicada aparte). La cascada de
+tolerancia % heredable que este archivo testeaba originalmente fue
+RETIRADA por completo -- ver test_fase_ac_perfil_tiempos.py para el
+modelo nuevo (SKU×Estación > SKU > Línea, siempre en segundos, nunca %).
 """
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,7 +20,7 @@ from sqlmodel import select
 
 from app.models.domain import (
     Estacion, LiteEventoProduccion, MaestroSKU, OrdenProduccion, EstadoOrden,
-    ParadaDetectada, Planta, Linea, SkuTiempoEstacion, Tenant, TipoProduccion,
+    ParadaDetectada, Planta, Linea, SkuTiempoEstacion, TipoProduccion,
 )
 from tests.conftest import autenticar_como, crear_usuario
 
@@ -50,7 +55,7 @@ def _crear_orden_en_progreso(db, tenant_id, linea_id, sku=None):
     if sku is None:
         sku = MaestroSKU(
             tenant_id=tenant_id, codigo_sku=f"SKU-{uuid.uuid4().hex[:8]}",
-            descripcion="SKU de prueba", tiempo_ciclo_teorico=10.0, unidades_por_ciclo=1,
+            descripcion="SKU de prueba", tiempo_ideal_seg=10.0, unidades_por_ciclo=1,
         )
         db.add(sku)
         db.commit()
@@ -93,11 +98,13 @@ def test_crear_tiempo_sku_estacion(client, db, tenant_a, gerente_a):
 
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 18.5},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 18.5, "tiempo_lento_seg": 22.0, "tiempo_alerta_seg": 25.0},
     )
     assert r.status_code == 201
     body = r.json()
-    assert body["tiempo_ciclo_teorico"] == 18.5
+    assert body["tiempo_ideal_seg"] == 18.5
+    assert body["tiempo_lento_seg"] == 22.0
+    assert body["tiempo_alerta_seg"] == 25.0
     assert body["activo"] is True
     assert body["estacion_id"] == str(estacion.id)
 
@@ -106,13 +113,25 @@ def test_crear_tiempo_sku_estacion(client, db, tenant_a, gerente_a):
     assert fila.tenant_id == tenant_a
 
 
+def test_crear_tiempo_sku_estacion_perfil_invertido_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    _, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
+    autenticar_como(gerente_a.id)
+
+    r = client.post(
+        f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 18.5, "tiempo_lento_seg": 25.0, "tiempo_alerta_seg": 22.0},
+    )
+    assert r.status_code == 400
+
+
 def test_crear_tiempo_sku_estacion_sku_inexistente_404(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     autenticar_como(gerente_a.id)
 
     r = client.post(
         "/config/erp/skus/NO-EXISTE/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     assert r.status_code == 404
 
@@ -137,7 +156,7 @@ def test_crear_tiempo_sku_estacion_de_otro_tenant_devuelve_400(client, db, tenan
     autenticar_como(gerente_a.id)
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion_b.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion_b.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     assert r.status_code == 400  # la estación es de otro tenant
 
@@ -149,13 +168,13 @@ def test_crear_tiempo_sku_estacion_duplicado_devuelve_409(client, db, tenant_a, 
 
     r1 = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     assert r1.status_code == 201
 
     r2 = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 20.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 20.0, "tiempo_lento_seg": 24.0, "tiempo_alerta_seg": 28.0},
     )
     assert r2.status_code == 409
 
@@ -170,7 +189,7 @@ def test_crear_tiempo_sku_estacion_requiere_gerencia(client, db, tenant_a):
 
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     assert r.status_code == 403
 
@@ -182,7 +201,7 @@ def test_listar_tiempos_sku_estacion_excluye_inactivos_por_default(client, db, t
 
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     tiempo_id = r.json()["id"]
     r = client.delete(f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/{tiempo_id}")
@@ -205,14 +224,31 @@ def test_patch_tiempo_sku_estacion_persiste_y_campo_omitido_no_lo_toca(client, d
 
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     tiempo_id = r.json()["id"]
 
-    r = client.patch(f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/{tiempo_id}", json={"tiempo_ciclo_teorico": 15.0})
+    r = client.patch(f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/{tiempo_id}", json={"tiempo_ideal_seg": 8.0})
     assert r.status_code == 200
-    assert r.json()["tiempo_ciclo_teorico"] == 15.0
-    assert r.json()["activo"] is True  # no se mandó, no se toca
+    assert r.json()["tiempo_ideal_seg"] == 8.0
+    assert r.json()["tiempo_lento_seg"] == 12.0  # no se mandó, no se toca...
+    assert r.json()["activo"] is True  # ...ni tampoco esto
+
+
+def test_patch_tiempo_sku_estacion_perfil_invertido_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    _, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
+    autenticar_como(gerente_a.id)
+
+    r = client.post(
+        f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
+    )
+    tiempo_id = r.json()["id"]
+
+    # Patch deja lento (20) >= alerta (14, sin tocar) -> perfil resultante inválido.
+    r = client.patch(f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/{tiempo_id}", json={"tiempo_lento_seg": 20.0})
+    assert r.status_code == 400
 
 
 def test_delete_tiempo_sku_estacion_es_baja_logica(client, db, tenant_a, gerente_a):
@@ -222,7 +258,7 @@ def test_delete_tiempo_sku_estacion_es_baja_logica(client, db, tenant_a, gerente
 
     r = client.post(
         f"/config/erp/skus/{sku.codigo_sku}/tiempos-estacion/",
-        json={"estacion_id": str(estacion.id), "tiempo_ciclo_teorico": 10.0},
+        json={"estacion_id": str(estacion.id), "tiempo_ideal_seg": 10.0, "tiempo_lento_seg": 12.0, "tiempo_alerta_seg": 14.0},
     )
     tiempo_id = r.json()["id"]
 
@@ -235,23 +271,28 @@ def test_delete_tiempo_sku_estacion_es_baja_logica(client, db, tenant_a, gerente
 
 
 # ========================================================
-# Efecto real en /api/lite/scans
+# Efecto real en /api/lite/scans -- cascada SKU×Estación > SKU > Línea (Fase AC)
 # ========================================================
 
-def test_override_sku_estacion_pisa_tiempo_generico_del_sku(client, db, tenant_a, gerente_a):
+def test_override_sku_estacion_pisa_perfil_generico_del_sku(client, db, tenant_a, gerente_a):
     """Un SKU puede tardar distinto según la estación que lo procesa -- si
-    hay un override cargado para (SKU, Estación), ese manda sobre
-    MaestroSKU.tiempo_ciclo_teorico (genérico)."""
+    hay un override cargado para (SKU, Estación), ese manda sobre el
+    perfil genérico de MaestroSKU."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 2.0  # genérico: ~2s/unidad en cualquier estación
+    # Genérico: ~2s/unidad, con perfil completo propio (para que el test
+    # distinga claramente "usó el override" de "usó el genérico" de "cayó
+    # al piso de línea", que son 3 fuentes bien distintas ahora).
+    sku.tiempo_ideal_seg = 2.0
+    sku.tiempo_lento_seg = 2.3
+    sku.tiempo_alerta_seg = 2.5
     db.add(sku)
 
     # En ESTA estación puntual el mismo SKU tarda mucho más (proceso más
     # lento en esta máquina en particular).
     override = SkuTiempoEstacion(
         tenant_id=tenant_a, sku_fk=sku.codigo_sku, estacion_id=estacion.id,
-        tiempo_ciclo_teorico=20.0, activo=True,
+        tiempo_ideal_seg=20.0, tiempo_lento_seg=25.0, tiempo_alerta_seg=30.0, activo=True,
     )
     db.add(override)
     db.commit()
@@ -260,9 +301,8 @@ def test_override_sku_estacion_pisa_tiempo_generico_del_sku(client, db, tenant_a
     ahora = datetime.now(timezone.utc)
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
 
-    # 21s de hueco: con el genérico (2.0s -> t_alerta=2.5s con tolerancia
-    # default 1.25) sería ALERTA y generaría una parada. Con el override
-    # (20s -> t_alerta=25s) tiene que seguir OPTIMO.
+    # 21s de hueco: con el genérico (alerta=2.5s) sería ALERTA y generaría
+    # una parada. Con el override (alerta=30s) tiene que seguir OPTIMO.
     ts2 = ahora + timedelta(seconds=21)
     assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
 
@@ -276,12 +316,15 @@ def test_override_sku_estacion_pisa_tiempo_generico_del_sku(client, db, tenant_a
 def test_override_inactivo_se_ignora_y_cae_al_generico(client, db, tenant_a, gerente_a):
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 2.0
+    sku.tiempo_ideal_seg = 2.0
+    sku.tiempo_lento_seg = 2.3
+    sku.tiempo_alerta_seg = 2.5
     db.add(sku)
 
     override = SkuTiempoEstacion(
         tenant_id=tenant_a, sku_fk=sku.codigo_sku, estacion_id=estacion.id,
-        tiempo_ciclo_teorico=20.0, activo=False,  # desactivado -> no debe aplicarse
+        tiempo_ideal_seg=20.0, tiempo_lento_seg=25.0, tiempo_alerta_seg=30.0,
+        activo=False,  # desactivado -> no debe aplicarse
     )
     db.add(override)
     db.commit()
@@ -294,15 +337,18 @@ def test_override_inactivo_se_ignora_y_cae_al_generico(client, db, tenant_a, ger
     assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
 
     eventos = _estado_ultimo_evento(db, estacion.id)
-    assert eventos[1].estado == "ALERTA"  # override inactivo no cuenta -> genérico (2.0s)
+    assert eventos[1].estado == "ALERTA"  # override inactivo no cuenta -> genérico (alerta=2.5s)
 
 
-def test_sin_override_cae_al_tiempo_generico_del_sku(client, db, tenant_a, gerente_a):
+def test_sin_override_cae_al_perfil_generico_del_sku(client, db, tenant_a, gerente_a):
     """Contraparte: sin ninguna fila en sku_tiempo_estacion, el
-    comportamiento tiene que ser exactamente el de antes de Fase R."""
+    comportamiento tiene que caer al perfil genérico del SKU (si está
+    completo) -- nunca directo al piso de línea."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 2.0
+    sku.tiempo_ideal_seg = 2.0
+    sku.tiempo_lento_seg = 2.3
+    sku.tiempo_alerta_seg = 2.5
     db.add(sku)
     db.commit()
 
@@ -317,121 +363,31 @@ def test_sin_override_cae_al_tiempo_generico_del_sku(client, db, tenant_a, geren
     assert eventos[1].estado == "ALERTA"
 
 
-# ---------- Tolerancia % heredable Estación > Línea > Tenant ----------
-
-def test_tolerancia_lee_del_tenant_no_es_un_fallback_hardcodeado(client, db, tenant_a, gerente_a):
-    """Sin override en Línea ni Estación, tiene que usar la tolerancia REAL
-    del Tenant -- no los literales 1.15/1.25 del fallback de default (que
-    sólo deben aplicar si ni siquiera hay fila de Tenant)."""
+def test_sku_con_perfil_incompleto_cae_entero_al_piso_de_linea(client, db, tenant_a, gerente_a):
+    """Regla central del rediseño (Fase AC): un SKU con sólo el ideal
+    cargado (sin lento/alerta) es un perfil INCOMPLETO -- el evento cae
+    ENTERO al piso de Línea, nunca mezcla el ideal del SKU con el
+    lento/alerta de otra fuente."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 10.0
-    db.add(sku)
-
-    tenant = db.get(Tenant, tenant_a)
-    tenant.tolerancia_lento_pct = 5.0  # tenant muy permisivo: LENTO recién a partir de 50s
-    tenant.tolerancia_alerta_pct = 6.0  # y ALERTA recién a partir de 60s
-    db.add(tenant)
-    db.commit()
-
-    credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
-    assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
-
-    # 20s: con el default de sistema (1.15/1.25 * 10 = 11.5/12.5) sería
-    # ALERTA (y generaría una parada); con la tolerancia real del tenant
-    # (50/60) tiene que seguir OPTIMO.
-    ts2 = ahora + timedelta(seconds=20)
-    assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
-
-    eventos = _estado_ultimo_evento(db, estacion.id)
-    assert eventos[1].estado == "OPTIMO"
-    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
-    assert len(paradas) == 0
-
-
-def test_tolerancia_de_linea_pisa_al_tenant_si_estacion_no_define(client, db, tenant_a, gerente_a):
-    planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 10.0
-    db.add(sku)
-
-    # Línea muy permisiva (tenant se queda en el default 1.15/1.25).
-    linea.tolerancia_lento_pct = 5.0
-    linea.tolerancia_alerta_pct = 6.0
+    linea.tiempo_ideal_seg = 5.0
+    linea.tiempo_lento_seg = 50.0
+    linea.tiempo_alerta_seg = 60.0
     db.add(linea)
     db.commit()
-    # La Estación no define nada -- tiene que heredar de la Línea, no
-    # saltearla directo al Tenant.
 
-    credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
-    assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
-
-    # 20s: > el default de sistema (11.5/12.5, sería ALERTA) pero muy por
-    # debajo de lo que permite la Línea (50/60) -> tiene que seguir OPTIMO.
-    ts2 = ahora + timedelta(seconds=20)
-    assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
-
-    eventos = _estado_ultimo_evento(db, estacion.id)
-    assert eventos[1].estado == "OPTIMO"
-    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
-    assert len(paradas) == 0
-
-
-def test_tolerancia_de_estacion_pisa_a_la_de_linea(client, db, tenant_a, gerente_a):
-    """Estación > Línea en la cascada -- si ambas están cargadas, gana la
-    de la Estación."""
-    planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 10.0
+    sku.tiempo_ideal_seg = 2.0  # sólo el ideal -- lento/alerta quedan None
     db.add(sku)
-
-    linea.tolerancia_lento_pct = 1.0  # línea estricta: LENTO/ALERTA a partir de 10s/11s
-    linea.tolerancia_alerta_pct = 1.1
-    estacion.tolerancia_lento_pct = 5.0  # esta estación puntual es mucho más permisiva
-    estacion.tolerancia_alerta_pct = 6.0
-    db.add(linea)
-    db.add(estacion)
     db.commit()
 
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     ahora = datetime.now(timezone.utc)
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
 
-    # 20s: > umbral de la línea (11s, sería ALERTA) pero muy por debajo del
-    # de la estación (60s) -- si ganara la línea sería ALERTA; gana la
-    # estación -> OPTIMO.
-    ts2 = ahora + timedelta(seconds=20)
-    assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
-
-    eventos = _estado_ultimo_evento(db, estacion.id)
-    assert eventos[1].estado == "OPTIMO"
-    paradas = db.exec(select(ParadaDetectada).where(ParadaDetectada.estacion_fk == estacion.id)).all()
-    assert len(paradas) == 0
-
-
-def test_tolerancia_lento_y_alerta_heredan_por_separado(client, db, tenant_a, gerente_a):
-    """tolerancia_lento_pct y tolerancia_alerta_pct son dos cascadas
-    independientes -- una Estación puede pisar sólo una de las dos."""
-    planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id)
-    sku.tiempo_ciclo_teorico = 10.0
-    db.add(sku)
-
-    # Sólo se pisa tolerancia_lento_pct a nivel Estación; alerta sigue en
-    # el default del tenant (1.25 -> t_alerta=12.5s).
-    estacion.tolerancia_lento_pct = 1.05  # LENTO ya a partir de 10.5s
-    db.add(estacion)
-    db.commit()
-
-    credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
-    assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
-
-    # 11s: > t_lento de la estación (10.5s) pero < t_alerta heredado del
-    # tenant (12.5s) -> LENTO.
-    ts2 = ahora + timedelta(seconds=11)
+    # 55s: si usara el ideal del SKU (2.0) con CUALQUIER tolerancia sería
+    # ALERTA de sobra. Si cae correctamente al piso de línea (lento=50,
+    # alerta=60), tiene que dar LENTO.
+    ts2 = ahora + timedelta(seconds=55)
     assert _postear_evento(client, credencial, estacion.id, ts2).status_code == 201
 
     eventos = _estado_ultimo_evento(db, estacion.id)

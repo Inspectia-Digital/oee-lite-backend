@@ -45,10 +45,17 @@ def _emitir_credencial(client, gerente, estacion_id):
     return r.json()["credencial_completa"]
 
 
-def _crear_orden_en_progreso(db, tenant_id, linea_id, tiempo_ciclo_teorico=10.0):
+def _crear_orden_en_progreso(db, tenant_id, linea_id, tiempo_ideal_seg=10.0):
+    # Fase AC: el perfil del SKU sólo se usa si está COMPLETO (ideal +
+    # lento + alerta) -- si faltara lento/alerta, el evento cae entero al
+    # piso de Línea (240/280/300) y desarma las cuentas "esperado==real"
+    # que hace este archivo. lento/alerta acá son holgados a propósito
+    # (no interfieren con los ciclos de 10s reales que arman los tests).
     sku = MaestroSKU(
         tenant_id=tenant_id, codigo_sku=f"SKU-{uuid.uuid4().hex[:8]}",
-        descripcion="SKU de prueba", tiempo_ciclo_teorico=tiempo_ciclo_teorico, unidades_por_ciclo=1,
+        descripcion="SKU de prueba", tiempo_ideal_seg=tiempo_ideal_seg,
+        tiempo_lento_seg=tiempo_ideal_seg * 3, tiempo_alerta_seg=tiempo_ideal_seg * 5,
+        unidades_por_ciclo=1,
     )
     db.add(sku)
     db.commit()
@@ -75,7 +82,7 @@ def _construir_escenario_con_transicion(client, db, tenant_a, gerente_a):
     orden2) + 1 transición de 4hs entre orden1 y orden2. Promedio real
     correcto = 10s; promedio roto (sin excluir la transición) = 3607.5s."""
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
-    orden1, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=10.0)
+    orden1, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=10.0)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
 
     ahora = datetime.now(timezone.utc) - timedelta(hours=6)  # margen para que +4h no caiga en el futuro
@@ -88,7 +95,7 @@ def _construir_escenario_con_transicion(client, db, tenant_a, gerente_a):
     orden1.estado = EstadoOrden.CERRADA
     db.add(orden1)
     db.commit()
-    orden2, _ = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=10.0)
+    orden2, _ = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=10.0)
 
     ts4 = ts3 + timedelta(hours=4)  # transición de sesión: hueco real de 4hs
     assert _postear_evento(client, credencial, estacion.id, ts4).status_code == 201
@@ -113,7 +120,7 @@ def test_cuellos_botella_excluye_transicion_de_orden_del_promedio(client, db, te
     assert len(filas) == 1
     # Sin excluir la transición el promedio sería (10+10+14400+10)/4=3607.5s.
     assert filas[0]["tiempo_promedio_real_seg"] == 10.0
-    assert filas[0]["desvio_pct"] == 0.0  # esperado == real, ambos SKU tiempo_ciclo_teorico=10
+    assert filas[0]["desvio_pct"] == 0.0  # esperado == real, ambos SKU tiempo_ideal_seg=10
 
 
 def test_rendimiento_secuencial_excluye_transicion_de_orden_del_promedio(client, db, tenant_a, gerente_a):
@@ -150,7 +157,7 @@ def test_cuellos_botella_transicion_de_orden_entre_estaciones_distintas_no_se_co
     db.commit()
     db.refresh(estacion_b)
 
-    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ciclo_teorico=10.0)
+    orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=10.0)
     credencial_b = _emitir_credencial(client, gerente_a, estacion_b.id)
 
     ahora = datetime.now(timezone.utc) - timedelta(hours=1)

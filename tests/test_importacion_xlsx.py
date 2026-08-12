@@ -43,7 +43,7 @@ def test_subir_skus_xlsx_real_no_falla_por_formato(client, db, tenant_a, gerente
     df = pd.DataFrame({
         "codigo_sku": [codigo_sku],
         "descripcion": ["Producto de prueba"],
-        "tiempo_ciclo_teorico": [240],
+        "tiempo_ideal_seg": [240],
         "unidades_por_ciclo": [1],
     })
     contenido = _xlsx_bytes(df)

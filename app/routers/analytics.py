@@ -23,6 +23,13 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Analytics"])
 
+# Fase AC: fallback de _calcular_metricas_oee para Calidad por tiempo --
+# antes usaba estacion.umbral_alerta (retirado del modelo, ver domain.py).
+# El concepto correcto es MaestroSKU.umbral_calidad (mismo default acá,
+# 1800.0) resuelto POR EVENTO, pendiente de implementar (ver docstring de
+# obtener_oee_general) porque ningún tenant real ejercita este camino hoy.
+UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG = 1800.0
+
 # ==========================================
 # --- MOLDES (Schemas) ---
 # ==========================================
@@ -302,12 +309,15 @@ def obtener_oee_general(
       (None) y se excluye del producto OEE -- nunca se reemplaza por
       100% ni 0%.
 
-    Limitación conocida y documentada: para Calidad por tiempo, "el
-    umbral SKU prevalece sobre el umbral de estación" está pendiente
-    -- hoy usa siempre estacion.umbral_alerta. Implementarlo bien
+    Limitación conocida y documentada: para Calidad por tiempo, resolver
+    MaestroSKU.umbral_calidad POR EVENTO (el SKU real que corría en ese
+    momento) está pendiente -- hoy usa un fallback fijo (ver
+    UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG más abajo). Implementarlo bien
     requeriría otro snapshot inmutable por evento (igual que
     tiempo_ideal_seg), y hoy ningún dato real ejercita este camino
-    (no hay estaciones tipo "calidad" en los tenants existentes).
+    (no hay estaciones tipo "calidad" en los tenants existentes). Nota
+    Fase AC: Estación ya NO tiene ningún umbral propio (ver domain.py) --
+    antes este camino usaba estacion.umbral_alerta, que dejó de existir.
     """
     try:
         validar_planta(context)
@@ -483,8 +493,9 @@ def _calcular_metricas_oee(
             unidades_calidad_total += evento.unidades_procesadas
             unidades_buenas_total += (evento.unidades_procesadas - evento.unidades_rechazadas)
         elif linea.metodo_calidad == "por_tiempo" and estacion.tipo.lower() == "calidad":
-            # Limitación documentada en obtener_oee_general: umbral de estación, no de SKU.
-            umbral_calidad_aplicable = estacion.umbral_alerta
+            # Limitación documentada en obtener_oee_general: debería resolver
+            # MaestroSKU.umbral_calidad del SKU real del evento, no un fallback fijo.
+            umbral_calidad_aplicable = UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG
             unidades_calidad_total += evento.unidades_procesadas
             if (evento.delta_t_segundos or 0) <= umbral_calidad_aplicable:
                 unidades_buenas_total += evento.unidades_procesadas
@@ -571,28 +582,42 @@ def obtener_reporte_springwall(
                     if _en_turno(e.timestamp, turno.hora_inicio, turno.hora_fin)
                 ]
 
+        # Fase AC: antes usaba estacion.umbral_optimo (retirado del modelo,
+        # ver domain.py) como un único valor fijo por grupo -- el mismo
+        # bug ya documentado y corregido en /cuellos-botella/ y
+        # /rendimiento-secuencial/ (Fase Q ronda 3, ver más abajo en este
+        # archivo): no es la referencia correcta cuando el evento resolvió
+        # un SKU, y ahora directamente ya no existe. Se reemplaza por el
+        # snapshot inmutable evento.tiempo_ideal_seg (por unidad, SKU si
+        # había uno activo, si no el piso de Línea -- Fase E2/AC),
+        # ACUMULADO por grupo -- nunca se resuelve "esperado" con una
+        # lógica propia y desalineada de la que gobierna la clasificación real.
         data_agrupada = {}
         for evento, estacion, operario in eventos:
             nombre_op = operario.nombre_completo if operario else "Sin Asignar"
             clave = (nombre_op, estacion.nombre)
-            
+
             if clave not in data_agrupada:
                 data_agrupada[clave] = {
-                    "cantidad_real": 0, "tiempo_invertido": 0, "umbral_optimo": estacion.umbral_optimo
+                    "cantidad_real": 0, "tiempo_invertido": 0, "tiempo_ideal_acumulado": 0.0,
                 }
-                
+
             grupo = data_agrupada[clave]
-            grupo["cantidad_real"] += evento.unidades_procesadas 
-            
+            grupo["cantidad_real"] += evento.unidades_procesadas
+            grupo["tiempo_ideal_acumulado"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
+
             if evento.delta_t_segundos and evento.delta_t_segundos > 0:
                 grupo["tiempo_invertido"] += evento.delta_t_segundos
 
         reporte_final = []
         for (nombre_op, nombre_est), metricas in data_agrupada.items():
             esperada = metricas["cantidad_real"]
-            if metricas["umbral_optimo"] > 0:
-                esperada = max(1, int(metricas["tiempo_invertido"] / metricas["umbral_optimo"]))
-                
+            if metricas["tiempo_ideal_acumulado"] > 0:
+                # Agregación segura (regla de oro): ratio de SUMAS (tiempo
+                # invertido total / tiempo ideal total), nunca un promedio
+                # por evento primero -- mismo criterio que _calcular_metricas_oee.
+                esperada = max(1, int(metricas["tiempo_invertido"] * metricas["cantidad_real"] / metricas["tiempo_ideal_acumulado"]))
+
             diferencia = ((metricas["cantidad_real"] - esperada) / esperada) * 100
             
             reporte_final.append(

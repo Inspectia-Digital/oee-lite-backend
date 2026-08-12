@@ -11,6 +11,7 @@ import uuid
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext
+from app.core.clasificacion import validar_perfil_tiempos
 from app.models.domain import OrdenProduccion, MaestroSKU, Tenant, Linea
 
 logger = logging.getLogger(__name__)
@@ -193,8 +194,10 @@ async def subir_plan(
 # ==========================================
 @router.get("/skus/template", status_code=status.HTTP_200_OK)
 def descargar_template_skus():
-    df = pd.DataFrame(columns=["codigo_sku", "descripcion", "tiempo_ciclo_teorico", "unidades_por_ciclo"])
-    df.loc[0] = ["SKU-123", "Pan Integral", "240", "4"]
+    # Fase AC: tiempo_lento_seg/tiempo_alerta_seg opcionales -- si se
+    # omiten, el SKU clasifica con el piso de Línea hasta completarse.
+    df = pd.DataFrame(columns=["codigo_sku", "descripcion", "tiempo_ideal_seg", "tiempo_lento_seg", "tiempo_alerta_seg", "unidades_por_ciclo"])
+    df.loc[0] = ["SKU-123", "Pan Integral", "240", "280", "300", "4"]
     
     stream = io.StringIO()
     df.to_csv(stream, index=False)
@@ -253,24 +256,35 @@ async def subir_skus(
                 continue
                 
             desc = str(row["descripcion"]).strip()
-            
-            t_ciclo = float(row["tiempo_ciclo_teorico"]) if "tiempo_ciclo_teorico" in df.columns and not pd.isna(row["tiempo_ciclo_teorico"]) else 240.0
+
+            # Fase AC: lento/alerta opcionales -- si faltan (no viene la
+            # columna, o la celda está vacía), el SKU queda con perfil
+            # incompleto y clasifica con el piso de Línea hasta
+            # completarse (ver clasificacion.resolver_umbrales_evento).
+            t_ideal = float(row["tiempo_ideal_seg"]) if "tiempo_ideal_seg" in df.columns and not pd.isna(row["tiempo_ideal_seg"]) else 240.0
+            t_lento = float(row["tiempo_lento_seg"]) if "tiempo_lento_seg" in df.columns and not pd.isna(row["tiempo_lento_seg"]) else None
+            t_alerta = float(row["tiempo_alerta_seg"]) if "tiempo_alerta_seg" in df.columns and not pd.isna(row["tiempo_alerta_seg"]) else None
+            validar_perfil_tiempos(t_ideal, t_lento, t_alerta)
             u_ciclo = int(row["unidades_por_ciclo"]) if "unidades_por_ciclo" in df.columns and not pd.isna(row["unidades_por_ciclo"]) else 1
 
             sku_db = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == sku_code, MaestroSKU.tenant_id == context.tenant_id)).first()
 
             if sku_db:
                 sku_db.descripcion = desc
-                sku_db.tiempo_ciclo_teorico = t_ciclo
+                sku_db.tiempo_ideal_seg = t_ideal
+                sku_db.tiempo_lento_seg = t_lento
+                sku_db.tiempo_alerta_seg = t_alerta
                 sku_db.unidades_por_ciclo = u_ciclo
                 sku_db.linea_id = linea_id  # Actualizamos la línea
                 actualizados += 1
             else:
                 nuevo_sku = MaestroSKU(
-                    tenant_id=context.tenant_id, 
-                    codigo_sku=sku_code, 
+                    tenant_id=context.tenant_id,
+                    codigo_sku=sku_code,
                     descripcion=desc,
-                    tiempo_ciclo_teorico=t_ciclo, 
+                    tiempo_ideal_seg=t_ideal,
+                    tiempo_lento_seg=t_lento,
+                    tiempo_alerta_seg=t_alerta,
                     unidades_por_ciclo=u_ciclo,
                     linea_id=linea_id
                 )

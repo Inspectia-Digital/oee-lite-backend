@@ -27,7 +27,7 @@ def test_crear_sku_manual(client, db, tenant_a, gerente_a):
     assert body["codigo_sku"] == codigo
     assert body["descripcion"] == "Producto de prueba"
     # Defaults del modelo cuando no se envían.
-    assert body["tiempo_ciclo_teorico"] == 240.0
+    assert body["tiempo_ideal_seg"] == 240.0
     assert body["unidades_por_ciclo"] == 1
 
     sku_db = db.exec(
@@ -53,7 +53,7 @@ def test_crear_sku_manual_con_linea(client, db, tenant_a, gerente_a):
         json={
             "codigo_sku": codigo,
             "descripcion": "Con línea",
-            "tiempo_ciclo_teorico": 120,
+            "tiempo_ideal_seg": 120,
             "unidades_por_ciclo": 4,
             "linea_id": str(linea.id),
         },
@@ -61,7 +61,7 @@ def test_crear_sku_manual_con_linea(client, db, tenant_a, gerente_a):
     assert r.status_code == 201
     body = r.json()
     assert body["linea_id"] == str(linea.id)
-    assert body["tiempo_ciclo_teorico"] == 120
+    assert body["tiempo_ideal_seg"] == 120
     assert body["unidades_por_ciclo"] == 4
 
 
@@ -139,3 +139,31 @@ def test_patch_sku_campo_omitido_no_lo_toca(client, db, tenant_a, gerente_a):
     r = client.patch(f"/config/erp/skus/{codigo}", json={"activo": False})
     assert r.status_code == 200
     assert r.json()["descripcion"] == "Original"  # no se mandó, no se toca
+
+
+def test_patch_sku_puede_completar_el_perfil_de_tiempos(client, db, tenant_a, gerente_a):
+    """Fase AC: gap real preexistente -- este PATCH sólo permitía editar
+    activo/descripcion, ni siquiera tiempo_ideal_seg (antes tiempo_ciclo_teorico)
+    era editable después del alta, sólo vía bulk-CSV que pisa todo junto."""
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+    assert r.json()["tiempo_lento_seg"] is None  # perfil incompleto al alta
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"tiempo_lento_seg": 280.0, "tiempo_alerta_seg": 300.0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tiempo_ideal_seg"] == 240.0  # default, no se tocó
+    assert body["tiempo_lento_seg"] == 280.0
+    assert body["tiempo_alerta_seg"] == 300.0
+
+
+def test_patch_sku_perfil_invertido_devuelve_400(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"tiempo_lento_seg": 300.0, "tiempo_alerta_seg": 280.0})
+    assert r.status_code == 400

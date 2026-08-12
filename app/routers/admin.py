@@ -15,7 +15,6 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
 from app.core.auth0_management import crear_ticket_cambio_password
-from app.core.clasificacion import validar_orden_lento_alerta
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso
 
 # Roles a los que no se les asigna alcance por planta -- ven todo el tenant
@@ -65,8 +64,9 @@ class TenantUpdate(BaseModel):
     nombre: Optional[str] = None
     color_primario: Optional[str] = None
     logo_url: Optional[str] = None
-    tolerancia_lento_pct: Optional[float] = None
-    tolerancia_alerta_pct: Optional[float] = None
+    # Fase AC: tolerancia_lento_pct/alerta_pct retirados -- Empresa deja
+    # de ser un nivel de la cascada de umbrales (ver Tenant en domain.py
+    # y clasificacion.resolver_umbrales_evento). El piso ahora es Línea.
     # Fase N: objetivo de OEE configurable (antes hardcodeado en el front:
     # 75 en la tendencia, 85 en el Command Center).
     oee_objetivo_pct: Optional[float] = None
@@ -209,11 +209,6 @@ def actualizar_mi_tenant(
     update_data = datos.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(tenant_db, key, value)
-
-    try:
-        validar_orden_lento_alerta(tenant_db.tolerancia_lento_pct, tenant_db.tolerancia_alerta_pct)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
     db.add(tenant_db)
     db.commit()

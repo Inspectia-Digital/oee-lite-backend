@@ -222,14 +222,12 @@ def registrar_escaneo_rapido(
     if scan.unidades_procesadas is not None:
         unidades_a_sumar = scan.unidades_procesadas
 
-    # Fase P/Q/R (extraído a app/core/clasificacion.py en Fase S para que
-    # /config/estaciones/{id}/recomputar-eventos/ use exactamente la misma
-    # cascada, nunca una reimplementación paralela): Rama A (sin SKU) usa
-    # umbral_optimo/lento/alerta heredable Estación>Línea>sistema; Rama B
-    # (con SKU) usa tiempo_ciclo_teorico del SKU (o su override por
-    # Estación) × unidades del evento, con tolerancia % heredable
-    # Estación>Línea>Tenant.
-    umbrales = resolver_umbrales_evento(db, dispositivo.tenant_id, tenant_config, estacion, linea, sku_final, unidades_a_sumar)
+    # Fase P/Q/R/S, rediseñado en Fase AC (extraído a app/core/clasificacion.py
+    # para que /config/estaciones/{id}/recomputar-eventos/ use exactamente
+    # la misma cascada, nunca una reimplementación paralela): perfil de
+    # tiempos (ideal/lento/alerta, siempre en segundos) resuelto
+    # SKU×Estación > SKU > Línea -- ver docstring de resolver_umbrales_evento.
+    umbrales = resolver_umbrales_evento(db, dispositivo.tenant_id, estacion, linea, sku_final, unidades_a_sumar)
     t_optimo, t_lento, t_alerta = umbrales.t_optimo, umbrales.t_lento, umbrales.t_alerta
     tiempo_ideal_por_ciclo = umbrales.tiempo_ideal_por_ciclo
     sku_resuelto = umbrales.sku_resuelto

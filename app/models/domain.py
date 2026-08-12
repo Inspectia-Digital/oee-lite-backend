@@ -101,8 +101,12 @@ class Tenant(SQLModel, table=True):
         sa_column=Column(SaEnum(ModoAsignacionOperarios, values_callable=lambda obj: [e.value for e in obj]))
     )
     activo: bool = Field(default=True)
-    tolerancia_lento_pct: float = Field(default=1.15)
-    tolerancia_alerta_pct: float = Field(default=1.25)
+    # Fase AC (rediseño de umbrales/tolerancias, pedido de Green Mills):
+    # Empresa deja de ser un nivel de la cascada de tiempos -- no aportaba
+    # nada real (un único valor de tolerancia % para TODO el tenant, sin
+    # relación con el ritmo real de cada línea). El piso ahora es Línea,
+    # siempre en segundos absolutos (ver Linea.tiempo_ideal_seg y
+    # clasificacion.py). tolerancia_lento_pct/alerta_pct quedan retirados.
     # Fase N: objetivo de OEE de referencia del tenant, configurable por
     # Gerencia (antes estaba hardcodeado en el front: 75 en la tendencia,
     # 85 en el Command Center -- ninguno de los dos venía de acá).
@@ -161,27 +165,22 @@ class Linea(TenantBase, table=True):
     metodo_calidad: MetodoCalidadLinea = Field(default=MetodoCalidadLinea.POR_RECHAZO)
     activo: bool = Field(default=True)
 
-    # Fase Q (feedback de producto): umbrales por defecto para todas las
-    # estaciones de esta línea. NULL = sin default de línea, cada estación
-    # resuelve el suyo propio (o el default de sistema si tampoco lo tiene).
-    # No reemplaza Tenant.tolerancia_lento_pct/alerta_pct -- ese es un
-    # concepto distinto (% de tolerancia sobre el ciclo ideal del SKU
-    # activo, usado sólo cuando hay un SKU resuelto en scans.py). Esto es
-    # el fallback de segundos absolutos para cuando NO hay SKU resuelto,
-    # heredable Línea -> Estación igual que antes era sólo Estación.
-    umbral_optimo: Optional[int] = Field(default=None, description="Default de línea: tiempo ideal en segundos")
-    umbral_lento: Optional[int] = Field(default=None, description="Default de línea: límite de tiempo aceptable")
-    umbral_alerta: Optional[int] = Field(default=None, description="Default de línea: tiempo que dispara alerta")
-
-    # Fase R (feedback de producto): tolerancia % heredable Estación ->
-    # Línea -> Tenant, para la rama de scans.py donde SÍ hay un SKU
-    # resuelto (antes esa tolerancia era un único valor fijo por tenant,
-    # sin poder ajustarla por línea/estación). NULL = sin override de
-    # línea, cada estación resuelve el suyo propio (o el del tenant si
-    # tampoco lo tiene). Mismo patrón que umbral_optimo/lento/alerta de
-    # arriba, pero para el eje de tolerancia, no de segundos absolutos.
-    tolerancia_lento_pct: Optional[float] = Field(default=None, description="Default de línea: % de tolerancia lento sobre el ciclo ideal del SKU")
-    tolerancia_alerta_pct: Optional[float] = Field(default=None, description="Default de línea: % de tolerancia alerta sobre el ciclo ideal del SKU")
+    # Fase AC (rediseño de umbrales/tolerancias, pedido de Green Mills):
+    # reemplaza los 5 campos viejos (umbral_optimo/lento/alerta en
+    # segundos + tolerancia_lento/alerta_pct en %, Fases Q/R) por UN solo
+    # perfil de 3 tiempos, siempre en segundos, nunca porcentaje. Línea es
+    # ahora el ÚNICO piso de la cascada (ya no hay Estación ni Empresa/
+    # Tenant como niveles intermedios/default -- ver clasificacion.py):
+    # se usa siempre que un evento NO resuelve SKU, o resuelve un SKU
+    # cuyo perfil está incompleto (falta lento y/o alerta, ver
+    # MaestroSKU). NOT NULL con default 240/280/300 (mismos valores que
+    # antes eran la constante hardcodeada de sistema): así Línea siempre
+    # tiene un piso funcionando desde que se crea, sin bloquear el alta,
+    # y esos 3 números dejan de estar hardcodeados en el código -- son
+    # datos editables por línea desde el minuto uno.
+    tiempo_ideal_seg: float = Field(default=240.0, description="Piso de línea: segundos ideales por ciclo cuando no hay SKU (o su perfil está incompleto)")
+    tiempo_lento_seg: float = Field(default=280.0, description="Piso de línea: segundos que clasifican LENTO")
+    tiempo_alerta_seg: float = Field(default=300.0, description="Piso de línea: segundos que disparan ALERTA/parada")
 
 class Supervisor(TenantBase, table=True):
     __tablename__ = "dim_supervisores"
@@ -195,21 +194,16 @@ class Estacion(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     nombre: str
     tipo: str  # Ej: "sensor", "escaneo_manual", "calidad"
-    
-    # Fase Q: nullable a propósito -- NULL significa "hereda el default de
-    # la Línea" (Linea.umbral_*), y si la Línea tampoco lo tiene, el
-    # sistema cae al default histórico (240/280/300, ver scans.py). Antes
-    # eran NOT NULL con esos mismos valores como default: los registros
-    # existentes no cambian (ya tienen un valor explícito), sólo cambia
-    # el comportamiento de estaciones NUEVAS que no lo configuren.
-    umbral_optimo: Optional[int] = Field(default=None, description="Tiempo ideal en segundos (NULL = hereda de la línea)")
-    umbral_lento: Optional[int] = Field(default=None, description="Límite de tiempo aceptable (NULL = hereda de la línea)")
-    umbral_alerta: Optional[int] = Field(default=None, description="Tiempo que dispara alerta (NULL = hereda de la línea)")
 
-    # Fase R: tolerancia % heredable -- NULL = hereda de la Línea (y del
-    # Tenant si la Línea tampoco la tiene). Ver mismo comentario en Linea.
-    tolerancia_lento_pct: Optional[float] = Field(default=None, description="% de tolerancia lento sobre el ciclo ideal del SKU (NULL = hereda de la línea)")
-    tolerancia_alerta_pct: Optional[float] = Field(default=None, description="% de tolerancia alerta sobre el ciclo ideal del SKU (NULL = hereda de la línea)")
+    # Fase AC (rediseño de umbrales/tolerancias): Estación deja de ser un
+    # nivel de la cascada -- ya no tiene umbral_optimo/lento/alerta ni
+    # tolerancia_lento/alerta_pct propios (eran 5 campos redundantes con
+    # los de Línea, y con las % encima, la fuente real del problema que
+    # pidió simplificar Green Mills). Una estación sigue pudiendo tener
+    # tiempos propios, pero SIEMPRE en combinación con un SKU puntual --
+    # ver SkuTiempoEstacion (override por SKU×Estación) y
+    # clasificacion.resolver_umbrales_evento. Sin SKU resuelto, TODAS las
+    # estaciones de una línea comparten el piso de Linea.tiempo_ideal_seg.
 
     activa: bool = Field(default=True, description="Apagar si hoy no se usa")
     posicion_linea: int = Field(default=1, description="Secuencia lógica (1,2,3...)")
@@ -295,8 +289,21 @@ class MaestroSKU(TenantBase, table=True):
     modelo: Optional[str] = None
     medida: Optional[str] = None
 
-    tiempo_ciclo_teorico: float = Field(default=240.0, description="Segundos ideales por unidad")
-    umbral_calidad: float = Field(default=1800.0, description="Tolerancia en estación de calidad")
+    # Fase AC (rediseño de umbrales/tolerancias): tiempo_ciclo_teorico se
+    # renombra a tiempo_ideal_seg -- mismo campo, mismo default, nombre
+    # consistente con Linea.tiempo_ideal_seg y SkuTiempoEstacion.tiempo_ideal_seg
+    # (los 3 niveles de la cascada usan exactamente los mismos 3 nombres
+    # de campo). tiempo_lento_seg/tiempo_alerta_seg son NUEVOS y
+    # nullable a propósito: un SKU siempre existe con su tiempo ideal
+    # (tiene default), pero recién tiene un perfil de clasificación
+    # PROPIO cuando alguien carga los 3. Si falta cualquiera de los dos
+    # (no sólo si faltan ambos), el perfil se considera incompleto y el
+    # evento cae ENTERO al piso de Línea -- nunca se mezclan campos de
+    # dos fuentes distintas para un mismo evento (ver resolver_umbrales_evento).
+    tiempo_ideal_seg: float = Field(default=240.0, description="Segundos ideales por unidad")
+    tiempo_lento_seg: Optional[float] = Field(default=None, description="Segundos que clasifican LENTO para este SKU (NULL = perfil incompleto, cae al piso de línea)")
+    tiempo_alerta_seg: Optional[float] = Field(default=None, description="Segundos que disparan ALERTA para este SKU (NULL = perfil incompleto, cae al piso de línea)")
+    umbral_calidad: float = Field(default=1800.0, description="Tolerancia en estación de calidad -- concepto de CALIDAD, no de rendimiento; no forma parte del perfil de tiempos de arriba")
 
     linea_id: Optional[uuid.UUID] = Field(default=None, foreign_key="dim_lineas.id") # OS Shell requirement para uploads
     unidades_por_ciclo: int = Field(default=1, description="Factor de lote (ej: 4 panes por molde)")
@@ -305,16 +312,24 @@ class MaestroSKU(TenantBase, table=True):
 class SkuTiempoEstacion(TenantBase, table=True):
     """Fase R (feedback de producto): un mismo SKU puede tardar distinto
     según en qué estación se procesa (ej. la Armadora vs. el Embalaje) --
-    MaestroSKU.tiempo_ciclo_teorico es un único valor genérico por SKU,
-    no alcanza para eso. Esta tabla es un OVERRIDE opcional por
+    MaestroSKU.tiempo_ideal_seg es un único valor genérico por SKU, no
+    alcanza para eso. Esta tabla es un OVERRIDE opcional por
     (SKU, Estación): si no existe fila acá para el par, scans.py cae al
-    tiempo_ciclo_teorico genérico del SKU (no bloquea nada, sólo hace
-    falta cargar el override donde realmente difiera del genérico)."""
+    perfil genérico del SKU (o al piso de línea si ese también está
+    incompleto -- no bloquea nada, sólo hace falta cargar el override
+    donde realmente difiera del genérico).
+
+    Fase AC: a diferencia de MaestroSKU, acá los 3 campos son NOT NULL --
+    una fila de override, si existe, siempre está completa (no tiene
+    sentido un override parcial: quien crea la fila define un perfil
+    entero para ese SKU en esa estación puntual, o no la crea)."""
     __tablename__ = "sku_tiempo_estacion"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     sku_fk: str = Field(foreign_key="maestro_skus.codigo_sku")
     estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id")
-    tiempo_ciclo_teorico: float = Field(description="Segundos ideales por unidad de este SKU en esta estación")
+    tiempo_ideal_seg: float = Field(description="Segundos ideales por unidad de este SKU en esta estación")
+    tiempo_lento_seg: float = Field(description="Segundos que clasifican LENTO para este SKU en esta estación")
+    tiempo_alerta_seg: float = Field(description="Segundos que disparan ALERTA para este SKU en esta estación")
     activo: bool = Field(default=True)
 
     __table_args__ = (
