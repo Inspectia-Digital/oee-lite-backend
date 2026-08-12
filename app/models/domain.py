@@ -491,6 +491,15 @@ class ParadaDetectada(TenantBase, table=True):
     # en el front sin ambigüedad -- antes ambas terminaban con el mismo
     # estado=CLASIFICADA y no había forma de diferenciarlas.
     origen: str = Field(default="AUTOMATICA")
+    # Fase AF (pedido de Green Mills): qué orden -- y por lo tanto qué SKU
+    # -- estaba activa cuando se detectó la parada, para poder analizar
+    # paradas POR SKU (ver /analytics/paradas-por-sku/). NULL para paradas
+    # de antes de este campo (no se backfillea con una suposición; quedan
+    # agrupadas como "Sin SKU asociado") y para paradas PLANIFICADAS (no
+    # están atadas a un evento de scans.py). Apunta a OrdenProduccion.id
+    # (UUID), no a id_orden -- mismo criterio C1/C2 que el resto de las
+    # FKs nuevas desde Fase AA (ver nota en OrdenProduccion).
+    orden_fk: Optional[uuid.UUID] = Field(default=None, foreign_key="ordenes_produccion.id")
 
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""

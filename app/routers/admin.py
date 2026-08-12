@@ -70,6 +70,12 @@ class TenantUpdate(BaseModel):
     # Fase N: objetivo de OEE configurable (antes hardcodeado en el front:
     # 75 en la tendencia, 85 en el Command Center).
     oee_objetivo_pct: Optional[float] = None
+    # Fase AF (reorganización de "carga de SKUs por el front", pedido de
+    # Green Mills): origen_maestros ya existía en el modelo y YA estaba
+    # enforced en el backend (verificar_permiso_carga_y_linea, importaciones.py
+    # -- rechaza con 409 la carga manual/archivo si es "ERP"), pero nunca
+    # tuvo forma de editarse por API -- un gap real, no un campo nuevo.
+    origen_maestros: Optional[str] = None
 
 class TenantLogoUpdate(BaseModel):
     logo_url: str
