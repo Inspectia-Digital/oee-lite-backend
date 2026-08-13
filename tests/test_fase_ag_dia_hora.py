@@ -33,6 +33,18 @@ def _preparar_escenario(db, tenant_id):
     return planta, linea, estacion
 
 
+def _dia_reciente_a_hora_local(dias_atras: int, hora: int, minuto: int = 0) -> tuple:
+    """Como _dia_reciente_a_las_14utc, pero ancla a una hora LOCAL
+    puntual (no UTC) -- para reproducir el escenario exacto de QA-08:
+    un evento tarde en la noche local (ej. 23:00) cae en el calendario
+    UTC del día SIGUIENTE. Devuelve (fecha_local, timestamp_utc)."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/Argentina/Buenos_Aires")
+    dia_local = (datetime.now(tz) - timedelta(days=dias_atras)).date()
+    ts_local = datetime.combine(dia_local, datetime.min.time(), tzinfo=tz).replace(hour=hora, minute=minuto)
+    return dia_local, ts_local.astimezone(timezone.utc)
+
+
 def _dia_reciente_a_las_14utc(dias_atras: int) -> datetime:
     """/api/lite/scans rechaza timestamps de más de 7 días de antigüedad
     (_validar_rango_timestamp) -- a diferencia de otros tests de esta
@@ -158,3 +170,35 @@ def test_dia_promedio_rango_invertido_devuelve_400(client, db, tenant_a, gerente
         headers={"X-Sub-Tenant-Id": str(planta.id)},
     )
     assert r.status_code == 400
+
+
+# ---------- Fase AO (auditoría QA, QA-08): rango en timezone de planta ----------
+
+def test_dia_detalle_incluye_evento_de_la_noche_local_del_dia_consultado(client, db, tenant_a, gerente_a):
+    """QA-08: un evento a las 23:00 hora LOCAL de planta (UTC-3) cae a
+    las 02:00 UTC del día CALENDARIO SIGUIENTE. obtener_rango_dia antes
+    construía [00:00, 23:59:59] en UTC puro para el día consultado --
+    ese evento quedaba afuera (el rango terminaba a las 23:59:59 UTC del
+    mismo día, 3 horas antes de que el evento siquiera ocurriera en UTC).
+    Ahora el rango se arma en la timezone real de la planta."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    credencial = _emitir_credencial(client, gerente_a, estacion.id)
+
+    dia_local, ts_utc = _dia_reciente_a_hora_local(3, hora=23, minuto=0)
+    _postear_evento(client, credencial, estacion.id, ts_utc)
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/dia-detalle/",
+        params={"fecha": dia_local.isoformat(), "linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    filas = r.json()
+    assert len(filas) == 24
+    fila_23 = next(f for f in filas if f["hora"] == 23)
+    assert fila_23["unidades_producidas"] == 1
+    # Confirma que no se coló como si fuera "hora 2" del día calendario
+    # (que sería el síntoma del bug viejo si de casualidad el evento
+    # hubiera matcheado igual contra el rango de OTRO día).
+    assert sum(f["unidades_producidas"] for f in filas) == 1

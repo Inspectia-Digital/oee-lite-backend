@@ -210,7 +210,7 @@ class CommandCenterSummary(BaseModel):
 # ==========================================
 # --- HELPER FUNCTIONS ---
 # ==========================================
-def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
+def obtener_rango_dia(fecha_busqueda: Optional[date] = None, context: Optional[TenantContext] = None, db: Optional[Session] = None):
     # Fase P: era datetime.now() (hora del SERVIDOR) contra
     # LiteEventoProduccion.timestamp, que siempre se guarda en UTC puro
     # (default_factory=datetime.utcnow en el modelo). En un servidor cuyo
@@ -218,7 +218,35 @@ def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
     # con lo que hay guardado -- se vio en vivo: al cruzar la medianoche
     # UTC, varios endpoints con rango por defecto (éste incluido) dejaban
     # de encontrar eventos de "hoy" que sí estaban en la base.
+    #
+    # QA-08 (auditoría QA): ese fix sólo resolvió CUÁL es "hoy" (evitar
+    # que datetime.now() del servidor desalineara el día calendario) --
+    # seguía construyendo [00:00, 23:59:59] en UTC PURO, sin la
+    # timezone de la PLANTA. Para una planta en UTC-3, ese rango arranca
+    # 3 horas antes de la medianoche local: incluye la noche local del
+    # día ANTERIOR y excluye la noche local del día consultado. Los
+    # endpoints horarios (Fase AG) agrupaban correctamente por hora
+    # local después, pero sobre un conjunto inicial ya incorrecto. Ahora,
+    # si se pasan context+db, el rango se arma en la timezone real de la
+    # planta activa (medianoche a medianoche LOCAL, convertido a UTC
+    # recién al final para comparar contra timestamps persistidos, que
+    # siempre están en UTC). Sin context/db (o sin planta activa/
+    # timezone configurada) cae al comportamiento anterior -- red de
+    # seguridad, no un camino pensado para quedarse así a propósito.
     f = fecha_busqueda or datetime.utcnow().date()
+    if context is not None and db is not None and context.sub_tenant_id:
+        planta = db.get(Planta, context.sub_tenant_id)
+        if planta and planta.timezone:
+            try:
+                tz = ZoneInfo(planta.timezone)
+                inicio_local = datetime.combine(f, time.min, tzinfo=tz)
+                fin_local = datetime.combine(f, time.max, tzinfo=tz)
+                return (
+                    inicio_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
+                    fin_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
+                )
+            except Exception:
+                pass
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
 def validar_planta(context: TenantContext):
@@ -242,7 +270,7 @@ def obtener_dashboard_estaciones(
 ):
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia()
+        inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         
         # 🔒 CAST EXPLÍCITO para cruzar String (id_estacion) con UUID (Estacion.id)
         resultados = db.exec(
@@ -410,8 +438,8 @@ def _calcular_metricas_oee(
     principal, no como un join más (evitaría reescribir todos los
     `for e, _, _ in eventos` de acá abajo, que asumen exactamente 3
     columnas)."""
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
     query = (
         select(LiteEventoProduccion, Estacion, Linea)
@@ -441,7 +469,16 @@ def _calcular_metricas_oee(
         return None
 
     total_unidades = sum(e.unidades_procesadas for e, _, _ in eventos)
-    dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
+    # QA-08 (auditoría QA): con obtener_rango_dia ahora devolviendo el
+    # rango en UTC pero calculado desde medianoche LOCAL de planta, un
+    # (fin.date() - inicio.date()) tomado directo sobre esos UTC-naive
+    # infla el conteo en un día de más (fin cae en el calendario UTC del
+    # día SIGUIENTE al pedido, por el corrimiento de huso horario). Se
+    # calcula sobre las fechas ORIGINALES pedidas -- las mismas que
+    # entraron a obtener_rango_dia -- nunca sobre el UTC ya convertido.
+    fecha_desde_real = fecha_desde or datetime.utcnow().date()
+    fecha_hasta_real = (fecha_hasta or fecha_desde) or datetime.utcnow().date()
+    dias_consulta = max(1, (fecha_hasta_real - fecha_desde_real).days + 1)
 
     # Fase Q (feedback de producto): tiempo_planificado antes se calculaba
     # sobre TODO el rango consultado (dias_consulta) -- pedir "últimos 7
@@ -620,10 +657,10 @@ def obtener_reporte_springwall(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion, Operario)
@@ -725,10 +762,10 @@ def obtener_pareto_paradas(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(ParadaDetectada, MotivoParada)
@@ -834,10 +871,10 @@ def obtener_cuellos_botella(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -1003,7 +1040,7 @@ def obtener_alertas_vivas(
 ):
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia()
+        inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         alertas = []
 
         # 1. Paradas Pendientes
@@ -1151,10 +1188,10 @@ def obtener_rendimiento_secuencial(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -2080,10 +2117,10 @@ def obtener_paradas_por_sku(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(ParadaDetectada, MotivoParada, OrdenProduccion)
@@ -2166,8 +2203,8 @@ def obtener_rendimiento_sku(
     except ValueError:
         return []
 
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
     # SKUs con al menos un evento en el período/línea -- resueltos vía
     # orden_fk (id_orden string) -> OrdenProduccion.sku_fk, igual que
@@ -2327,7 +2364,7 @@ def obtener_dia_detalle(
     except ValueError:
         return [DiaDetalleHoraRow(hora=h, unidades_producidas=0, minutos_perdidos=0.0, paradas=0, rendimiento_pct=0.0) for h in range(24)]
 
-    inicio, fin = obtener_rango_dia(fecha)
+    inicio, fin = obtener_rango_dia(fecha, context, db)
     buckets, _dias = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
 
     return [
@@ -2372,8 +2409,8 @@ def obtener_dia_promedio(
     if fecha_hasta < fecha_desde:
         raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta, context, db)
     buckets, dias_con_actividad = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
 
     if dias_con_actividad == 0:
