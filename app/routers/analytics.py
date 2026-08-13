@@ -1441,20 +1441,43 @@ def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
     return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).time()
 
 
+def _dia_iso_anterior(dia_iso: int) -> int:
+    """1=lunes..7=domingo (Fase Q) -- el día anterior a lunes es domingo."""
+    return 7 if dia_iso == 1 else dia_iso - 1
+
+
 def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
     """Qué Turno (de una lista ya acotada a una línea) está vigente para
-    una hora+día puntuales -- mismo criterio que turno_actual en
-    /analytics/linea-en-vivo/ (horario + día de semana, primer match
-    gana), generalizado para resolver un timestamp CUALQUIERA (no sólo
-    "ahora"). None si ninguno matchea -- no se inventa un turno."""
+    una hora+día puntuales -- horario + día de semana, primer match gana.
+    Usada tanto por /analytics/linea-en-vivo/ (con la hora/día de AHORA)
+    como para resolver un timestamp arbitrario (Fase AD/AN).
+
+    QA-05 (auditoría QA): antes se chequeaba dias_semana contra el día
+    CALENDARIO del momento consultado, sin importar si el turno cruza
+    medianoche -- un turno "lunes 22:00-06:00" (dias_semana="1")
+    consultado el MARTES a las 02:00 nunca resolvía, porque dia_iso ya
+    era martes (2), no lunes (1), aunque el turno siga técnicamente en
+    curso (arrancó el lunes a la noche). dias_semana describe el día en
+    que el turno ARRANCA, no el día calendario de cada instante dentro
+    de él -- así que primero se determina si hora_local cae en la mitad
+    "de noche" (después de hora_inicio, arrancó HOY) o en la mitad
+    "de madrugada" (antes de hora_fin, arrancó AYER) de un turno que
+    cruza medianoche, y recién ahí se compara dias_semana contra el día
+    que corresponde. None si ninguno matchea -- no se inventa un turno."""
     for t in turnos:
-        if not _dia_en_dias_semana(dia_iso, t.dias_semana):
-            continue
         if t.hora_inicio <= t.hora_fin:
             en_turno = t.hora_inicio <= hora_local <= t.hora_fin
+            dia_de_inicio = dia_iso
+        elif hora_local >= t.hora_inicio:
+            en_turno = True
+            dia_de_inicio = dia_iso
+        elif hora_local <= t.hora_fin:
+            en_turno = True
+            dia_de_inicio = _dia_iso_anterior(dia_iso)
         else:
-            en_turno = hora_local >= t.hora_inicio or hora_local <= t.hora_fin
-        if en_turno:
+            en_turno = False
+            dia_de_inicio = dia_iso
+        if en_turno and _dia_en_dias_semana(dia_de_inicio, t.dias_semana):
             return t
     return None
 
@@ -1508,17 +1531,12 @@ def obtener_linea_en_vivo(
                 Turno.activo == True,  # noqa: E712
             )
         ).all()
-        turno_actual = None
-        for t in turnos:
-            if not _dia_en_dias_semana(dia_iso_hoy, t.dias_semana):
-                continue
-            if t.hora_inicio <= t.hora_fin:
-                en_turno = t.hora_inicio <= ahora_time <= t.hora_fin
-            else:  # turno que cruza medianoche
-                en_turno = ahora_time >= t.hora_inicio or ahora_time <= t.hora_fin
-            if en_turno:
-                turno_actual = t
-                break
+        # QA-05 (auditoría QA): esta resolución vivía duplicada acá y en
+        # _resolver_turno_por_horario -- exactamente el tipo de
+        # duplicación que dejó pasar el bug del turno nocturno (se
+        # arregló una copia en Fase AD sin tocar ésta). Ahora hay una
+        # sola fuente de verdad.
+        turno_actual = _resolver_turno_por_horario(ahora_time, dia_iso_hoy, turnos)
 
         # Fase AA: misma resolución que scans.py (resolver_orden_activa,
         # clasificacion.py) -- si la línea tiene un Plan de Producción
