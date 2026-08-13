@@ -846,3 +846,96 @@ def test_actualizar_orden_sin_tocar_plan_ni_linea_no_revalida(client, db, tenant
     r = client.patch(f"/config/ordenes/{orden['id_orden']}", json={"cantidad_esperada": 250}, headers=headers)
     assert r.status_code == 200
     assert r.json()["cantidad_esperada"] == 250
+
+
+# ---------- Fase AP (auditoría QA, QA-12): no avanzar a una orden inactiva ----------
+
+def test_avanzar_orden_salta_la_siguiente_si_esta_inactiva(client, db, tenant_a, gerente_a):
+    """QA-12: si la orden que seguía en la secuencia se desactivó desde
+    Configuración (baja lógica) entre medio, avanzar_orden no debe
+    reactivarla -- el plan se cierra solo, como si no quedara ninguna."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+
+    # Desactiva o2 (la que seguiría en la secuencia) ANTES de avanzar.
+    r = client.delete(f"/config/ordenes/{o2['id_orden']}", headers=headers)
+    assert r.status_code == 200
+
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # o2 está inactiva -> se salta
+    assert r.status_code == 200
+    body = r.json()
+    assert body["orden_cerrada_id_orden"] == o1["id_orden"]
+    assert body["orden_activa_id_orden"] is None
+    assert body["estado"] == "cerrado"
+
+    o2_db = client.get(f"/config/ordenes/{o2['id_orden']}", headers=headers).json()
+    assert o2_db["estado"] != "en_progreso"  # nunca se activó
+
+
+# ---------- Fase AR (auditoría QA, QA-11): secuencia positiva y única ----------
+
+def test_crear_orden_con_secuencia_negativa_en_plan_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan"},
+        headers=headers,
+    ).json()
+
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"], "secuencia": -1},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_crear_orden_con_secuencia_duplicada_en_plan_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan"},
+        headers=headers,
+    ).json()
+    client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-A-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"], "secuencia": 1},
+        headers=headers,
+    )
+
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-B-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 50, "plan_id": plan["id"], "secuencia": 1},
+        headers=headers,
+    )
+    assert r.status_code == 409
+
+
+def test_actualizar_orden_a_secuencia_duplicada_en_plan_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    # o1 y o2 se autoasignaron secuencia 1 y 2 -- intentar mover o2 a la
+    # misma secuencia que o1 debe fallar.
+    r = client.patch(f"/config/ordenes/{o2['id_orden']}", json={"secuencia": 1}, headers=headers)
+    assert r.status_code == 409
+
+
+def test_actualizar_orden_a_su_propia_secuencia_no_falla(client, db, tenant_a, gerente_a):
+    """Regresión: re-enviar la MISMA secuencia que ya tenía la orden no
+    debe rechazarse como "duplicada consigo misma"."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+
+    r = client.patch(f"/config/ordenes/{o1['id_orden']}", json={"secuencia": 1}, headers=headers)
+    assert r.status_code == 200

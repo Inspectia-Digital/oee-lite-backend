@@ -965,6 +965,24 @@ def crear_orden(
                 .order_by(OrdenProduccion.secuencia.desc())
             ).first()
             datos["secuencia"] = (maxima or 0) + 1
+        else:
+            # QA-11 (auditoría QA): el autoasignado de arriba siempre da
+            # positivo y único -- el problema real es el override manual
+            # (la API lo permite y no validaba nada). avanzar_orden
+            # (operacion.py) selecciona "la primera con secuencia >
+            # secuencia_actual"; secuencias duplicadas o negativas la
+            # vuelven no determinística o directamente rompen el avance.
+            if datos["secuencia"] <= 0:
+                raise HTTPException(status_code=400, detail="secuencia tiene que ser mayor que cero dentro de un plan.")
+            duplicada = db.exec(
+                select(OrdenProduccion.id_orden).where(
+                    OrdenProduccion.tenant_id == context.tenant_id,
+                    OrdenProduccion.plan_id == plan.id,
+                    OrdenProduccion.secuencia == datos["secuencia"],
+                )
+            ).first()
+            if duplicada:
+                raise HTTPException(status_code=409, detail=f"Ya existe una orden con secuencia {datos['secuencia']} en este plan ('{duplicada}').")
     elif datos.get("secuencia") is None:
         datos["secuencia"] = 0
 
@@ -1030,8 +1048,8 @@ def actualizar_orden(
     # esperada) -- no hay que bloquear ediciones no relacionadas de una
     # orden vieja por datos que pudieran haber quedado inconsistentes
     # antes de este fix.
+    plan_id_efectivo = datos.get("plan_id", orden.plan_id)
     if "plan_id" in datos or "linea_id" in datos:
-        plan_id_efectivo = datos.get("plan_id", orden.plan_id)
         linea_id_efectivo = datos.get("linea_id", orden.linea_id)
         if plan_id_efectivo:
             plan = db.exec(
@@ -1045,6 +1063,25 @@ def actualizar_orden(
                 raise HTTPException(status_code=400, detail="linea_id no coincide con la línea del plan.")
             if "linea_id" not in datos:
                 datos["linea_id"] = plan.linea_id
+
+    # QA-11 (auditoría QA): mismo criterio que crear_orden -- si esta
+    # edición toca secuencia y la orden pertenece (o va a pertenecer) a
+    # un plan, validar positivo y sin duplicados dentro de ESE plan
+    # (excluyendo la propia orden que se está editando).
+    if "secuencia" in datos and datos["secuencia"] is not None and plan_id_efectivo:
+        nueva_secuencia = datos["secuencia"]
+        if nueva_secuencia <= 0:
+            raise HTTPException(status_code=400, detail="secuencia tiene que ser mayor que cero dentro de un plan.")
+        duplicada = db.exec(
+            select(OrdenProduccion.id_orden).where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.plan_id == plan_id_efectivo,
+                OrdenProduccion.secuencia == nueva_secuencia,
+                OrdenProduccion.id_orden != id_orden,
+            )
+        ).first()
+        if duplicada:
+            raise HTTPException(status_code=409, detail=f"Ya existe una orden con secuencia {nueva_secuencia} en este plan ('{duplicada}').")
 
     for key, value in datos.items():
         setattr(orden, key, value)

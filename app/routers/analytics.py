@@ -210,7 +210,7 @@ class CommandCenterSummary(BaseModel):
 # ==========================================
 # --- HELPER FUNCTIONS ---
 # ==========================================
-def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
+def obtener_rango_dia(fecha_busqueda: Optional[date] = None, context: Optional[TenantContext] = None, db: Optional[Session] = None):
     # Fase P: era datetime.now() (hora del SERVIDOR) contra
     # LiteEventoProduccion.timestamp, que siempre se guarda en UTC puro
     # (default_factory=datetime.utcnow en el modelo). En un servidor cuyo
@@ -218,7 +218,35 @@ def obtener_rango_dia(fecha_busqueda: Optional[date] = None):
     # con lo que hay guardado -- se vio en vivo: al cruzar la medianoche
     # UTC, varios endpoints con rango por defecto (éste incluido) dejaban
     # de encontrar eventos de "hoy" que sí estaban en la base.
+    #
+    # QA-08 (auditoría QA): ese fix sólo resolvió CUÁL es "hoy" (evitar
+    # que datetime.now() del servidor desalineara el día calendario) --
+    # seguía construyendo [00:00, 23:59:59] en UTC PURO, sin la
+    # timezone de la PLANTA. Para una planta en UTC-3, ese rango arranca
+    # 3 horas antes de la medianoche local: incluye la noche local del
+    # día ANTERIOR y excluye la noche local del día consultado. Los
+    # endpoints horarios (Fase AG) agrupaban correctamente por hora
+    # local después, pero sobre un conjunto inicial ya incorrecto. Ahora,
+    # si se pasan context+db, el rango se arma en la timezone real de la
+    # planta activa (medianoche a medianoche LOCAL, convertido a UTC
+    # recién al final para comparar contra timestamps persistidos, que
+    # siempre están en UTC). Sin context/db (o sin planta activa/
+    # timezone configurada) cae al comportamiento anterior -- red de
+    # seguridad, no un camino pensado para quedarse así a propósito.
     f = fecha_busqueda or datetime.utcnow().date()
+    if context is not None and db is not None and context.sub_tenant_id:
+        planta = db.get(Planta, context.sub_tenant_id)
+        if planta and planta.timezone:
+            try:
+                tz = ZoneInfo(planta.timezone)
+                inicio_local = datetime.combine(f, time.min, tzinfo=tz)
+                fin_local = datetime.combine(f, time.max, tzinfo=tz)
+                return (
+                    inicio_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
+                    fin_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
+                )
+            except Exception:
+                pass
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
 def validar_planta(context: TenantContext):
@@ -242,7 +270,11 @@ def obtener_dashboard_estaciones(
 ):
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia()
+    except ValueError:
+        return []
+
+    try:
+        inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         
         # 🔒 CAST EXPLÍCITO para cruzar String (id_estacion) con UUID (Estacion.id)
         resultados = db.exec(
@@ -301,9 +333,6 @@ def obtener_dashboard_estaciones(
         return reporte_final
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en dashboard: {e}")
-        return []
 
 
 @router.get("/analytics/oee-general/", response_model=OeeGeneralCard)
@@ -410,8 +439,8 @@ def _calcular_metricas_oee(
     principal, no como un join más (evitaría reescribir todos los
     `for e, _, _ in eventos` de acá abajo, que asumen exactamente 3
     columnas)."""
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
     query = (
         select(LiteEventoProduccion, Estacion, Linea)
@@ -441,7 +470,16 @@ def _calcular_metricas_oee(
         return None
 
     total_unidades = sum(e.unidades_procesadas for e, _, _ in eventos)
-    dias_consulta = max(1, (fin.date() - inicio.date()).days + 1)
+    # QA-08 (auditoría QA): con obtener_rango_dia ahora devolviendo el
+    # rango en UTC pero calculado desde medianoche LOCAL de planta, un
+    # (fin.date() - inicio.date()) tomado directo sobre esos UTC-naive
+    # infla el conteo en un día de más (fin cae en el calendario UTC del
+    # día SIGUIENTE al pedido, por el corrimiento de huso horario). Se
+    # calcula sobre las fechas ORIGINALES pedidas -- las mismas que
+    # entraron a obtener_rango_dia -- nunca sobre el UTC ya convertido.
+    fecha_desde_real = fecha_desde or datetime.utcnow().date()
+    fecha_hasta_real = (fecha_hasta or fecha_desde) or datetime.utcnow().date()
+    dias_consulta = max(1, (fecha_hasta_real - fecha_desde_real).days + 1)
 
     # Fase Q (feedback de producto): tiempo_planificado antes se calculaba
     # sobre TODO el rango consultado (dias_consulta) -- pedir "últimos 7
@@ -619,11 +657,15 @@ def obtener_reporte_springwall(
     campo directo en el evento (LiteEventoProduccion no guarda turno_fk)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion, Operario)
@@ -704,9 +746,6 @@ def obtener_reporte_springwall(
         return reporte_final
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Reporte Operario: {e}")
-        return []
 
 
 @router.get("/analytics/pareto-paradas/", response_model=list[ParetoParadas])
@@ -724,11 +763,15 @@ def obtener_pareto_paradas(
     reporte (/analytics/paradas-por-sku/), no se mezcla con este."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(ParadaDetectada, MotivoParada)
@@ -769,9 +812,6 @@ def obtener_pareto_paradas(
         return reporte
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Pareto: {e}")
-        return []
 
 
 def _eventos_con_ciclo_real(eventos_ordenados):
@@ -833,11 +873,15 @@ def obtener_cuellos_botella(
     real."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -936,9 +980,6 @@ def obtener_cuellos_botella(
         return sorted(res, key=lambda x: x.desvio_pct, reverse=True)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Cuellos de Botella: {e}")
-        return []
 
 
 @router.get("/analytics/oee-tendencia/", response_model=list[TendenciaOEERow])
@@ -990,9 +1031,6 @@ def tendencia_oee_diaria(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en tendencia OEE: {e}")
-        return []
 
 
 @router.get("/analytics/alertas-vivas/", response_model=list[AlertaActiva])
@@ -1003,7 +1041,11 @@ def obtener_alertas_vivas(
 ):
     try:
         validar_planta(context)
-        inicio_dia, fin_dia = obtener_rango_dia()
+    except ValueError:
+        return []
+
+    try:
+        inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         alertas = []
 
         # 1. Paradas Pendientes
@@ -1062,10 +1104,6 @@ def obtener_alertas_vivas(
         return alertas
     except HTTPException:
         raise # Dejamos pasar el 400 del sub_tenant faltante
-    except Exception as e:
-        logger.error(f"Error fatal en alertas_vivas: {str(e)}")
-        # Escudo protector final: Retornamos lista vacía para no romper la UI
-        return []
 
 
 # ==========================================
@@ -1150,11 +1188,15 @@ def obtener_rendimiento_secuencial(
     mismo fix en /analytics/cuellos-botella/)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -1224,9 +1266,6 @@ def obtener_rendimiento_secuencial(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento secuencial: {e}")
-        return []
 
 
 @router.get("/analytics/reporte-produccion/", response_model=list[ReporteProduccionRow])
@@ -1242,6 +1281,10 @@ def obtener_reporte_produccion(
     que los filtros del dashboard tengan efecto real acá también."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
@@ -1291,9 +1334,6 @@ def obtener_reporte_produccion(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en reporte de producción: {e}")
-        return []
 
 
 @router.get("/analytics/plan-vs-actual/", response_model=list[PlanVsActualRow])
@@ -1315,6 +1355,10 @@ def obtener_plan_vs_actual(
     puede seguir sumando piezas después de su plan_fecha)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
@@ -1366,9 +1410,6 @@ def obtener_plan_vs_actual(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en plan vs actual: {e}")
-        return []
 
 
 # Sin eventos hace más de esto, la estación se considera "sin_datos" (no
@@ -1441,20 +1482,56 @@ def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
     return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).time()
 
 
+def _dia_iso_anterior(dia_iso: int) -> int:
+    """1=lunes..7=domingo (Fase Q) -- el día anterior a lunes es domingo."""
+    return 7 if dia_iso == 1 else dia_iso - 1
+
+
+def _fecha_inicio_turno(fecha_consulta: date, hora_local: time, turno: Turno) -> date:
+    """QA-09 (auditoría QA): qué fecha usar para buscar en
+    AsignacionTurno.fecha -- el día en que el TURNO empieza, no
+    necesariamamente fecha_consulta. Para un turno que cruza medianoche,
+    si hora_local cae en la franja "de madrugada" (antes de hora_fin,
+    ver _resolver_turno_por_horario), el turno arrancó AYER -- la
+    dotación se carga pensando en "el turno del lunes a la noche", con
+    fecha=lunes, no fecha=martes."""
+    if turno.hora_inicio > turno.hora_fin and hora_local <= turno.hora_fin:
+        return fecha_consulta - timedelta(days=1)
+    return fecha_consulta
+
+
 def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
     """Qué Turno (de una lista ya acotada a una línea) está vigente para
-    una hora+día puntuales -- mismo criterio que turno_actual en
-    /analytics/linea-en-vivo/ (horario + día de semana, primer match
-    gana), generalizado para resolver un timestamp CUALQUIERA (no sólo
-    "ahora"). None si ninguno matchea -- no se inventa un turno."""
+    una hora+día puntuales -- horario + día de semana, primer match gana.
+    Usada tanto por /analytics/linea-en-vivo/ (con la hora/día de AHORA)
+    como para resolver un timestamp arbitrario (Fase AD/AN).
+
+    QA-05 (auditoría QA): antes se chequeaba dias_semana contra el día
+    CALENDARIO del momento consultado, sin importar si el turno cruza
+    medianoche -- un turno "lunes 22:00-06:00" (dias_semana="1")
+    consultado el MARTES a las 02:00 nunca resolvía, porque dia_iso ya
+    era martes (2), no lunes (1), aunque el turno siga técnicamente en
+    curso (arrancó el lunes a la noche). dias_semana describe el día en
+    que el turno ARRANCA, no el día calendario de cada instante dentro
+    de él -- así que primero se determina si hora_local cae en la mitad
+    "de noche" (después de hora_inicio, arrancó HOY) o en la mitad
+    "de madrugada" (antes de hora_fin, arrancó AYER) de un turno que
+    cruza medianoche, y recién ahí se compara dias_semana contra el día
+    que corresponde. None si ninguno matchea -- no se inventa un turno."""
     for t in turnos:
-        if not _dia_en_dias_semana(dia_iso, t.dias_semana):
-            continue
         if t.hora_inicio <= t.hora_fin:
             en_turno = t.hora_inicio <= hora_local <= t.hora_fin
+            dia_de_inicio = dia_iso
+        elif hora_local >= t.hora_inicio:
+            en_turno = True
+            dia_de_inicio = dia_iso
+        elif hora_local <= t.hora_fin:
+            en_turno = True
+            dia_de_inicio = _dia_iso_anterior(dia_iso)
         else:
-            en_turno = hora_local >= t.hora_inicio or hora_local <= t.hora_fin
-        if en_turno:
+            en_turno = False
+            dia_de_inicio = dia_iso
+        if en_turno and _dia_en_dias_semana(dia_de_inicio, t.dias_semana):
             return t
     return None
 
@@ -1508,17 +1585,12 @@ def obtener_linea_en_vivo(
                 Turno.activo == True,  # noqa: E712
             )
         ).all()
-        turno_actual = None
-        for t in turnos:
-            if not _dia_en_dias_semana(dia_iso_hoy, t.dias_semana):
-                continue
-            if t.hora_inicio <= t.hora_fin:
-                en_turno = t.hora_inicio <= ahora_time <= t.hora_fin
-            else:  # turno que cruza medianoche
-                en_turno = ahora_time >= t.hora_inicio or ahora_time <= t.hora_fin
-            if en_turno:
-                turno_actual = t
-                break
+        # QA-05 (auditoría QA): esta resolución vivía duplicada acá y en
+        # _resolver_turno_por_horario -- exactamente el tipo de
+        # duplicación que dejó pasar el bug del turno nocturno (se
+        # arregló una copia en Fase AD sin tocar ésta). Ahora hay una
+        # sola fuente de verdad.
+        turno_actual = _resolver_turno_por_horario(ahora_time, dia_iso_hoy, turnos)
 
         # Fase AA: misma resolución que scans.py (resolver_orden_activa,
         # clasificacion.py) -- si la línea tiene un Plan de Producción
@@ -1651,9 +1723,6 @@ def obtener_linea_en_vivo(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en línea en vivo: {e}")
-        return LineaEnVivoResumen()
 
 
 @router.get("/analytics/rendimiento-operarios/", response_model=list[RendimientoOperarioRow])
@@ -1719,19 +1788,59 @@ def obtener_rendimiento_operarios(
         # /analytics/linea-en-vivo/ (_fecha_planta), pero nunca se aplicó acá.
         planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
         estacion_ids = {est.id for _, est in eventos}
-        fechas = {_fecha_planta(e.timestamp, planta) for e, _ in eventos}
+
+        # QA-09 (auditoría QA): antes se agrupaba operario por
+        # (estacion_fk, fecha) -- con DOS turnos en la misma estación el
+        # mismo día (el caso normal: turno día + turno noche), la
+        # segunda asignación cargada pisaba a la primera en este dict, y
+        # TODOS los eventos de ese día terminaban atribuidos a un único
+        # operario (el que ganara el orden no garantizado de las filas
+        # de Postgres). Ahora cada evento resuelve primero SU turno por
+        # horario (mismo criterio corregido en Fase AM) y la key de
+        # lookup suma turno_fk.
+        linea_ids = {est.linea_id for _, est in eventos if est.linea_id}
+        turnos_por_linea: Dict[uuid.UUID, List[Turno]] = {}
+        if linea_ids:
+            for t in db.exec(
+                select(Turno).where(
+                    Turno.tenant_id == context.tenant_id,
+                    Turno.linea_id.in_(linea_ids),
+                    Turno.activo == True,  # noqa: E712
+                )
+            ).all():
+                turnos_por_linea.setdefault(t.linea_id, []).append(t)
+
+        # Resuelto una sola vez por evento (se reusa para acotar qué
+        # fechas traer de AsignacionTurno y para el lookup real de abajo).
+        resolucion_por_evento: Dict[uuid.UUID, tuple] = {}
+        for evento, estacion in eventos:
+            hora_local = _hora_planta(evento.timestamp, planta)
+            fecha_evento = _fecha_planta(evento.timestamp, planta)
+            turno = _resolver_turno_por_horario(
+                hora_local, fecha_evento.isoweekday(), turnos_por_linea.get(estacion.linea_id, [])
+            )
+            if turno:
+                resolucion_por_evento[evento.id] = (turno.id, _fecha_inicio_turno(fecha_evento, hora_local, turno))
+
+        fechas_necesarias = {f for _, f in resolucion_por_evento.values()}
         asignaciones = db.exec(
             select(AsignacionTurno).where(
                 AsignacionTurno.tenant_id == context.tenant_id,
                 AsignacionTurno.estacion_fk.in_(estacion_ids),
-                AsignacionTurno.fecha.in_(fechas),
+                AsignacionTurno.fecha.in_(fechas_necesarias),
             )
-        ).all()
-        operario_por_estacion_fecha = {(a.estacion_fk, a.fecha): a.operario_fk for a in asignaciones}
+        ).all() if fechas_necesarias else []
+        operario_por_estacion_fecha_turno = {
+            (a.estacion_fk, a.fecha, a.turno_fk): a.operario_fk for a in asignaciones
+        }
 
         agrupado = {}
         for evento, estacion in eventos:
-            op_id = operario_por_estacion_fecha.get((estacion.id, _fecha_planta(evento.timestamp, planta)))
+            resuelto = resolucion_por_evento.get(evento.id)
+            if not resuelto:
+                continue  # sin turno resuelto, no hay forma de saber a quién atribuirlo
+            turno_id, fecha_inicio = resuelto
+            op_id = operario_por_estacion_fecha_turno.get((estacion.id, fecha_inicio, turno_id))
             if not op_id:
                 continue
             if operario_id and op_id != operario_id:
@@ -1784,9 +1893,6 @@ def obtener_rendimiento_operarios(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento de operarios: {e}")
-        return []
 
 
 @router.get("/command-center/summary", response_model=CommandCenterSummary)
@@ -1986,9 +2092,6 @@ def obtener_rendimiento_maquinas(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento de máquinas: {e}")
-        return []
 
 
 @router.get("/analytics/paradas-por-sku/", response_model=list[ParadasPorSku])
@@ -2009,10 +2112,10 @@ def obtener_paradas_por_sku(
     try:
         validar_planta(context)
         if fecha is not None:
-            inicio_dia, fin_dia = obtener_rango_dia(fecha)
+            inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
-            inicio_dia, _ = obtener_rango_dia(fecha_desde)
-            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde)
+            inicio_dia, _ = obtener_rango_dia(fecha_desde, context, db)
+            _, fin_dia = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
         query = (
             select(ParadaDetectada, MotivoParada, OrdenProduccion)
@@ -2053,9 +2156,6 @@ def obtener_paradas_por_sku(
         return reporte
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en paradas por SKU: {e}")
-        return []
 
 
 # ==========================================
@@ -2095,8 +2195,8 @@ def obtener_rendimiento_sku(
     except ValueError:
         return []
 
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde, context, db)
 
     # SKUs con al menos un evento en el período/línea -- resueltos vía
     # orden_fk (id_orden string) -> OrdenProduccion.sku_fk, igual que
@@ -2256,7 +2356,7 @@ def obtener_dia_detalle(
     except ValueError:
         return [DiaDetalleHoraRow(hora=h, unidades_producidas=0, minutos_perdidos=0.0, paradas=0, rendimiento_pct=0.0) for h in range(24)]
 
-    inicio, fin = obtener_rango_dia(fecha)
+    inicio, fin = obtener_rango_dia(fecha, context, db)
     buckets, _dias = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
 
     return [
@@ -2301,8 +2401,8 @@ def obtener_dia_promedio(
     if fecha_hasta < fecha_desde:
         raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
-    inicio, _ = obtener_rango_dia(fecha_desde)
-    _, fin = obtener_rango_dia(fecha_hasta)
+    inicio, _ = obtener_rango_dia(fecha_desde, context, db)
+    _, fin = obtener_rango_dia(fecha_hasta, context, db)
     buckets, dias_con_actividad = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
 
     if dias_con_actividad == 0:

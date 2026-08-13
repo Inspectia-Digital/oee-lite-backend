@@ -364,7 +364,18 @@ def avanzar_orden(
     if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
         raise HTTPException(status_code=403, detail="Sólo Supervisor, Gerencia, Producción o SuperAdmin pueden avanzar un plan.")
 
-    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    # QA-10 (auditoría QA): FOR UPDATE bloquea la fila del plan por el
+    # resto de esta transacción -- dos requests concurrentes de
+    # avanzar_orden sobre el MISMO plan (doble clic, doble tap) ya no
+    # pueden leer el mismo estado "antes" y avanzar los dos: el segundo
+    # espera a que el primero haga commit y recién ahí lee el estado ya
+    # actualizado. Mismo patrón que scans.py usa para serializar por
+    # estación (with_for_update()).
+    plan = db.exec(
+        select(PlanProduccion)
+        .where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)
+        .with_for_update()
+    ).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
     if context.sub_tenant_id:
@@ -402,6 +413,11 @@ def avanzar_orden(
             OrdenProduccion.plan_id == plan.id,
             OrdenProduccion.secuencia > secuencia_actual,
             OrdenProduccion.estado != EstadoOrden.CERRADA,
+            # QA-12 (auditoría QA): antes no exigía activo==true -- una
+            # orden desactivada desde Configuración (baja lógica) podía
+            # volver a activarse igual al avanzar el plan, como si nunca
+            # se hubiera dado de baja.
+            OrdenProduccion.activo == True,  # noqa: E712
         )
         .order_by(OrdenProduccion.secuencia)
     ).first()
