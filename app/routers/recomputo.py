@@ -76,6 +76,17 @@ def recomputar_eventos(
     if not estacion:
         raise HTTPException(status_code=404, detail="Estación no encontrada.")
 
+    # QA-07 (auditoría QA): antes el recómputo no tomaba ningún lock
+    # sobre la estación -- si llegaba un scan real mientras corría (lee
+    # eventos, recalcula uno por uno, un solo commit al final), la
+    # ingesta podía crear una parada nueva sobre una continuidad que el
+    # recómputo todavía estaba reescribiendo, con resultado dependiente
+    # del orden de commits. Mismo mecanismo que ya serializa la ingesta
+    # en scans.py (with_for_update() sobre la fila de la estación): un
+    # scan concurrente para esta MISMA estación espera a que este
+    # recómputo termine (o viceversa), nunca corren pisándose.
+    db.exec(select(Estacion).where(Estacion.id == estacion_id).with_for_update()).first()
+
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
 
     desde_dt = datetime.combine(payload.fecha_desde, time.min)
