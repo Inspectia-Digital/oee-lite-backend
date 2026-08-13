@@ -299,7 +299,8 @@ def test_plan_expone_campo_activo_y_se_desactiva_con_baja_logica(client, db, ten
     ).json()
     assert plan["activo"] is True
 
-    r = client.delete(f"/config/planes/{plan['id']}", headers=headers)
+    # Fase AV: nace en_progreso (primer plan de la línea) -- cancelarlo exige motivo.
+    r = client.request("DELETE", f"/config/planes/{plan['id']}", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 200
 
     detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
@@ -595,7 +596,7 @@ def test_activar_plan_programado_sin_conflicto(client, db, tenant_a, gerente_a):
     assert p2["estado"] == "programado"
 
     # Cerrando/cancelando el primero, activar el segundo debe funcionar.
-    client.delete(f"/config/planes/{p1['id']}", headers=headers)
+    client.request("DELETE", f"/config/planes/{p1['id']}", json={"motivo": "Prueba"}, headers=headers)
     r = client.post(f"/config/planes/{p2['id']}/activar", headers=headers)
     assert r.status_code == 200
     assert r.json()["estado"] == "en_progreso"
@@ -647,16 +648,69 @@ def test_desactivar_plan_en_progreso_lo_cancela_y_cierra_orden_activa(client, db
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
     client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
 
-    r = client.delete(f"/config/planes/{plan['id']}", headers=headers)
+    r = client.request("DELETE", f"/config/planes/{plan['id']}", json={"motivo": "Falla de máquina, se aborta el lote"}, headers=headers)
     assert r.status_code == 200
 
     detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
     assert detalle["estado"] == "cancelado"
     assert detalle["activo"] is False
     assert detalle["orden_activa_fk"] is None
+    # Fase AV (FE-P0-04): el motivo queda persistido en el detalle del plan.
+    assert detalle["motivo_cancelacion"] == "Falla de máquina, se aborta el lote"
 
     o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
     assert o1_db["estado"] == "cerrada"
+
+
+def test_desactivar_plan_en_progreso_sin_motivo_devuelve_400(client, db, tenant_a, gerente_a):
+    """Fase AV (FE-P0-04): cancelar un plan EN_PROGRESO sin motivo es un
+    409/400 -- a diferencia de archivar un BORRADOR/PROGRAMADO (siguiente
+    test), acá el backend puede derivar solo la condición y no confía en
+    que el front no deje enviar el botón sin texto."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    assert plan["estado"] == "en_progreso"
+
+    r = client.request("DELETE", f"/config/planes/{plan['id']}", json={}, headers=headers)
+    assert r.status_code == 400
+
+    r_sin_body = client.request("DELETE", f"/config/planes/{plan['id']}", headers=headers)
+    assert r_sin_body.status_code == 400
+
+    # No quedó a medio cancelar: sigue activo y en_progreso.
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert detalle["estado"] == "en_progreso"
+    assert detalle["activo"] is True
+
+
+def test_archivar_plan_programado_no_exige_motivo(client, db, tenant_a, gerente_a):
+    """Archivar un plan que nunca arrancó (PROGRAMADO, no compite por la
+    línea) no tiene nada que explicar -- a diferencia de cancelar uno
+    EN_PROGRESO (test anterior), acá el DELETE sin body sigue funcionando."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    )
+    p2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2 (en cola)"},
+        headers=headers,
+    ).json()
+    assert p2["estado"] == "programado"
+
+    r = client.delete(f"/config/planes/{p2['id']}", headers=headers)
+    assert r.status_code == 200
+
+    detalle = client.get(f"/config/planes/{p2['id']}", headers=headers).json()
+    assert detalle["estado"] == "cancelado"
+    assert detalle["activo"] is False
+    assert detalle["motivo_cancelacion"] is None
 
 
 def test_desactivar_plan_cerrado_no_cambia_estado(client, db, tenant_a, gerente_a):
@@ -671,10 +725,12 @@ def test_desactivar_plan_cerrado_no_cambia_estado(client, db, tenant_a, gerente_
     r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # agota la secuencia
     assert r.json()["estado"] == "cerrado"
 
+    # Un plan ya CERRADO no exige motivo -- no está cancelando nada en curso.
     client.delete(f"/config/planes/{plan['id']}", headers=headers)
     detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
     assert detalle["estado"] == "cerrado"
     assert detalle["activo"] is False
+    assert detalle["motivo_cancelacion"] is None
 
 
 def test_avanzar_orden_bloqueado_si_plan_todavia_no_esta_en_progreso(client, db, tenant_a, gerente_a):
@@ -702,7 +758,7 @@ def test_avanzar_orden_bloqueado_si_plan_cancelado(client, db, tenant_a, gerente
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.delete(f"/config/planes/{plan['id']}", headers=headers)  # cancela
+    client.request("DELETE", f"/config/planes/{plan['id']}", json={"motivo": "Prueba"}, headers=headers)  # cancela
 
     r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
     assert r.status_code == 409
