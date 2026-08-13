@@ -942,6 +942,22 @@ def crear_orden(
         ).first()
         if not plan:
             raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+        # QA-02 (auditoría QA): antes no se validaba que la orden y el
+        # plan fueran de la MISMA línea -- se podía vincular una orden a
+        # un plan de otra línea sin ningún error (la importación por
+        # Excel sí lo validaba, ver subir_plan en importaciones.py --
+        # acá faltaba la misma regla). Tampoco se podía agregar una
+        # orden a un plan que ya terminó (CERRADO) o se abortó
+        # (CANCELADO) -- no tiene sentido sumar producción a algo que ya
+        # no está operativo ni en cola.
+        if plan.estado in (EstadoPlan.CERRADO, EstadoPlan.CANCELADO):
+            raise HTTPException(status_code=409, detail=f"El plan '{plan.nombre}' está {plan.estado.value} -- no se le pueden agregar órdenes.")
+        if datos.get("linea_id") and datos["linea_id"] != plan.linea_id:
+            raise HTTPException(status_code=400, detail="linea_id no coincide con la línea del plan.")
+        # La línea la da el plan si no vino explícita en el payload --
+        # mismo criterio que useCrearOrdenEnPlan en el front, que nunca
+        # la manda (deja que el backend la resuelva).
+        datos["linea_id"] = plan.linea_id
         if datos.get("secuencia") is None:
             maxima = db.exec(
                 select(OrdenProduccion.secuencia)
@@ -1006,6 +1022,29 @@ def actualizar_orden(
         sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == datos["sku_fk"], MaestroSKU.tenant_id == context.tenant_id)).first()
         if not sku:
             raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    # QA-02 (auditoría QA): mismo criterio que crear_orden -- si esta
+    # edición toca plan_id o linea_id, validar que sigan siendo
+    # consistentes entre sí. Deliberadamente NO se re-valida en cada
+    # PATCH que no toque ninguno de los dos (ej. renombrar cantidad
+    # esperada) -- no hay que bloquear ediciones no relacionadas de una
+    # orden vieja por datos que pudieran haber quedado inconsistentes
+    # antes de este fix.
+    if "plan_id" in datos or "linea_id" in datos:
+        plan_id_efectivo = datos.get("plan_id", orden.plan_id)
+        linea_id_efectivo = datos.get("linea_id", orden.linea_id)
+        if plan_id_efectivo:
+            plan = db.exec(
+                select(PlanProduccion).where(PlanProduccion.id == plan_id_efectivo, PlanProduccion.tenant_id == context.tenant_id)
+            ).first()
+            if not plan:
+                raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+            if "plan_id" in datos and plan.estado in (EstadoPlan.CERRADO, EstadoPlan.CANCELADO):
+                raise HTTPException(status_code=409, detail=f"El plan '{plan.nombre}' está {plan.estado.value} -- no se le pueden agregar órdenes.")
+            if linea_id_efectivo and linea_id_efectivo != plan.linea_id:
+                raise HTTPException(status_code=400, detail="linea_id no coincide con la línea del plan.")
+            if "linea_id" not in datos:
+                datos["linea_id"] = plan.linea_id
 
     for key, value in datos.items():
         setattr(orden, key, value)

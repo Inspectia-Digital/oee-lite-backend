@@ -731,3 +731,118 @@ def test_resolver_orden_activa_ignora_plan_programado(client, db, tenant_a, gere
     # Sigue viendo la orden del plan EN_PROGRESO, no se confunde con el
     # plan en cola.
     assert r.json()["orden_activa"] == o1["id_orden"]
+
+
+# ---------- Fase AI (auditoría QA, QA-02): línea Orden == línea Plan ----------
+
+def test_crear_orden_con_linea_distinta_a_la_del_plan_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea_a, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    linea_b = Linea(tenant_id=tenant_a, planta_id=planta.id, nombre="Línea B")
+    db.add(linea_b)
+    db.commit()
+    db.refresh(linea_b)
+
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea_a.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan en línea A"},
+        headers=headers,
+    ).json()
+
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"], "linea_id": str(linea_b.id)},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_crear_orden_en_plan_hereda_la_linea_si_no_se_manda(client, db, tenant_a, gerente_a):
+    """Mismo criterio que useCrearOrdenEnPlan en el front: nunca manda
+    linea_id -- el backend la resuelve del plan."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan"},
+        headers=headers,
+    ).json()
+
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"]},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    assert r.json()["linea_id"] == str(linea.id)
+
+
+def test_crear_orden_en_plan_cerrado_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # agota la secuencia, cierra el plan
+
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"]},
+        headers=headers,
+    )
+    assert r.status_code == 409
+
+
+def test_actualizar_orden_con_linea_distinta_a_la_de_su_plan_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea_a, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    linea_b = Linea(tenant_id=tenant_a, planta_id=planta.id, nombre="Línea B (update)")
+    db.add(linea_b)
+    db.commit()
+    db.refresh(linea_b)
+
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea_a.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan"},
+        headers=headers,
+    ).json()
+    orden = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"]},
+        headers=headers,
+    ).json()
+
+    r = client.patch(
+        f"/config/ordenes/{orden['id_orden']}",
+        json={"linea_id": str(linea_b.id)},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_actualizar_orden_sin_tocar_plan_ni_linea_no_revalida(client, db, tenant_a, gerente_a):
+    """Editar un campo no relacionado (cantidad_esperada) nunca dispara
+    la validación cruzada plan<->línea -- no debe bloquear ediciones de
+    órdenes viejas por datos que pudieran haber quedado inconsistentes
+    antes de este fix."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan"},
+        headers=headers,
+    ).json()
+    orden = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-{uuid.uuid4().hex[:6]}", "cantidad_esperada": 100, "plan_id": plan["id"]},
+        headers=headers,
+    ).json()
+
+    r = client.patch(f"/config/ordenes/{orden['id_orden']}", json={"cantidad_esperada": 250}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["cantidad_esperada"] == 250
