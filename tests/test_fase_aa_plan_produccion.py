@@ -7,11 +7,14 @@ corriendo ahora" tanto para la ingesta real (/api/lite/scans) como para
 la portada (/analytics/linea-en-vivo/) -- una sola fuente de verdad para
 las dos, ver resolver_orden_activa en clasificacion.py.
 """
+import io
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
+from sqlmodel import select
+
 from app.models.domain import (
-    Estacion, EstadoOrden, Linea, MaestroSKU, Planta, RolUsuario,
+    Estacion, EstadoOrden, Linea, MaestroSKU, Planta, RolUsuario, Tenant,
 )
 from tests.conftest import autenticar_como, crear_usuario
 
@@ -61,7 +64,7 @@ def test_crear_plan_vacio(client, db, tenant_a, gerente_a):
     autenticar_como(gerente_a.id)
     r = client.post(
         "/config/planes/",
-        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat()},
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan vacío"},
         headers={"X-Sub-Tenant-Id": str(planta.id)},
     )
     assert r.status_code == 201
@@ -74,7 +77,150 @@ def test_crear_plan_vacio(client, db, tenant_a, gerente_a):
 def test_crear_plan_linea_de_otro_tenant_devuelve_400(client, db, tenant_a, tenant_b, gerente_a):
     planta_b, linea_b, _ = _preparar_escenario(db, tenant_b)
     autenticar_como(gerente_a.id)
-    r = client.post("/config/planes/", json={"linea_id": str(linea_b.id), "fecha_inicio": date.today().isoformat()})
+    r = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea_b.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan cross-tenant"},
+    )
+    assert r.status_code == 400
+
+
+def test_crear_plan_requiere_nombre(client, db, tenant_a, gerente_a):
+    """Unificación UX Planes/Órdenes/SKUs: antes un plan sólo se
+    identificaba por (línea, fecha) -- ahora puede haber varios el mismo
+    día y el nombre es obligatorio para poder distinguirlos."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat()},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 422
+
+    r2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "   "},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r2.status_code == 422
+
+
+def test_crear_plan_nombre_se_persiste_y_se_puede_renombrar(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    r = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Turno mañana"},
+        headers=headers,
+    )
+    assert r.status_code == 201
+    plan = r.json()
+    assert plan["nombre"] == "Turno mañana"
+
+    r2 = client.patch(f"/config/planes/{plan['id']}", json={"nombre": "Turno mañana (revisado)"}, headers=headers)
+    assert r2.status_code == 200
+    assert r2.json()["nombre"] == "Turno mañana (revisado)"
+
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert detalle["nombre"] == "Turno mañana (revisado)"
+
+
+def test_crear_plan_bloqueado_si_origen_erp(client, db, tenant_a, gerente_a):
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_a)).first()
+    tenant_db.origen_maestros = "ERP"
+    db.add(tenant_db)
+    db.commit()
+
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan bloqueado"},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 409
+
+
+def test_crear_orden_bloqueada_si_origen_erp(client, db, tenant_a, gerente_a):
+    tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_a)).first()
+    tenant_db.origen_maestros = "ERP"
+    db.add(tenant_db)
+    db.commit()
+
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/ordenes/",
+        json={"id_orden": f"OP-ERP-{uuid.uuid4().hex[:6]}", "linea_id": str(linea.id), "cantidad_esperada": 10},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 409
+
+
+def test_subir_plan_con_plan_id_asocia_ordenes_y_autoasigna_secuencia(client, db, tenant_a, gerente_a):
+    """El upload masivo (/plan/upload) tampoco seteaba plan_id -- las
+    órdenes cargadas por Excel quedaban invisibles para "Plan del día"
+    (Supervisor) aunque la línea tuviera un Plan abierto."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    sku1 = _crear_sku(db, tenant_a)
+    sku2 = _crear_sku(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan por Excel"},
+        headers=headers,
+    ).json()
+
+    id_orden_1 = f"OP-UP-{uuid.uuid4().hex[:6]}"
+    id_orden_2 = f"OP-UP-{uuid.uuid4().hex[:6]}"
+    csv_content = (
+        "id_orden,sku_fk,cantidad_esperada,plan_fecha\n"
+        f"{id_orden_1},{sku1.codigo_sku},100,{date.today().isoformat()}\n"
+        f"{id_orden_2},{sku2.codigo_sku},50,{date.today().isoformat()}\n"
+    )
+
+    r = client.post(
+        "/api/lite/importaciones/plan/upload",
+        data={"linea_id": str(linea.id), "plan_id": plan["id"]},
+        files={"file": ("plan.csv", csv_content.encode(), "text/csv")},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["resultados"]["creadas"] == 2
+
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    ordenes_por_id = {o["id_orden"]: o for o in detalle["ordenes"]}
+    assert ordenes_por_id[id_orden_1]["secuencia"] == 1
+    assert ordenes_por_id[id_orden_2]["secuencia"] == 2
+
+
+def test_subir_plan_con_plan_id_de_otra_linea_devuelve_400(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    linea_b = Linea(tenant_id=tenant_a, planta_id=planta.id, nombre="Línea AA otra")
+    db.add(linea_b)
+    db.commit()
+    db.refresh(linea_b)
+    sku = _crear_sku(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan línea A"},
+        headers=headers,
+    ).json()
+
+    csv_content = f"id_orden,sku_fk,cantidad_esperada,plan_fecha\nOP-X,{sku.codigo_sku},10,{date.today().isoformat()}\n"
+    r = client.post(
+        "/api/lite/importaciones/plan/upload",
+        # linea_id apunta a linea_b, pero el plan es de linea -- deben coincidir.
+        data={"linea_id": str(linea_b.id), "plan_id": plan["id"]},
+        files={"file": ("plan.csv", csv_content.encode(), "text/csv")},
+        headers=headers,
+    )
     assert r.status_code == 400
 
 
@@ -85,7 +231,9 @@ def test_crear_orden_con_plan_id_autoasigna_secuencia(client, db, tenant_a, gere
     autenticar_como(gerente_a.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     plan = client.post(
-        "/config/planes/", json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat()}, headers=headers,
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan autoasigna"},
+        headers=headers,
     ).json()
 
     o1 = client.post(
@@ -115,8 +263,16 @@ def test_listar_planes_filtra_por_linea(client, db, tenant_a, gerente_a):
 
     autenticar_como(gerente_a.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    client.post("/config/planes/", json={"linea_id": str(linea1.id), "fecha_inicio": date.today().isoformat()}, headers=headers)
-    client.post("/config/planes/", json={"linea_id": str(linea2.id), "fecha_inicio": date.today().isoformat()}, headers=headers)
+    client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea1.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan línea 1"},
+        headers=headers,
+    )
+    client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea2.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan línea 2"},
+        headers=headers,
+    )
 
     r = client.get("/config/planes/", params={"linea_id": str(linea1.id)}, headers=headers)
     assert r.status_code == 200
@@ -129,7 +285,9 @@ def _crear_plan_con_dos_ordenes(client, db, tenant_id, planta, linea, headers):
     sku1 = _crear_sku(db, tenant_id, tiempo_ideal_seg=10.0)
     sku2 = _crear_sku(db, tenant_id, tiempo_ideal_seg=20.0)
     plan = client.post(
-        "/config/planes/", json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat()}, headers=headers,
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan avanzar_orden"},
+        headers=headers,
     ).json()
     o1 = client.post(
         "/config/ordenes/",

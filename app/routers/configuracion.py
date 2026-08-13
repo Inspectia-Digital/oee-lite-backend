@@ -907,6 +907,14 @@ def crear_orden(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
+    # Unificación UX Planes/Órdenes/SKUs: mismo guard que crear_sku/crear_plan.
+    tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
+    if tenant and tenant.origen_maestros == "ERP":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP.",
+        )
+
     existente = db.exec(
         select(OrdenProduccion).where(
             OrdenProduccion.tenant_id == context.tenant_id,
@@ -1037,6 +1045,33 @@ def desactivar_orden(
 class PlanProduccionCreate(BaseModel):
     linea_id: uuid.UUID
     fecha_inicio: date
+    # Unificación UX Planes/Órdenes/SKUs: obligatorio desde acá en adelante
+    # -- antes un plan sólo se identificaba por (línea, fecha), y la única
+    # UI (Supervisor) asumía que había a lo sumo uno abierto por línea/día.
+    # Ahora puede haber varios el mismo día; nombre es como se distinguen.
+    nombre: str
+
+    @field_validator("nombre")
+    @classmethod
+    def _validar_nombre(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("nombre no puede estar vacío.")
+        return v
+
+
+class PlanProduccionUpdate(BaseModel):
+    nombre: Optional[str] = None
+
+    @field_validator("nombre")
+    @classmethod
+    def _validar_nombre(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("nombre no puede estar vacío.")
+        return v
 
 
 class OrdenEnPlan(BaseModel):
@@ -1057,6 +1092,9 @@ class OrdenEnPlan(BaseModel):
 class PlanConOrdenes(BaseModel):
     id: uuid.UUID
     linea_id: uuid.UUID
+    # Nullable: planes creados antes de este cambio no tienen nombre y no
+    # hay backfill razonable -- el front les muestra un fallback.
+    nombre: Optional[str] = None
     fecha_inicio: date
     estado: str
     orden_activa_fk: Optional[uuid.UUID] = None
@@ -1083,7 +1121,8 @@ def _armar_plan_con_ordenes(db: Session, tenant_id: str, plan: PlanProduccion) -
         producido_por_orden = {orden_fk: int(total or 0) for orden_fk, total in filas}
 
     return PlanConOrdenes(
-        id=plan.id, linea_id=plan.linea_id, fecha_inicio=plan.fecha_inicio, estado=plan.estado,
+        id=plan.id, linea_id=plan.linea_id, nombre=plan.nombre,
+        fecha_inicio=plan.fecha_inicio, estado=plan.estado,
         orden_activa_fk=plan.orden_activa_fk,
         ordenes=[
             OrdenEnPlan(
@@ -1105,11 +1144,25 @@ def crear_plan(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
+    # Unificación UX Planes/Órdenes/SKUs: mismo guard que crear_sku -- el
+    # alta masiva por archivo ya lo tenía (verificar_permiso_carga_y_linea,
+    # importaciones.py), el alta individual no. Un tenant "ERP" no debería
+    # poder crear Planes/Órdenes a mano tampoco.
+    tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
+    if tenant and tenant.origen_maestros == "ERP":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP.",
+        )
+
     linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()
     if not linea:
         raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
 
-    nuevo = PlanProduccion(tenant_id=context.tenant_id, linea_id=payload.linea_id, fecha_inicio=payload.fecha_inicio)
+    nuevo = PlanProduccion(
+        tenant_id=context.tenant_id, linea_id=payload.linea_id,
+        fecha_inicio=payload.fecha_inicio, nombre=payload.nombre,
+    )
     db.add(nuevo)
     db.commit()
     db.refresh(nuevo)
@@ -1149,6 +1202,30 @@ def obtener_plan(
     plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    return _armar_plan_con_ordenes(db, context.tenant_id, plan)
+
+
+@router.patch("/planes/{plan_id}", response_model=PlanConOrdenes)
+def actualizar_plan(
+    plan_id: uuid.UUID,
+    payload: PlanProduccionUpdate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    """Renombrar un plan -- único campo editable hoy. línea/fecha no se
+    tocan (identidad del plan); estado se maneja vía avanzar_orden
+    (operacion.py) o desactivar_plan, no por acá."""
+    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+
+    datos = payload.model_dump(exclude_unset=True)
+    for key, value in datos.items():
+        setattr(plan, key, value)
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
     return _armar_plan_con_ordenes(db, context.tenant_id, plan)
 
 
