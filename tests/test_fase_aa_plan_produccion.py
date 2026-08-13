@@ -846,3 +846,30 @@ def test_actualizar_orden_sin_tocar_plan_ni_linea_no_revalida(client, db, tenant
     r = client.patch(f"/config/ordenes/{orden['id_orden']}", json={"cantidad_esperada": 250}, headers=headers)
     assert r.status_code == 200
     assert r.json()["cantidad_esperada"] == 250
+
+
+# ---------- Fase AP (auditoría QA, QA-12): no avanzar a una orden inactiva ----------
+
+def test_avanzar_orden_salta_la_siguiente_si_esta_inactiva(client, db, tenant_a, gerente_a):
+    """QA-12: si la orden que seguía en la secuencia se desactivó desde
+    Configuración (baja lógica) entre medio, avanzar_orden no debe
+    reactivarla -- el plan se cierra solo, como si no quedara ninguna."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+
+    # Desactiva o2 (la que seguiría en la secuencia) ANTES de avanzar.
+    r = client.delete(f"/config/ordenes/{o2['id_orden']}", headers=headers)
+    assert r.status_code == 200
+
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # o2 está inactiva -> se salta
+    assert r.status_code == 200
+    body = r.json()
+    assert body["orden_cerrada_id_orden"] == o1["id_orden"]
+    assert body["orden_activa_id_orden"] is None
+    assert body["estado"] == "cerrado"
+
+    o2_db = client.get(f"/config/ordenes/{o2['id_orden']}", headers=headers).json()
+    assert o2_db["estado"] != "en_progreso"  # nunca se activó
