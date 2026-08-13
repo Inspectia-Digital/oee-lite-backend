@@ -35,6 +35,14 @@ class RolUsuario(str, Enum):
     GERENCIA = "gerencia"
     PRODUCCION = "produccion"
     SUPERVISOR = "supervisor"
+    # Pedido explícito del usuario: rol intermedio entre Supervisor y
+    # Operario -- el supervisor a veces está ocupado con otras tareas y no
+    # puede estar atento a clasificar paradas. Encargado tiene cuenta web
+    # (a diferencia de Operario) pero acceso deliberadamente angosto: sólo
+    # paradas pendientes/clasificar/historial (ver ROLES_SUPERVISION_COMPLETA
+    # en operacion.py, que lo excluye explícitamente del resto -- dotación,
+    # asignación de supervisores, avanzar Plan, paradas planificadas).
+    ENCARGADO = "encargado"
     OPERARIO = "operario"
 
 class CategoriaParada(str, Enum):

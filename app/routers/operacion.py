@@ -20,6 +20,17 @@ router = APIRouter(prefix="/supervisor", tags=["Operacion (UI Supervisor)"])
 # supervisores, que BACKEND_REQUIREMENTS.md SS11.2 documenta bajo /asignaciones/supervisor/.
 router_asignaciones_supervisor = APIRouter(prefix="/asignaciones", tags=["Operacion (UI Supervisor)"])
 
+# Rol "Encargado" (pedido explícito del usuario): intermedio entre
+# Supervisor y Operario -- tiene cuenta web, pero sólo puede ver/clasificar
+# paradas (obtener_paradas_pendientes, clasificar_parada,
+# listar_historial_paradas -- sin chequeo de rol, alcanza con planta
+# asignada, igual que siempre). Todo lo demás en este archivo (dotación,
+# asignación de supervisores, avanzar Plan, paradas planificadas) usa esta
+# constante para excluirlo explícitamente -- antes esos endpoints no
+# chequeaban rol en absoluto, sólo pertenencia a la planta (validar_planta),
+# así que agregar el rol nuevo sin este guard le habría dado acceso a todo.
+ROLES_SUPERVISION_COMPLETA = (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN)
+
 class ClasificarParada(BaseModel):
     motivo_fk: uuid.UUID
 
@@ -124,6 +135,10 @@ def registrar_parada_planificada(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    # Programar una parada FUTURA es distinto de clasificar una que ya
+    # ocurrió -- confirmado con el usuario: Encargado queda afuera de esto.
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para programar paradas planificadas.")
     estacion = db.get(Estacion, datos.estacion_fk)
     if not estacion or estacion.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Estación no encontrada")
@@ -235,6 +250,8 @@ def eliminar_parada_planificada(
     que ya está en curso o pasada -- ahí se preserva trazabilidad real de
     downtime, no es una fila de agenda editable."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para eliminar paradas planificadas.")
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")
@@ -313,9 +330,9 @@ def avanzar_orden(
     Sólo Supervisor, Gerencia, Producción o SuperAdmin: es una acción
     operativa real que cambia en vivo qué SKU/tiempo ideal clasifican
     los próximos escaneos de la línea (ver resolver_orden_activa en
-    clasificacion.py) -- un Operario no la dispara."""
+    clasificacion.py) -- ni un Operario ni un Encargado la disparan."""
     validar_planta(context, usuario, db)
-    if usuario.rol not in (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN):
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
         raise HTTPException(status_code=403, detail="Sólo Supervisor, Gerencia, Producción o SuperAdmin pueden avanzar un plan.")
 
     plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
@@ -396,6 +413,8 @@ def listar_asignaciones_dotacion(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver la dotación.")
     _validar_linea_en_planta(linea_id, context, db)
 
     query = (
@@ -420,6 +439,8 @@ def asignar_dotacion(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para asignar dotación.")
 
     estacion = db.exec(select(Estacion).where(Estacion.id == payload.estacion_fk, Estacion.tenant_id == context.tenant_id)).first()
     if not estacion:
@@ -465,6 +486,8 @@ def liberar_estacion(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para liberar una estación.")
     asignacion = db.exec(
         select(AsignacionTurno).where(AsignacionTurno.id == asignacion_id, AsignacionTurno.tenant_id == context.tenant_id)
     ).first()
@@ -500,6 +523,8 @@ def eventos_en_vivo(
     pertenece cada evento) -- suficiente para un monitor en vivo, no para
     reportes de precisión."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver el monitor en vivo.")
 
     estaciones_planta = db.exec(
         select(Estacion.id)
@@ -602,6 +627,8 @@ def listar_asignaciones_supervisor(
     exacto (vigencia_desde/hasta + día de semana) -- por ejemplo, para
     resolver "quién cubre este turno tal día"."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver la asignación de supervisores.")
     query = select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == context.tenant_id)
     if linea_id:
         _validar_linea_en_planta(linea_id, context, db)
@@ -626,6 +653,8 @@ def asignar_supervisor(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para asignar supervisores.")
     _validar_linea_en_planta(payload.linea_id, context, db)
 
     if payload.vigencia_hasta is not None and payload.vigencia_hasta < payload.vigencia_desde:
@@ -664,6 +693,8 @@ def eliminar_asignacion_supervisor(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+        raise HTTPException(status_code=403, detail="No tenés permisos para eliminar una asignación de supervisor.")
     regla = db.exec(
         select(AsignacionSupervisor).where(
             AsignacionSupervisor.id == asignacion_id,
