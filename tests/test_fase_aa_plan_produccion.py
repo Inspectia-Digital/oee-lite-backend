@@ -279,6 +279,31 @@ def test_listar_planes_filtra_por_linea(client, db, tenant_a, gerente_a):
     assert len(r.json()) == 1
 
 
+def test_plan_expone_campo_activo_y_se_desactiva_con_baja_logica(client, db, tenant_a, gerente_a):
+    """PlanConOrdenes -- la respuesta real de POST/GET/PATCH
+    /config/planes/{id} -- no serializaba `activo` aunque el ORM siempre
+    lo tuvo: plan.activo daba undefined en el front y el botón "Cerrar
+    plan" de PlanesPanel.tsx no se mostraba nunca, ni para un plan
+    abierto. Cubre el ida y vuelta completo: el alta expone activo=true
+    (precondición para que el botón aparezca) y la baja lógica (DELETE)
+    lo deja en false en el detalle."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    plan = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan activo"},
+        headers=headers,
+    ).json()
+    assert plan["activo"] is True
+
+    r = client.delete(f"/config/planes/{plan['id']}", headers=headers)
+    assert r.status_code == 200
+
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert detalle["activo"] is False
+
+
 # ---------- avanzar_orden ----------
 
 def _crear_plan_con_dos_ordenes(client, db, tenant_id, planta, linea, headers):

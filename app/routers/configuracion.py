@@ -1098,6 +1098,13 @@ class PlanConOrdenes(BaseModel):
     fecha_inicio: date
     estado: str
     orden_activa_fk: Optional[uuid.UUID] = None
+    # Faltaba acá (bug real): PlanProduccion.activo existe en el ORM
+    # desde siempre, pero este schema -- la respuesta real de
+    # GET/POST/PATCH /config/planes/{id} -- nunca lo serializaba. El
+    # front (PlanesPanel.tsx) lee plan.activo para decidir si muestra el
+    # botón "Cerrar plan"; con el campo ausente siempre daba undefined y
+    # el botón no aparecía nunca, ni para un plan abierto.
+    activo: bool
     ordenes: List[OrdenEnPlan]
 
 
@@ -1123,7 +1130,7 @@ def _armar_plan_con_ordenes(db: Session, tenant_id: str, plan: PlanProduccion) -
     return PlanConOrdenes(
         id=plan.id, linea_id=plan.linea_id, nombre=plan.nombre,
         fecha_inicio=plan.fecha_inicio, estado=plan.estado,
-        orden_activa_fk=plan.orden_activa_fk,
+        orden_activa_fk=plan.orden_activa_fk, activo=plan.activo,
         ordenes=[
             OrdenEnPlan(
                 id_orden=o.id_orden, id=o.id, sku_fk=o.sku_fk,
