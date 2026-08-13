@@ -1,13 +1,17 @@
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlmodel import SQLModel
 
 from app.core.config import settings
 from app.core.database import engine
-from app.core.observabilidad import RequestIDMiddleware
+from app.core.observabilidad import RequestIDMiddleware, obtener_request_id_actual
+
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # IMPORTACIÓN DE ROUTERS
@@ -69,6 +73,43 @@ app.add_middleware(
 # + log de acceso estructurado por request. Se agrega último para que quede
 # como capa más externa y mida la duración total real del request.
 app.add_middleware(RequestIDMiddleware)
+
+
+# ==========================================
+# MANEJO GLOBAL DE ERRORES (Fase AT, auditoría QA, QA-16)
+# ==========================================
+@app.exception_handler(Exception)
+async def manejador_global_de_excepciones(request: Request, exc: Exception) -> JSONResponse:
+    """QA-16 (auditoría QA): varios endpoints de analytics.py capturaban
+    cualquier excepción y devolvían [] silenciosamente en vez de dejarla
+    propagar -- el frontend no podía distinguir "sin datos" de "error
+    real" (withPreviewFallback, en previewMode.ts, SÍ está pensado para
+    marcar la feature como "pendiente de backend" ante un error HTTP
+    real, pero nunca se disparaba porque el backend nunca fallaba
+    visiblemente). Ese fix (sacar los `except Exception: return []`
+    locales) exige que exista una red de contención acá: sin esto,
+    cualquier excepción no prevista llegaría cruda hasta
+    Starlette (texto plano "Internal Server Error", sin el sobre JSON
+    {"detail": ...} que usa el resto de esta API) o, peor, filtraría el
+    traceback si algún día se corre con debug=True.
+
+    Nunca se expone el mensaje de la excepción ni el traceback al
+    cliente -- se loguean completos server-side (correlacionados por
+    request_id, ver RequestIDMiddleware) y el cliente sólo recibe un 500
+    genérico con ese mismo request_id para poder reportarlo."""
+    request_id = obtener_request_id_actual()
+    logger.error(
+        "Excepción no manejada: method=%s path=%s request_id=%s",
+        request.method, request.url.path, request_id,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Error interno del servidor. Si persiste, contactá a soporte con el request_id.",
+            "request_id": request_id,
+        },
+    )
 
 # ==========================================
 # REGISTRO DE MÓDULOS (ROUTERS)

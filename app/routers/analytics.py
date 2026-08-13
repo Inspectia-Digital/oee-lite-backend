@@ -270,6 +270,10 @@ def obtener_dashboard_estaciones(
 ):
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         
         # 🔒 CAST EXPLÍCITO para cruzar String (id_estacion) con UUID (Estacion.id)
@@ -329,9 +333,6 @@ def obtener_dashboard_estaciones(
         return reporte_final
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en dashboard: {e}")
-        return []
 
 
 @router.get("/analytics/oee-general/", response_model=OeeGeneralCard)
@@ -656,6 +657,10 @@ def obtener_reporte_springwall(
     campo directo en el evento (LiteEventoProduccion no guarda turno_fk)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
             inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
@@ -741,9 +746,6 @@ def obtener_reporte_springwall(
         return reporte_final
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Reporte Operario: {e}")
-        return []
 
 
 @router.get("/analytics/pareto-paradas/", response_model=list[ParetoParadas])
@@ -761,6 +763,10 @@ def obtener_pareto_paradas(
     reporte (/analytics/paradas-por-sku/), no se mezcla con este."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
             inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
@@ -806,9 +812,6 @@ def obtener_pareto_paradas(
         return reporte
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Pareto: {e}")
-        return []
 
 
 def _eventos_con_ciclo_real(eventos_ordenados):
@@ -870,6 +873,10 @@ def obtener_cuellos_botella(
     real."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
             inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
@@ -973,9 +980,6 @@ def obtener_cuellos_botella(
         return sorted(res, key=lambda x: x.desvio_pct, reverse=True)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error Cuellos de Botella: {e}")
-        return []
 
 
 @router.get("/analytics/oee-tendencia/", response_model=list[TendenciaOEERow])
@@ -1027,9 +1031,6 @@ def tendencia_oee_diaria(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en tendencia OEE: {e}")
-        return []
 
 
 @router.get("/analytics/alertas-vivas/", response_model=list[AlertaActiva])
@@ -1040,6 +1041,10 @@ def obtener_alertas_vivas(
 ):
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         inicio_dia, fin_dia = obtener_rango_dia(context=context, db=db)
         alertas = []
 
@@ -1099,10 +1104,6 @@ def obtener_alertas_vivas(
         return alertas
     except HTTPException:
         raise # Dejamos pasar el 400 del sub_tenant faltante
-    except Exception as e:
-        logger.error(f"Error fatal en alertas_vivas: {str(e)}")
-        # Escudo protector final: Retornamos lista vacía para no romper la UI
-        return []
 
 
 # ==========================================
@@ -1187,6 +1188,10 @@ def obtener_rendimiento_secuencial(
     mismo fix en /analytics/cuellos-botella/)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha is not None:
             inicio_dia, fin_dia = obtener_rango_dia(fecha, context, db)
         else:
@@ -1261,9 +1266,6 @@ def obtener_rendimiento_secuencial(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento secuencial: {e}")
-        return []
 
 
 @router.get("/analytics/reporte-produccion/", response_model=list[ReporteProduccionRow])
@@ -1279,6 +1281,10 @@ def obtener_reporte_produccion(
     que los filtros del dashboard tengan efecto real acá también."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
@@ -1328,9 +1334,6 @@ def obtener_reporte_produccion(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en reporte de producción: {e}")
-        return []
 
 
 @router.get("/analytics/plan-vs-actual/", response_model=list[PlanVsActualRow])
@@ -1352,6 +1355,10 @@ def obtener_plan_vs_actual(
     puede seguir sumando piezas después de su plan_fecha)."""
     try:
         validar_planta(context)
+    except ValueError:
+        return []
+
+    try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
@@ -1403,9 +1410,6 @@ def obtener_plan_vs_actual(
         return filas
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en plan vs actual: {e}")
-        return []
 
 
 # Sin eventos hace más de esto, la estación se considera "sin_datos" (no
@@ -1719,9 +1723,6 @@ def obtener_linea_en_vivo(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en línea en vivo: {e}")
-        return LineaEnVivoResumen()
 
 
 @router.get("/analytics/rendimiento-operarios/", response_model=list[RendimientoOperarioRow])
@@ -1892,9 +1893,6 @@ def obtener_rendimiento_operarios(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento de operarios: {e}")
-        return []
 
 
 @router.get("/command-center/summary", response_model=CommandCenterSummary)
@@ -2094,9 +2092,6 @@ def obtener_rendimiento_maquinas(
         return resultado
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en rendimiento de máquinas: {e}")
-        return []
 
 
 @router.get("/analytics/paradas-por-sku/", response_model=list[ParadasPorSku])
@@ -2161,9 +2156,6 @@ def obtener_paradas_por_sku(
         return reporte
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error en paradas por SKU: {e}")
-        return []
 
 
 # ==========================================
