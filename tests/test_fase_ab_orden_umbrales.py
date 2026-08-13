@@ -170,3 +170,42 @@ def test_actualizar_tenant_ignora_tolerancia_legacy_pero_sigue_actualizando_lo_d
     )
     assert r.status_code == 200
     assert r.json()["tenant"]["oee_objetivo_pct"] == 90.0
+
+
+# ---------- Fase AS (auditoría QA, QA-14): valores positivos ----------
+
+def test_crear_linea_ideal_negativo_devuelve_400(client, db, tenant_a, gerente_a):
+    """QA-14: antes sólo se validaba el ORDEN relativo -- ideal=-10,
+    lento=-5, alerta=0 cumplía ideal<=lento<alerta y pasaba sin
+    problema, pero convertía todos los eventos en ALERTA."""
+    planta = _crear_planta(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/lineas/",
+        json={"nombre": "Línea Negativa", "tiempo_ideal_seg": -10, "tiempo_lento_seg": -5, "tiempo_alerta_seg": 0},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 400
+    assert "cero" in r.json()["detail"].lower()
+
+
+def test_crear_linea_ideal_cero_devuelve_400(client, db, tenant_a, gerente_a):
+    planta = _crear_planta(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/lineas/",
+        json={"nombre": "Línea Cero", "tiempo_ideal_seg": 0, "tiempo_lento_seg": 100, "tiempo_alerta_seg": 200},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 400
+
+
+def test_crear_linea_lento_o_alerta_negativos_devuelve_400(client, db, tenant_a, gerente_a):
+    planta = _crear_planta(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.post(
+        "/config/lineas/",
+        json={"nombre": "Línea Lento Negativo", "tiempo_ideal_seg": 100, "tiempo_lento_seg": -50, "tiempo_alerta_seg": 300},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 400

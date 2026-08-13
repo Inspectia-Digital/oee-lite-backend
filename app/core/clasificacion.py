@@ -49,9 +49,24 @@ def validar_perfil_tiempos(ideal: float, lento: Optional[float], alerta: Optiona
     (ver más abajo / registrar_escaneo_rapido en scans.py): el nivel
     LENTO queda matemáticamente inalcanzable, en silencio -- la estación
     parece saltar directo de OPTIMO a ALERTA y nadie se entera de por qué.
-    Este bug fue real en producción (Fase AB) antes de existir este chequeo."""
+    Este bug fue real en producción (Fase AB) antes de existir este chequeo.
+
+    QA-14 (auditoría QA): esto sólo validaba el ORDEN relativo, nunca
+    que los valores fueran positivos -- un perfil como ideal=-10,
+    lento=-5, alerta=0 pasaba sin problema (cumple ideal<=lento<alerta),
+    pero convertía todos los eventos en ALERTA (cualquier delta_t real
+    es "mayor" que un t_alerta<=0), con tiempo_ideal_seg negativo
+    contaminando Rendimiento, y eventualmente violando el CHECK
+    delta_t_segundos >= 0 de la base (migración 7af24f2546a7) al
+    intentar persistir."""
+    if ideal <= 0:
+        raise ValueError(f"El tiempo 'ideal' ({ideal}s) tiene que ser mayor que cero.")
     if lento is None or alerta is None:
         return
+    if lento <= 0:
+        raise ValueError(f"El tiempo 'lento' ({lento}s) tiene que ser mayor que cero.")
+    if alerta <= 0:
+        raise ValueError(f"El tiempo 'alerta' ({alerta}s) tiene que ser mayor que cero.")
     if ideal > lento:
         raise ValueError(
             f"El tiempo 'ideal' ({ideal}s) no puede ser mayor que 'lento' ({lento}s) -- "
