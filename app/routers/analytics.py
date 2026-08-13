@@ -1446,6 +1446,19 @@ def _dia_iso_anterior(dia_iso: int) -> int:
     return 7 if dia_iso == 1 else dia_iso - 1
 
 
+def _fecha_inicio_turno(fecha_consulta: date, hora_local: time, turno: Turno) -> date:
+    """QA-09 (auditoría QA): qué fecha usar para buscar en
+    AsignacionTurno.fecha -- el día en que el TURNO empieza, no
+    necesariamamente fecha_consulta. Para un turno que cruza medianoche,
+    si hora_local cae en la franja "de madrugada" (antes de hora_fin,
+    ver _resolver_turno_por_horario), el turno arrancó AYER -- la
+    dotación se carga pensando en "el turno del lunes a la noche", con
+    fecha=lunes, no fecha=martes."""
+    if turno.hora_inicio > turno.hora_fin and hora_local <= turno.hora_fin:
+        return fecha_consulta - timedelta(days=1)
+    return fecha_consulta
+
+
 def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
     """Qué Turno (de una lista ya acotada a una línea) está vigente para
     una hora+día puntuales -- horario + día de semana, primer match gana.
@@ -1737,19 +1750,59 @@ def obtener_rendimiento_operarios(
         # /analytics/linea-en-vivo/ (_fecha_planta), pero nunca se aplicó acá.
         planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
         estacion_ids = {est.id for _, est in eventos}
-        fechas = {_fecha_planta(e.timestamp, planta) for e, _ in eventos}
+
+        # QA-09 (auditoría QA): antes se agrupaba operario por
+        # (estacion_fk, fecha) -- con DOS turnos en la misma estación el
+        # mismo día (el caso normal: turno día + turno noche), la
+        # segunda asignación cargada pisaba a la primera en este dict, y
+        # TODOS los eventos de ese día terminaban atribuidos a un único
+        # operario (el que ganara el orden no garantizado de las filas
+        # de Postgres). Ahora cada evento resuelve primero SU turno por
+        # horario (mismo criterio corregido en Fase AM) y la key de
+        # lookup suma turno_fk.
+        linea_ids = {est.linea_id for _, est in eventos if est.linea_id}
+        turnos_por_linea: Dict[uuid.UUID, List[Turno]] = {}
+        if linea_ids:
+            for t in db.exec(
+                select(Turno).where(
+                    Turno.tenant_id == context.tenant_id,
+                    Turno.linea_id.in_(linea_ids),
+                    Turno.activo == True,  # noqa: E712
+                )
+            ).all():
+                turnos_por_linea.setdefault(t.linea_id, []).append(t)
+
+        # Resuelto una sola vez por evento (se reusa para acotar qué
+        # fechas traer de AsignacionTurno y para el lookup real de abajo).
+        resolucion_por_evento: Dict[uuid.UUID, tuple] = {}
+        for evento, estacion in eventos:
+            hora_local = _hora_planta(evento.timestamp, planta)
+            fecha_evento = _fecha_planta(evento.timestamp, planta)
+            turno = _resolver_turno_por_horario(
+                hora_local, fecha_evento.isoweekday(), turnos_por_linea.get(estacion.linea_id, [])
+            )
+            if turno:
+                resolucion_por_evento[evento.id] = (turno.id, _fecha_inicio_turno(fecha_evento, hora_local, turno))
+
+        fechas_necesarias = {f for _, f in resolucion_por_evento.values()}
         asignaciones = db.exec(
             select(AsignacionTurno).where(
                 AsignacionTurno.tenant_id == context.tenant_id,
                 AsignacionTurno.estacion_fk.in_(estacion_ids),
-                AsignacionTurno.fecha.in_(fechas),
+                AsignacionTurno.fecha.in_(fechas_necesarias),
             )
-        ).all()
-        operario_por_estacion_fecha = {(a.estacion_fk, a.fecha): a.operario_fk for a in asignaciones}
+        ).all() if fechas_necesarias else []
+        operario_por_estacion_fecha_turno = {
+            (a.estacion_fk, a.fecha, a.turno_fk): a.operario_fk for a in asignaciones
+        }
 
         agrupado = {}
         for evento, estacion in eventos:
-            op_id = operario_por_estacion_fecha.get((estacion.id, _fecha_planta(evento.timestamp, planta)))
+            resuelto = resolucion_por_evento.get(evento.id)
+            if not resuelto:
+                continue  # sin turno resuelto, no hay forma de saber a quién atribuirlo
+            turno_id, fecha_inicio = resuelto
+            op_id = operario_por_estacion_fecha_turno.get((estacion.id, fecha_inicio, turno_id))
             if not op_id:
                 continue
             if operario_id and op_id != operario_id:
