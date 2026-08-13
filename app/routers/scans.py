@@ -257,6 +257,30 @@ def registrar_escaneo_rapido(
     if ultimo_evento:
         delta_t_segundos = (evento_timestamp - ultimo_evento.timestamp).total_seconds()
 
+        # QA-04 (auditoría QA): un evento con timestamp ANTERIOR al último
+        # persistido para esta estación (Edge/PLC que reenvía fuera de
+        # orden dentro de la ventana de _validar_rango_timestamp, ej. tras
+        # un corte de conectividad con buffer local) daba un delta
+        # negativo. Antes de este fix eso pasaba de largo hasta el
+        # commit, donde violaba el CHECK delta_t_segundos >= 0 (migración
+        # 7af24f2546a7) -- y el `except IntegrityError` de más abajo
+        # asumía SIEMPRE que una falla ahí era colisión de event_id, así
+        # que devolvía "event_id ya usado con un payload diferente": un
+        # mensaje totalmente engañoso para lo que en realidad era
+        # desorden cronológico, con el evento perdido sin dejar rastro
+        # claro para el gateway. Decisión del usuario: rechazar explícito
+        # con un código distinguible -- no se intenta reordenar ni
+        # recomputar automáticamente acá.
+        if delta_t_segundos < 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "EVENTO_FUERA_DE_ORDEN: el timestamp del evento es anterior al último "
+                    f"registrado para esta estación ({ultimo_evento.timestamp.isoformat()}Z). "
+                    "No se persiste -- reenviar en orden cronológico."
+                ),
+            )
+
         # Fase Q (feedback de producto): un cambio de ORDEN ACTIVA entre el
         # evento anterior y éste es un límite de SESIÓN, no una parada real
         # -- una orden tiene día/turno de INICIO pero no de fin definido,

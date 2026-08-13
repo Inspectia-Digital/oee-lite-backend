@@ -18,7 +18,7 @@ from app.core.clasificacion import validar_perfil_tiempos
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
-    Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion, Tenant,
+    Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion, Tenant, EstadoPlan, EstadoOrden,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -942,6 +942,22 @@ def crear_orden(
         ).first()
         if not plan:
             raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+        # QA-02 (auditoría QA): antes no se validaba que la orden y el
+        # plan fueran de la MISMA línea -- se podía vincular una orden a
+        # un plan de otra línea sin ningún error (la importación por
+        # Excel sí lo validaba, ver subir_plan en importaciones.py --
+        # acá faltaba la misma regla). Tampoco se podía agregar una
+        # orden a un plan que ya terminó (CERRADO) o se abortó
+        # (CANCELADO) -- no tiene sentido sumar producción a algo que ya
+        # no está operativo ni en cola.
+        if plan.estado in (EstadoPlan.CERRADO, EstadoPlan.CANCELADO):
+            raise HTTPException(status_code=409, detail=f"El plan '{plan.nombre}' está {plan.estado.value} -- no se le pueden agregar órdenes.")
+        if datos.get("linea_id") and datos["linea_id"] != plan.linea_id:
+            raise HTTPException(status_code=400, detail="linea_id no coincide con la línea del plan.")
+        # La línea la da el plan si no vino explícita en el payload --
+        # mismo criterio que useCrearOrdenEnPlan en el front, que nunca
+        # la manda (deja que el backend la resuelva).
+        datos["linea_id"] = plan.linea_id
         if datos.get("secuencia") is None:
             maxima = db.exec(
                 select(OrdenProduccion.secuencia)
@@ -1006,6 +1022,29 @@ def actualizar_orden(
         sku = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == datos["sku_fk"], MaestroSKU.tenant_id == context.tenant_id)).first()
         if not sku:
             raise HTTPException(status_code=400, detail="sku_fk no existe o pertenece a otra organización.")
+
+    # QA-02 (auditoría QA): mismo criterio que crear_orden -- si esta
+    # edición toca plan_id o linea_id, validar que sigan siendo
+    # consistentes entre sí. Deliberadamente NO se re-valida en cada
+    # PATCH que no toque ninguno de los dos (ej. renombrar cantidad
+    # esperada) -- no hay que bloquear ediciones no relacionadas de una
+    # orden vieja por datos que pudieran haber quedado inconsistentes
+    # antes de este fix.
+    if "plan_id" in datos or "linea_id" in datos:
+        plan_id_efectivo = datos.get("plan_id", orden.plan_id)
+        linea_id_efectivo = datos.get("linea_id", orden.linea_id)
+        if plan_id_efectivo:
+            plan = db.exec(
+                select(PlanProduccion).where(PlanProduccion.id == plan_id_efectivo, PlanProduccion.tenant_id == context.tenant_id)
+            ).first()
+            if not plan:
+                raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+            if "plan_id" in datos and plan.estado in (EstadoPlan.CERRADO, EstadoPlan.CANCELADO):
+                raise HTTPException(status_code=409, detail=f"El plan '{plan.nombre}' está {plan.estado.value} -- no se le pueden agregar órdenes.")
+            if linea_id_efectivo and linea_id_efectivo != plan.linea_id:
+                raise HTTPException(status_code=400, detail="linea_id no coincide con la línea del plan.")
+            if "linea_id" not in datos:
+                datos["linea_id"] = plan.linea_id
 
     for key, value in datos.items():
         setattr(orden, key, value)
@@ -1166,9 +1205,27 @@ def crear_plan(
     if not linea:
         raise HTTPException(status_code=400, detail="linea_id no existe o pertenece a otra organización.")
 
+    # QA-01 (auditoría QA): a lo sumo un plan EN_PROGRESO por línea, ver
+    # EstadoPlan y la migración plan_estados_qa01. Caso común (no hay
+    # ningún plan en_progreso todavía en esta línea): el nuevo nace
+    # EN_PROGRESO directo, mismo comportamiento de siempre, cero
+    # fricción. Si ya hay uno: el nuevo nace PROGRAMADO -- no compite,
+    # queda en cola para activarlo explícitamente después (POST
+    # .../activar) una vez que el actual se cierre/cancele.
+    hay_en_progreso = db.exec(
+        select(PlanProduccion).where(
+            PlanProduccion.tenant_id == context.tenant_id,
+            PlanProduccion.linea_id == payload.linea_id,
+            PlanProduccion.estado == EstadoPlan.EN_PROGRESO,
+            PlanProduccion.activo == True,  # noqa: E712
+        )
+    ).first()
+    estado_inicial = EstadoPlan.PROGRAMADO if hay_en_progreso else EstadoPlan.EN_PROGRESO
+
     nuevo = PlanProduccion(
         tenant_id=context.tenant_id, linea_id=payload.linea_id,
         fecha_inicio=payload.fecha_inicio, nombre=payload.nombre,
+        estado=estado_inicial,
     )
     db.add(nuevo)
     db.commit()
@@ -1236,6 +1293,48 @@ def actualizar_plan(
     return _armar_plan_con_ordenes(db, context.tenant_id, plan)
 
 
+@router.post("/planes/{plan_id}/activar", response_model=PlanConOrdenes)
+def activar_plan(
+    plan_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    _: UsuarioSaaS = Depends(requerir_gerencia),
+):
+    """QA-01 (auditoría QA): pasa un plan BORRADOR/PROGRAMADO a
+    EN_PROGRESO -- el paso explícito para "ahora arranca este" cuando ya
+    había otro operativo en la línea (crear_plan sólo activa directo si
+    la línea estaba libre, ver ahí). 409 si la línea ya tiene otro plan
+    EN_PROGRESO -- hay que cerrarlo/cancelarlo primero, nunca dos a la
+    vez (mismo invariante que el índice único parcial de la migración
+    plan_estados_qa01 garantiza a nivel de base)."""
+    plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    if plan.estado not in (EstadoPlan.BORRADOR, EstadoPlan.PROGRAMADO):
+        raise HTTPException(status_code=409, detail=f"Sólo se puede activar un plan BORRADOR o PROGRAMADO (estado actual: {plan.estado.value}).")
+
+    otro_en_progreso = db.exec(
+        select(PlanProduccion).where(
+            PlanProduccion.tenant_id == context.tenant_id,
+            PlanProduccion.linea_id == plan.linea_id,
+            PlanProduccion.estado == EstadoPlan.EN_PROGRESO,
+            PlanProduccion.activo == True,  # noqa: E712
+            PlanProduccion.id != plan.id,
+        )
+    ).first()
+    if otro_en_progreso:
+        raise HTTPException(
+            status_code=409,
+            detail=f"La línea ya tiene un plan en progreso ('{otro_en_progreso.nombre}'). Cerralo o cancelalo antes de activar este.",
+        )
+
+    plan.estado = EstadoPlan.EN_PROGRESO
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return _armar_plan_con_ordenes(db, context.tenant_id, plan)
+
+
 @router.delete("/planes/{plan_id}")
 def desactivar_plan(
     plan_id: uuid.UUID,
@@ -1243,12 +1342,39 @@ def desactivar_plan(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
-    """Baja lógica. No borra las órdenes que agrupaba -- quedan sueltas
-    (plan_id sigue apuntando a un plan inactivo, se preservan tal cual
-    para no romper trazabilidad histórica de lo que ya se produjo)."""
+    """Baja lógica + cancelación. No borra las órdenes que agrupaba --
+    quedan sueltas (plan_id sigue apuntando a un plan inactivo, se
+    preservan tal cual para no romper trazabilidad histórica de lo que
+    ya se produjo).
+
+    QA-13 (auditoría QA): antes esto sólo ponía activo=False sin tocar
+    estado/orden_activa_fk -- resolver_orden_activa ignoraba el plan
+    inactivo y caía al heurístico de EN_PROGRESO más reciente, así que
+    la orden que estaba "activa" podía seguir recibiendo scans como si
+    nada. Ahora, si el plan estaba operativo (EN_PROGRESO/PROGRAMADO/
+    BORRADOR), pasa a CANCELADO y se cierra explícitamente su orden
+    activa (si tenía una) -- deja de haber ambigüedad entre "el usuario
+    cree que esto se detuvo" y "la ingesta lo sigue usando". Un plan ya
+    CERRADO (terminó su secuencia normalmente) no se reescribe a
+    CANCELADO -- sólo se le aplica la baja lógica, igual que siempre."""
     plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
+
+    if plan.estado in (EstadoPlan.EN_PROGRESO, EstadoPlan.PROGRAMADO, EstadoPlan.BORRADOR):
+        if plan.orden_activa_fk:
+            orden_activa = db.exec(
+                select(OrdenProduccion).where(
+                    OrdenProduccion.id == plan.orden_activa_fk,
+                    OrdenProduccion.tenant_id == context.tenant_id,
+                )
+            ).first()
+            if orden_activa:
+                orden_activa.estado = EstadoOrden.CERRADA
+                db.add(orden_activa)
+            plan.orden_activa_fk = None
+        plan.estado = EstadoPlan.CANCELADO
+
     plan.activo = False
     db.add(plan)
     db.commit()

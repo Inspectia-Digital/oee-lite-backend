@@ -22,9 +22,29 @@ class EstadoPlan(str, Enum):
     """Fase AA (pedido de Green Mills): un Plan agrupa las Ordenes que se
     van a producir en un día -- sin fecha_fin (a pedido explícito, ver
     PlanProduccion.fecha_inicio); se cierra solo cuando se agota la
-    secuencia de órdenes (ver avanzar_orden en operacion.py)."""
-    ABIERTO = "abierto"
+    secuencia de órdenes (ver avanzar_orden en operacion.py).
+
+    QA-01 (auditoría QA post-Fase AG): el modelo anterior (ABIERTO/
+    CERRADO) no tenía invariante de unicidad -- podían coexistir varios
+    planes ABIERTO en la misma línea, y resolver_orden_activa
+    (clasificacion.py) tomaba cualquiera con `.first()` (orden no
+    determinístico de Postgres), contaminando qué orden/SKU/perfil de
+    tiempos se le atribuía a cada scan. Rediseño (decisión del usuario):
+    BORRADOR/PROGRAMADO no compiten por la línea -- ninguno participa en
+    resolver_orden_activa. EN_PROGRESO es el único estado operativo,
+    garantizado único por (tenant_id, linea_id) en DOS capas: a nivel de
+    aplicación (crear_plan/activar_plan en configuracion.py) Y a nivel
+    de base de datos (índice único parcial, ver migración
+    plan_estados_qa01) -- la invariante no depende sólo del
+    procedimiento humano, tal como pide la conclusión de la auditoría.
+    CANCELADO es nuevo: distingue un plan abortado a mitad de camino de
+    uno CERRADO normalmente (agotó su secuencia de órdenes) -- resuelve
+    también QA-13 (desactivar un plan no limpiaba su orden activa)."""
+    BORRADOR = "borrador"
+    PROGRAMADO = "programado"
+    EN_PROGRESO = "en_progreso"
     CERRADO = "cerrado"
+    CANCELADO = "cancelado"
 
 class EstadoParada(str, Enum):
     PENDIENTE = "pendiente"       # Gap detectado automáticamente, esperando al supervisor
@@ -375,7 +395,7 @@ class PlanProduccion(TenantBase, table=True):
     # en adelante (ver PlanProduccionCreate).
     nombre: Optional[str] = Field(default=None)
     fecha_inicio: date
-    estado: EstadoPlan = Field(default=EstadoPlan.ABIERTO)
+    estado: EstadoPlan = Field(default=EstadoPlan.EN_PROGRESO)
     # NOTA (C1/C2, mismo criterio que el resto del esquema): apunta a
     # OrdenProduccion.id (UUID), no a id_orden (PK legacy) -- las FKs
     # nuevas hacia Orden usan la identidad interna, ver nota en esa clase.

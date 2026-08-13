@@ -114,7 +114,11 @@ def clasificar_parada(
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa[cite: 13]")
-    
+    # QA-06 (auditoría QA): validar_planta() ya confirmó que el usuario
+    # tiene acceso a la planta activa -- esto confirma que la PARADA
+    # (vía su estación) pertenece a esa misma planta, no sólo al tenant.
+    _validar_estacion_en_planta(parada.estacion_fk, context, db)
+
     motivo = db.get(MotivoParada, datos.motivo_fk)
     if not motivo or motivo.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Motivo de parada no válido o no autorizado[cite: 13]")
@@ -142,11 +146,15 @@ def registrar_parada_planificada(
     estacion = db.get(Estacion, datos.estacion_fk)
     if not estacion or estacion.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Estación no encontrada")
+    # QA-06 (auditoría QA): la estación debe pertenecer a la planta
+    # activa, no sólo al tenant.
+    if estacion.linea_id:
+        _validar_linea_en_planta(estacion.linea_id, context, db)
 
     motivo = db.get(MotivoParada, datos.motivo_fk)
     if not motivo or motivo.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Motivo no encontrado")
-        
+
     if "planificada" not in str(motivo.tipo_parada).lower():
         raise HTTPException(status_code=400, detail="El motivo seleccionado no es PLANIFICADA[cite: 13]")
     
@@ -255,6 +263,8 @@ def eliminar_parada_planificada(
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")
+    # QA-06 (auditoría QA): la parada debe pertenecer a la planta activa.
+    _validar_estacion_en_planta(parada.estacion_fk, context, db)
     if parada.origen != "PLANIFICADA":
         raise HTTPException(status_code=409, detail="Sólo se pueden eliminar paradas programadas (origen PLANIFICADA).")
     if parada.inicio <= datetime.utcnow():
@@ -293,6 +303,25 @@ def _validar_linea_en_planta(linea_id: uuid.UUID, context: TenantContext, db: Se
     if context.sub_tenant_id and str(linea.planta_id) != str(context.sub_tenant_id):
         raise HTTPException(status_code=404, detail="Línea no encontrada en la planta activa.")
     return linea
+
+
+def _validar_estacion_en_planta(estacion_id: uuid.UUID, context: TenantContext, db: Session) -> Estacion:
+    """QA-06 (auditoría QA): validar_planta() sólo confirma que el
+    usuario tiene acceso a la planta activa -- NO que la entidad que
+    está escribiendo (parada, estación, asignación) pertenezca
+    realmente a esa planta. Sin esto, un usuario con acceso legítimo a
+    la Planta A podía escribir sobre una parada/estación/asignación de
+    la Planta B del mismo tenant, con sólo conocer o adivinar el UUID
+    (la lectura vía listados sí filtraba por planta -- el agujero era
+    puntual en las escrituras por ID directo). Mismo criterio que
+    _validar_linea_en_planta, para endpoints que reciben un UUID de
+    estación en vez de un UUID de línea."""
+    estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == context.tenant_id)).first()
+    if not estacion:
+        raise HTTPException(status_code=404, detail="Estación no encontrada.")
+    if estacion.linea_id:
+        _validar_linea_en_planta(estacion.linea_id, context, db)
+    return estacion
 
 
 # ==========================================
@@ -340,8 +369,16 @@ def avanzar_orden(
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
     if context.sub_tenant_id:
         _validar_linea_en_planta(plan.linea_id, context, db)
+    # QA-01 (auditoría QA): con el modelo de 5 estados sólo tiene sentido
+    # avanzar un plan EN_PROGRESO -- uno BORRADOR/PROGRAMADO todavía no
+    # arrancó (falta activarlo primero, ver activar_plan en
+    # configuracion.py) y uno CERRADO/CANCELADO ya terminó.
     if plan.estado == EstadoPlan.CERRADO:
         raise HTTPException(status_code=409, detail="El plan ya está cerrado -- no quedan más órdenes para avanzar.")
+    if plan.estado == EstadoPlan.CANCELADO:
+        raise HTTPException(status_code=409, detail="El plan está cancelado -- no se puede avanzar.")
+    if plan.estado in (EstadoPlan.BORRADOR, EstadoPlan.PROGRAMADO):
+        raise HTTPException(status_code=409, detail=f"El plan todavía no está en progreso (estado: {plan.estado.value}) -- activalo primero.")
 
     orden_cerrada_id = None
     secuencia_actual = -1  # -1 = "todavía no arrancó" -> avanzar activa la primera de la secuencia
@@ -493,6 +530,9 @@ def liberar_estacion(
     ).first()
     if not asignacion:
         raise HTTPException(status_code=404, detail="Asignación no encontrada.")
+    # QA-06 (auditoría QA): la asignación debe pertenecer a la planta
+    # activa (vía su estación), no sólo al tenant.
+    _validar_estacion_en_planta(asignacion.estacion_fk, context, db)
     db.delete(asignacion)
     db.commit()
     return {"mensaje": "Estación liberada."}
@@ -703,5 +743,7 @@ def eliminar_asignacion_supervisor(
     ).first()
     if not regla:
         raise HTTPException(status_code=404, detail="Regla de asignación no encontrada.")
+    # QA-06 (auditoría QA): la regla debe pertenecer a la planta activa.
+    _validar_linea_en_planta(regla.linea_id, context, db)
     db.delete(regla)
     db.commit()

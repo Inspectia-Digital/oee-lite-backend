@@ -177,27 +177,34 @@ def resolver_orden_activa(db: Session, tenant_id: str, linea_id) -> Optional[Ord
     uno reimplementaba su propia versión de "la orden EN_PROGRESO más
     reciente" por separado (Fase P), sin garantía de que dieran lo mismo.
 
-    - Si la línea tiene un PlanProduccion ABIERTO con orden_activa_fk
+    - Si la línea tiene un PlanProduccion EN_PROGRESO con orden_activa_fk
       definida, esa es la fuente AUTORITATIVA -- la decide un supervisor
       (ver avanzar_orden en operacion.py), sin ambigüedad posible.
     - Si no (la línea no adoptó el flujo de Plan, o el plan no tiene
       ninguna orden activa todavía), cae al heurístico histórico: la
       orden EN_PROGRESO más reciente de la línea (comportamiento
       idéntico al de antes de Fase AA para cualquier línea que no cree
-      un Plan -- Plan es opcional, nunca se le impone a un tenant)."""
-    plan_abierto = db.exec(
+      un Plan -- Plan es opcional, nunca se le impone a un tenant).
+
+    QA-01 (auditoría QA): antes el estado se llamaba ABIERTO y podía
+    haber más de uno por línea -- este `.first()` tomaba cualquiera sin
+    garantía. Ahora EN_PROGRESO está garantizado único por
+    (tenant_id, linea_id) con activo=true por un índice único parcial
+    (ver migración plan_estados_qa01), así que el `.first()` ya no es
+    ambiguo -- a lo sumo puede matchear una fila."""
+    plan_en_progreso = db.exec(
         select(PlanProduccion).where(
             PlanProduccion.tenant_id == tenant_id,
             PlanProduccion.linea_id == linea_id,
-            PlanProduccion.estado == EstadoPlan.ABIERTO,
+            PlanProduccion.estado == EstadoPlan.EN_PROGRESO,
             PlanProduccion.activo == True,  # noqa: E712
         )
     ).first()
-    if plan_abierto and plan_abierto.orden_activa_fk:
+    if plan_en_progreso and plan_en_progreso.orden_activa_fk:
         orden = db.exec(
             select(OrdenProduccion).where(
                 OrdenProduccion.tenant_id == tenant_id,
-                OrdenProduccion.id == plan_abierto.orden_activa_fk,
+                OrdenProduccion.id == plan_en_progreso.orden_activa_fk,
             )
         ).first()
         if orden:
