@@ -340,8 +340,16 @@ def avanzar_orden(
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
     if context.sub_tenant_id:
         _validar_linea_en_planta(plan.linea_id, context, db)
+    # QA-01 (auditoría QA): con el modelo de 5 estados sólo tiene sentido
+    # avanzar un plan EN_PROGRESO -- uno BORRADOR/PROGRAMADO todavía no
+    # arrancó (falta activarlo primero, ver activar_plan en
+    # configuracion.py) y uno CERRADO/CANCELADO ya terminó.
     if plan.estado == EstadoPlan.CERRADO:
         raise HTTPException(status_code=409, detail="El plan ya está cerrado -- no quedan más órdenes para avanzar.")
+    if plan.estado == EstadoPlan.CANCELADO:
+        raise HTTPException(status_code=409, detail="El plan está cancelado -- no se puede avanzar.")
+    if plan.estado in (EstadoPlan.BORRADOR, EstadoPlan.PROGRAMADO):
+        raise HTTPException(status_code=409, detail=f"El plan todavía no está en progreso (estado: {plan.estado.value}) -- activalo primero.")
 
     orden_cerrada_id = None
     secuencia_actual = -1  # -1 = "todavía no arrancó" -> avanzar activa la primera de la secuencia

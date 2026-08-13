@@ -69,7 +69,9 @@ def test_crear_plan_vacio(client, db, tenant_a, gerente_a):
     )
     assert r.status_code == 201
     body = r.json()
-    assert body["estado"] == "abierto"
+    # QA-01: nace en_progreso directo -- no había otro plan en_progreso
+    # en la línea, mismo comportamiento de siempre (antes "abierto").
+    assert body["estado"] == "en_progreso"
     assert body["orden_activa_fk"] is None
     assert body["ordenes"] == []
 
@@ -338,7 +340,7 @@ def test_avanzar_orden_primera_vez_activa_la_primera_de_la_secuencia(client, db,
     body = r.json()
     assert body["orden_cerrada_id_orden"] is None
     assert body["orden_activa_id_orden"] == o1["id_orden"]
-    assert body["estado"] == "abierto"
+    assert body["estado"] == "en_progreso"
 
 
 def test_avanzar_orden_segunda_vez_cierra_la_primera_y_activa_la_segunda(client, db, tenant_a, gerente_a):
@@ -353,7 +355,7 @@ def test_avanzar_orden_segunda_vez_cierra_la_primera_y_activa_la_segunda(client,
     body = r.json()
     assert body["orden_cerrada_id_orden"] == o1["id_orden"]
     assert body["orden_activa_id_orden"] == o2["id_orden"]
-    assert body["estado"] == "abierto"
+    assert body["estado"] == "en_progreso"
 
     o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
     assert o1_db["estado"] == "cerrada"
@@ -551,3 +553,181 @@ def test_linea_en_vivo_refleja_la_orden_activa_del_plan(client, db, tenant_a, ge
     assert r.status_code == 200
     assert r.json()["orden_activa"] == o1["id_orden"]
     assert r.json()["orden_sku"] == sku1.codigo_sku
+
+
+# ---------- Fase AH (auditoría QA, QA-01/QA-13): máquina de estados ----------
+
+def test_crear_segundo_plan_en_misma_linea_nace_programado(client, db, tenant_a, gerente_a):
+    """QA-01: si la línea ya tiene un plan EN_PROGRESO, el nuevo no
+    compite -- nace PROGRAMADO, no EN_PROGRESO."""
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    p1 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    ).json()
+    assert p1["estado"] == "en_progreso"
+
+    p2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2 (urgente)"},
+        headers=headers,
+    ).json()
+    assert p2["estado"] == "programado"
+
+
+def test_activar_plan_programado_sin_conflicto(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    p1 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    ).json()
+    p2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2"},
+        headers=headers,
+    ).json()
+    assert p2["estado"] == "programado"
+
+    # Cerrando/cancelando el primero, activar el segundo debe funcionar.
+    client.delete(f"/config/planes/{p1['id']}", headers=headers)
+    r = client.post(f"/config/planes/{p2['id']}/activar", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["estado"] == "en_progreso"
+
+
+def test_activar_plan_con_otro_en_progreso_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    )
+    p2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2"},
+        headers=headers,
+    ).json()
+    assert p2["estado"] == "programado"
+
+    r = client.post(f"/config/planes/{p2['id']}/activar", headers=headers)
+    assert r.status_code == 409
+
+
+def test_activar_plan_que_no_esta_en_borrador_ni_programado_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    p1 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    ).json()
+    assert p1["estado"] == "en_progreso"
+
+    r = client.post(f"/config/planes/{p1['id']}/activar", headers=headers)
+    assert r.status_code == 409
+
+
+def test_desactivar_plan_en_progreso_lo_cancela_y_cierra_orden_activa(client, db, tenant_a, gerente_a):
+    """QA-13: antes desactivar_plan sólo ponía activo=False, sin tocar
+    estado ni orden_activa_fk -- resolver_orden_activa caía al
+    heurístico de EN_PROGRESO más reciente y la orden "cancelada" seguía
+    recibiendo scans. Ahora cancela de verdad."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+
+    r = client.delete(f"/config/planes/{plan['id']}", headers=headers)
+    assert r.status_code == 200
+
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert detalle["estado"] == "cancelado"
+    assert detalle["activo"] is False
+    assert detalle["orden_activa_fk"] is None
+
+    o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
+    assert o1_db["estado"] == "cerrada"
+
+
+def test_desactivar_plan_cerrado_no_cambia_estado(client, db, tenant_a, gerente_a):
+    """Un plan que ya terminó su secuencia normalmente (CERRADO) no se
+    reescribe a CANCELADO al hacer la baja lógica -- ya terminó bien."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # agota la secuencia
+    assert r.json()["estado"] == "cerrado"
+
+    client.delete(f"/config/planes/{plan['id']}", headers=headers)
+    detalle = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert detalle["estado"] == "cerrado"
+    assert detalle["activo"] is False
+
+
+def test_avanzar_orden_bloqueado_si_plan_todavia_no_esta_en_progreso(client, db, tenant_a, gerente_a):
+    planta, linea, _ = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 1"},
+        headers=headers,
+    )
+    p2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2"},
+        headers=headers,
+    ).json()
+    assert p2["estado"] == "programado"
+
+    r = client.post(f"/supervisor/planes/{p2['id']}/avanzar-orden/", headers=headers)
+    assert r.status_code == 409
+
+
+def test_avanzar_orden_bloqueado_si_plan_cancelado(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.delete(f"/config/planes/{plan['id']}", headers=headers)  # cancela
+
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    assert r.status_code == 409
+
+
+def test_resolver_orden_activa_ignora_plan_programado(client, db, tenant_a, gerente_a):
+    """Defensa en profundidad: aunque en la práctica un plan PROGRAMADO
+    nunca debería tener orden_activa_fk (avanzar_orden ya lo bloquea),
+    resolver_orden_activa (vía linea-en-vivo) sólo debe mirar
+    EN_PROGRESO -- nunca un plan en cola."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan1, o1, o2, sku1, sku2 = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan1['id']}/avanzar-orden/", headers=headers)  # activa o1 en plan1 (en_progreso)
+
+    plan2 = client.post(
+        "/config/planes/",
+        json={"linea_id": str(linea.id), "fecha_inicio": date.today().isoformat(), "nombre": "Plan 2 (cola)"},
+        headers=headers,
+    ).json()
+    assert plan2["estado"] == "programado"
+
+    r = client.get("/analytics/linea-en-vivo/", params={"linea_id": str(linea.id)}, headers=headers)
+    assert r.status_code == 200
+    # Sigue viendo la orden del plan EN_PROGRESO, no se confunde con el
+    # plan en cola.
+    assert r.json()["orden_activa"] == o1["id_orden"]
