@@ -14,7 +14,7 @@ from app.models.domain import (
     MotivoParada, Operario, Turno, Linea, TipoParada,
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada,
-    AsignacionSupervisor, Supervisor, Maquina,
+    AsignacionSupervisor, Supervisor, Maquina, MaestroSKU,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -390,6 +390,7 @@ def _calcular_metricas_oee(
     fecha_desde: Optional[date], fecha_hasta: Optional[date],
     linea_id: Optional[uuid.UUID], turno_id: Optional[uuid.UUID],
     orden_fk: Optional[str] = None,
+    sku_fk: Optional[str] = None,
 ) -> Optional[dict]:
     """Núcleo del motor OEE (Fase E2), extraído para reusarse en oee-general
     y oee-cascada (Fase I) -- una sola fuente de verdad para las fórmulas,
@@ -401,7 +402,14 @@ def _calcular_metricas_oee(
     silenciosamente ignorado -- pedir un rango de 30 días devolvía nada más
     que el primer día. Ahora el rango realmente cubre [fecha_desde,
     fecha_hasta]. También suma el filtro opcional por orden (`orden_fk`,
-    el "Plan" del dashboard)."""
+    el "Plan" del dashboard).
+
+    Fase AE: sku_fk filtra por SKU en vez de por una orden puntual --
+    LiteEventoProduccion no guarda sku_fk directo (sólo orden_fk, el
+    id_orden string), así que se resuelve antes de armar la query
+    principal, no como un join más (evitaría reescribir todos los
+    `for e, _, _ in eventos` de acá abajo, que asumen exactamente 3
+    columnas)."""
     inicio, _ = obtener_rango_dia(fecha_desde)
     _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
 
@@ -419,6 +427,14 @@ def _calcular_metricas_oee(
     )
     if linea_id: query = query.where(Linea.id == linea_id)
     if orden_fk: query = query.where(LiteEventoProduccion.orden_fk == orden_fk)
+    if sku_fk:
+        ids_orden_del_sku = db.exec(
+            select(OrdenProduccion.id_orden).where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.sku_fk == sku_fk,
+            )
+        ).all()
+        query = query.where(LiteEventoProduccion.orden_fk.in_(ids_orden_del_sku))
     eventos = db.exec(query).all()
 
     if not eventos:
@@ -2007,3 +2023,265 @@ def obtener_paradas_por_sku(
     except Exception as e:
         logger.error(f"Error en paradas por SKU: {e}")
         return []
+
+
+# ==========================================
+# 📦 FASE AE: RENDIMIENTO POR SKU (pedido Green Mills)
+# El dashboard ya tenía "Top 5 SKUs por Volumen" (plan-vs-actual, sólo
+# cantidades) -- esto es lo que faltaba: las 4 métricas OEE reales
+# (Disponibilidad/Rendimiento/Calidad/OEE) por SKU, no sólo volumen.
+# ==========================================
+class RendimientoSkuRow(BaseModel):
+    sku_fk: str
+    sku_descripcion: Optional[str] = None
+    unidades_producidas: int
+    minutos_perdidos: float
+    disponibilidad_pct: float
+    rendimiento_pct: float
+    calidad_pct: Optional[float] = None
+    oee_general_pct: float
+
+
+@router.get("/analytics/rendimiento-sku/", response_model=List[RendimientoSkuRow])
+def obtener_rendimiento_sku(
+    fecha_desde: Optional[date] = None, fecha_hasta: Optional[date] = None,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase AE: las mismas 4 métricas de siempre (Disponibilidad/Rendimiento/
+    Calidad/OEE), recalculadas por SKU en vez de agregadas -- reusa
+    _calcular_metricas_oee con su filtro sku_fk (misma fórmula, nunca se
+    reinventa por separado). No depende de que exista un Plan (usa el
+    orden_fk que ya graba cada evento), pero es más confiable después de
+    Fase AA: sin Plan, dos órdenes EN_PROGRESO a la vez para la misma
+    línea podrían mezclar el heurístico de qué SKU corría en cada momento.
+    """
+    try:
+        validar_planta(context)
+    except ValueError:
+        return []
+
+    inicio, _ = obtener_rango_dia(fecha_desde)
+    _, fin = obtener_rango_dia(fecha_hasta or fecha_desde)
+
+    # SKUs con al menos un evento en el período/línea -- resueltos vía
+    # orden_fk (id_orden string) -> OrdenProduccion.sku_fk, igual que
+    # el filtro que se le agregó a _calcular_metricas_oee.
+    query_skus = (
+        select(OrdenProduccion.sku_fk)
+        .join(LiteEventoProduccion, LiteEventoProduccion.orden_fk == OrdenProduccion.id_orden)
+        .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .where(
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio,
+            LiteEventoProduccion.timestamp <= fin,
+            LiteEventoProduccion.incluido_oee == True,  # noqa: E712
+            OrdenProduccion.sku_fk.is_not(None),
+        )
+        .distinct()
+    )
+    if linea_id:
+        query_skus = query_skus.where(Linea.id == linea_id)
+    skus = [s for s in db.exec(query_skus).all() if s]
+    if not skus:
+        return []
+
+    descripciones = {
+        s.codigo_sku: s.descripcion
+        for s in db.exec(
+            select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id, MaestroSKU.codigo_sku.in_(skus))
+        ).all()
+    }
+
+    filas = []
+    for sku in skus:
+        m = _calcular_metricas_oee(db, context, fecha_desde, fecha_hasta, linea_id, None, sku_fk=sku)
+        if m is None:
+            continue
+        filas.append(RendimientoSkuRow(
+            sku_fk=sku,
+            sku_descripcion=descripciones.get(sku),
+            unidades_producidas=m["total_unidades"],
+            minutos_perdidos=round(m["minutos_perdidos_seg"] / 60, 1),
+            disponibilidad_pct=round(m["disponibilidad"] * 100, 1),
+            rendimiento_pct=round(m["rendimiento"] * 100, 1),
+            calidad_pct=m["calidad_pct"],
+            oee_general_pct=round(m["oee_general"] * 100, 1),
+        ))
+    # Peor OEE primero -- lo que más conviene mirar salta a la vista.
+    filas.sort(key=lambda f: f.oee_general_pct)
+    return filas
+
+
+# ==========================================
+# 🕐 FASE AG: DÍA PARTICULAR / DÍA PROMEDIO / POR HORAS (pedido Green Mills)
+# El agrupado es siempre por HORA LOCAL DE PLANTA (_hora_planta/_fecha_planta,
+# Fase AD) -- nunca UTC crudo, para que "las 14hs" del gráfico sean
+# efectivamente las 14hs reales de la planta.
+# ==========================================
+def _agrupar_eventos_por_hora_planta(
+    db: Session, context: TenantContext,
+    inicio: datetime, fin: datetime, linea_id: Optional[uuid.UUID],
+) -> tuple[dict, int]:
+    """Agrupa eventos (incluido_oee) y paradas en 24 buckets (hora local de
+    planta, 0-23). Devuelve (buckets, dias_con_actividad) -- dias_con_actividad
+    es un único número GLOBAL para todo el rango (no por hora), mismo
+    criterio que dias_produccion en _calcular_metricas_oee: cuenta días
+    calendario (hora de planta) con al menos un evento, sin importar en
+    qué hora haya caído cada uno."""
+    planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
+
+    query = (
+        select(LiteEventoProduccion, Estacion, Linea)
+        .join(Estacion, LiteEventoProduccion.id_estacion == cast(Estacion.id, String))
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .where(
+            LiteEventoProduccion.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            LiteEventoProduccion.timestamp >= inicio,
+            LiteEventoProduccion.timestamp <= fin,
+            LiteEventoProduccion.incluido_oee == True,  # noqa: E712
+        )
+    )
+    if linea_id:
+        query = query.where(Linea.id == linea_id)
+    eventos = db.exec(query).all()
+
+    buckets = {h: {"ideal": 0.0, "lentitud": 0.0, "unidades": 0} for h in range(24)}
+    dias_con_actividad = set()
+    for evento, _estacion, _linea in eventos:
+        hora = _hora_planta(evento.timestamp, planta).hour
+        dias_con_actividad.add(_fecha_planta(evento.timestamp, planta))
+        b = buckets[hora]
+        b["unidades"] += evento.unidades_procesadas
+        b["ideal"] += evento.tiempo_ideal_seg * evento.unidades_procesadas
+        if evento.estado == "LENTO":
+            b["lentitud"] += max(0.0, (evento.delta_t_segundos or 0.0) - (evento.tiempo_ideal_seg * evento.unidades_procesadas))
+
+    q_paradas = (
+        select(ParadaDetectada, MotivoParada)
+        .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
+        .join(Estacion, ParadaDetectada.estacion_fk == Estacion.id)
+        .join(Linea, Estacion.linea_id == Linea.id)
+        .where(
+            ParadaDetectada.tenant_id == context.tenant_id,
+            Linea.planta_id == context.sub_tenant_id,
+            ParadaDetectada.inicio >= inicio,
+            ParadaDetectada.inicio <= fin,
+        )
+    )
+    if linea_id:
+        q_paradas = q_paradas.where(Estacion.linea_id == linea_id)
+    for parada, motivo in db.exec(q_paradas).all():
+        hora = _hora_planta(parada.inicio, planta).hour
+        b = buckets[hora]
+        b.setdefault("paradas_count", 0)
+        b.setdefault("paradas_no_plan_seg", 0.0)
+        b["paradas_count"] += 1
+        # "Minutos perdidos" excluye paradas PLANIFICADAS -- mismo criterio
+        # que minutos_perdidos_seg en _calcular_metricas_oee.
+        if not motivo or motivo.tipo_parada == TipoParada.NO_PLANIFICADA:
+            b["paradas_no_plan_seg"] += parada.duracion_segundos or 0.0
+
+    return buckets, len(dias_con_actividad)
+
+
+def _rendimiento_asimetrico(ideal: float, lentitud: float) -> float:
+    """Misma fórmula de Fase V, reusada por 4ta vez (Cuellos de Botella,
+    Rendimiento por Estación, Fase AD máquinas, ahora por hora): sólo el
+    excedente LENTO penaliza, nunca ALERTA/parada (esa ya se cuenta aparte
+    como tiempo perdido)."""
+    if ideal + lentitud <= 0:
+        return 0.0
+    return round(min(100.0, ideal / (ideal + lentitud) * 100), 1)
+
+
+class DiaDetalleHoraRow(BaseModel):
+    hora: int
+    unidades_producidas: int
+    minutos_perdidos: float
+    paradas: int
+    rendimiento_pct: float
+
+
+@router.get("/analytics/dia-detalle/", response_model=List[DiaDetalleHoraRow])
+def obtener_dia_detalle(
+    fecha: date,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase AG (vista 1 de 3): un día puntual, desglosado en las 24 horas
+    del día (hora local de planta). Siempre devuelve las 24 filas, incluso
+    en cero -- un gráfico de barras/línea no debería tener huecos donde no
+    hubo actividad."""
+    try:
+        validar_planta(context)
+    except ValueError:
+        return [DiaDetalleHoraRow(hora=h, unidades_producidas=0, minutos_perdidos=0.0, paradas=0, rendimiento_pct=0.0) for h in range(24)]
+
+    inicio, fin = obtener_rango_dia(fecha)
+    buckets, _dias = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
+
+    return [
+        DiaDetalleHoraRow(
+            hora=h,
+            unidades_producidas=buckets[h]["unidades"],
+            minutos_perdidos=round((buckets[h]["lentitud"] + buckets[h].get("paradas_no_plan_seg", 0.0)) / 60, 1),
+            paradas=buckets[h].get("paradas_count", 0),
+            rendimiento_pct=_rendimiento_asimetrico(buckets[h]["ideal"], buckets[h]["lentitud"]),
+        )
+        for h in range(24)
+    ]
+
+
+class DiaPromedioHoraRow(BaseModel):
+    hora: int
+    unidades_promedio: float
+    minutos_perdidos_promedio: float
+    paradas_promedio: float
+    rendimiento_pct: float
+
+
+@router.get("/analytics/dia-promedio/", response_model=List[DiaPromedioHoraRow])
+def obtener_dia_promedio(
+    fecha_desde: date, fecha_hasta: date,
+    linea_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase AG (vista 2 de 3): perfil horario promediado entre todos los
+    días del rango. Decisión de diseño (planteada como pregunta abierta,
+    sin corrección del usuario -- se sigue el default declarado): las
+    cantidades (unidades/minutos perdidos/paradas) se dividen por los días
+    del rango que efectivamente tuvieron producción, NO por el total de
+    días del rango -- "cómo rinde la línea cuando trabaja", no diluido por
+    días parados. rendimiento_pct no se divide (ya es un ratio ideal/
+    (ideal+lentitud), se normaliza solo)."""
+    try:
+        validar_planta(context)
+    except ValueError:
+        return [DiaPromedioHoraRow(hora=h, unidades_promedio=0.0, minutos_perdidos_promedio=0.0, paradas_promedio=0.0, rendimiento_pct=0.0) for h in range(24)]
+    if fecha_hasta < fecha_desde:
+        raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+
+    inicio, _ = obtener_rango_dia(fecha_desde)
+    _, fin = obtener_rango_dia(fecha_hasta)
+    buckets, dias_con_actividad = _agrupar_eventos_por_hora_planta(db, context, inicio, fin, linea_id)
+
+    if dias_con_actividad == 0:
+        return [DiaPromedioHoraRow(hora=h, unidades_promedio=0.0, minutos_perdidos_promedio=0.0, paradas_promedio=0.0, rendimiento_pct=0.0) for h in range(24)]
+
+    return [
+        DiaPromedioHoraRow(
+            hora=h,
+            unidades_promedio=round(buckets[h]["unidades"] / dias_con_actividad, 1),
+            minutos_perdidos_promedio=round((buckets[h]["lentitud"] + buckets[h].get("paradas_no_plan_seg", 0.0)) / 60 / dias_con_actividad, 1),
+            paradas_promedio=round(buckets[h].get("paradas_count", 0) / dias_con_actividad, 1),
+            rendimiento_pct=_rendimiento_asimetrico(buckets[h]["ideal"], buckets[h]["lentitud"]),
+        )
+        for h in range(24)
+    ]
