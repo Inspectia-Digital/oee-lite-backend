@@ -357,6 +357,15 @@ class PlanProduccion(TenantBase, table=True):
     __tablename__ = "planes_produccion"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     linea_id: uuid.UUID = Field(foreign_key="dim_lineas.id")
+    # Unificación UX Planes/Órdenes/SKUs (pedido Green Mills): antes un
+    # plan sólo se identificaba por (línea, fecha) -- sin nombre, y la
+    # única UI (Supervisor) asumía que había A LO SUMO uno abierto por
+    # línea/día. Ahora puede haber varios el mismo día (turnos, lotes
+    # urgentes) y hace falta poder identificarlos. Nullable en el modelo
+    # -- los planes ya creados antes de este cambio no tienen backfill
+    # razonable -- pero la API exige nombre no vacío en el alta desde acá
+    # en adelante (ver PlanProduccionCreate).
+    nombre: Optional[str] = Field(default=None)
     fecha_inicio: date
     estado: EstadoPlan = Field(default=EstadoPlan.ABIERTO)
     # NOTA (C1/C2, mismo criterio que el resto del esquema): apunta a

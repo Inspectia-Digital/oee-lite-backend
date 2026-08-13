@@ -12,7 +12,7 @@ import uuid
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.core.clasificacion import validar_perfil_tiempos
-from app.models.domain import OrdenProduccion, MaestroSKU, Tenant, Linea
+from app.models.domain import OrdenProduccion, MaestroSKU, Tenant, Linea, PlanProduccion
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/lite/importaciones", tags=["Importación y Exportación (UI)"])
@@ -98,12 +98,37 @@ def descargar_template_plan():
 async def subir_plan(
     linea_id: str = Form(..., description="ID de la línea destino"),
     file: UploadFile = File(...),
-    map_json: Optional[str] = Form(None, description='Opcional. Ej: {"Tango_ID": "id_orden"}'), 
+    map_json: Optional[str] = Form(None, description='Opcional. Ej: {"Tango_ID": "id_orden"}'),
+    # Unificación UX Planes/Órdenes/SKUs: antes esta importación creaba
+    # órdenes SIN plan_id -- invisibles para "Plan del día"/avanzar-orden
+    # (Fase AA), aunque la línea sí tuviera un Plan abierto. Ahora, desde
+    # la vista de Planes en Configuración, la importación se dispara
+    # siempre DENTRO de un plan elegido y lo pasa acá.
+    plan_id: Optional[str] = Form(None, description="Opcional. Si se pasa, las órdenes cargadas/actualizadas quedan asociadas a este Plan."),
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
     # 1. Validaciones Core (ERP & Planta)
     verificar_permiso_carga_y_linea(db, context, linea_id)
+
+    plan_uuid: Optional[uuid.UUID] = None
+    siguiente_secuencia = 1
+    if plan_id:
+        try:
+            plan_uuid = uuid.UUID(plan_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="plan_id no es un UUID válido.")
+        plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_uuid, PlanProduccion.tenant_id == context.tenant_id)).first()
+        if not plan:
+            raise HTTPException(status_code=400, detail="plan_id no existe o pertenece a otra organización.")
+        if str(plan.linea_id) != str(linea_id):
+            raise HTTPException(status_code=400, detail="plan_id pertenece a una línea distinta de linea_id.")
+        maxima = db.exec(
+            select(OrdenProduccion.secuencia)
+            .where(OrdenProduccion.tenant_id == context.tenant_id, OrdenProduccion.plan_id == plan_uuid)
+            .order_by(OrdenProduccion.secuencia.desc())
+        ).first()
+        siguiente_secuencia = (maxima or 0) + 1
 
     # 2. Leer archivo (acotado en tamaño, Fase K)
     contenido = await _leer_archivo_acotado(file)
@@ -169,14 +194,23 @@ async def subir_plan(
                 orden_db.plan_fecha = fecha
                 orden_db.origen = origen_auditoria
                 orden_db.linea_id = linea_id  # Actualizamos la línea
+                if plan_uuid:
+                    # Reasigna al plan elegido; conserva la secuencia que ya
+                    # tenía (re-subir el mismo id_orden no debería reordenar
+                    # el plan, sólo actualizar sus datos).
+                    orden_db.plan_id = plan_uuid
                 actualizadas += 1
             else:
                 nueva_orden = OrdenProduccion(
                     tenant_id=context.tenant_id, id_orden=orden_id, sku_fk=sku,
                     cantidad_esperada=cant, plan_fecha=fecha, linea_id=linea_id,
-                    origen=origen_auditoria
+                    origen=origen_auditoria,
+                    plan_id=plan_uuid,
+                    secuencia=siguiente_secuencia if plan_uuid else 0,
                 )
                 db.add(nueva_orden)
+                if plan_uuid:
+                    siguiente_secuencia += 1
                 creadas += 1
 
         except Exception as e:
