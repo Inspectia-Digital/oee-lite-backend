@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
+from sqlalchemy import func
 import uuid
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -340,9 +341,26 @@ class PlanAvanzarResponse(BaseModel):
     orden_activa_sku_fk: Optional[str] = None
 
 
+class AvanzarOrdenRequest(BaseModel):
+    """Fase AX (auditoría de frontend, FE-P0-06): body opcional -- avanzar
+    una orden completa/sobreproducida (o "iniciar plan", sin orden previa
+    que cerrar) sigue sin pedir nada. Cerrar la orden activa con menos
+    unidades reales que las esperadas sí lo exige, validado en el endpoint."""
+    motivo: Optional[str] = None
+
+    @field_validator("motivo")
+    @classmethod
+    def _limpiar_motivo(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        return v or None
+
+
 @router.post("/planes/{plan_id}/avanzar-orden/", response_model=PlanAvanzarResponse)
 def avanzar_orden(
     plan_id: uuid.UUID,
+    payload: Optional[AvanzarOrdenRequest] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
@@ -391,6 +409,8 @@ def avanzar_orden(
     if plan.estado in (EstadoPlan.BORRADOR, EstadoPlan.PROGRAMADO):
         raise HTTPException(status_code=409, detail=f"El plan todavía no está en progreso (estado: {plan.estado.value}) -- activalo primero.")
 
+    motivo = payload.motivo if payload else None
+
     orden_cerrada_id = None
     secuencia_actual = -1  # -1 = "todavía no arrancó" -> avanzar activa la primera de la secuencia
     if plan.orden_activa_fk:
@@ -401,7 +421,31 @@ def avanzar_orden(
             )
         ).first()
         if orden_actual:
+            # Fase AX (FE-P0-06): "producido" siempre sumado de
+            # LiteEventoProduccion -- misma regla de oro que
+            # _armar_plan_con_ordenes (configuracion.py); OrdenProduccion.
+            # cantidad_producida nunca se actualiza en ningún lado, leerla
+            # acá daría siempre 0 y exigiría motivo hasta en una orden
+            # completa. El backend valida esto server-side (no confía sólo
+            # en que el front no deje enviar el botón sin texto) porque,
+            # a diferencia de "cancelar un plan en_progreso" (Fase AV, el
+            # backend sólo mira un estado), acá SÍ hace falta esta cuenta
+            # para saber si hace falta motivo.
+            producido = db.exec(
+                select(func.sum(LiteEventoProduccion.unidades_procesadas)).where(
+                    LiteEventoProduccion.tenant_id == context.tenant_id,
+                    LiteEventoProduccion.orden_fk == orden_actual.id_orden,
+                )
+            ).first()
+            producido = int(producido or 0)
+            incompleta = producido < orden_actual.cantidad_esperada
+            if incompleta and not motivo:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Motivo obligatorio: la orden se cierra con {producido} de {orden_actual.cantidad_esperada} unidades esperadas.",
+                )
             orden_actual.estado = EstadoOrden.CERRADA
+            orden_actual.motivo_incompleta = motivo if incompleta else None
             db.add(orden_actual)
             orden_cerrada_id = orden_actual.id_orden
             secuencia_actual = orden_actual.secuencia
