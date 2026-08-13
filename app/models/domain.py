@@ -401,6 +401,12 @@ class PlanProduccion(TenantBase, table=True):
     # nuevas hacia Orden usan la identidad interna, ver nota en esa clase.
     orden_activa_fk: Optional[uuid.UUID] = Field(default=None, foreign_key="ordenes_produccion.id")
     activo: bool = Field(default=True)
+    # Fase AV (auditoría de frontend, FE-P0-04): sólo se completa cuando
+    # desactivar_plan cancela un plan EN_PROGRESO (obligatorio ahí,
+    # validado en el endpoint) -- archivar un BORRADOR/PROGRAMADO que
+    # nunca arrancó no lo exige. Null para todo plan que se cerró solo
+    # (CERRADO vía avanzar_orden) o que nunca se desactivó.
+    motivo_cancelacion: Optional[str] = Field(default=None)
 
 
 class OrdenProduccion(TenantBase, table=True):

@@ -1181,6 +1181,8 @@ class PlanConOrdenes(BaseModel):
     # botón "Cerrar plan"; con el campo ausente siempre daba undefined y
     # el botón no aparecía nunca, ni para un plan abierto.
     activo: bool
+    # Fase AV: sólo se completa si el plan se canceló EN_PROGRESO.
+    motivo_cancelacion: Optional[str] = None
     ordenes: List[OrdenEnPlan]
 
 
@@ -1207,6 +1209,7 @@ def _armar_plan_con_ordenes(db: Session, tenant_id: str, plan: PlanProduccion) -
         id=plan.id, linea_id=plan.linea_id, nombre=plan.nombre,
         fecha_inicio=plan.fecha_inicio, estado=plan.estado,
         orden_activa_fk=plan.orden_activa_fk, activo=plan.activo,
+        motivo_cancelacion=plan.motivo_cancelacion,
         ordenes=[
             OrdenEnPlan(
                 id_orden=o.id_orden, id=o.id, sku_fk=o.sku_fk,
@@ -1372,9 +1375,26 @@ def activar_plan(
     return _armar_plan_con_ordenes(db, context.tenant_id, plan)
 
 
+class DesactivarPlanRequest(BaseModel):
+    """Fase AV (auditoría de frontend, FE-P0-04): body opcional -- el
+    front sigue pudiendo mandar DELETE sin body para archivar un
+    BORRADOR/PROGRAMADO (nunca arrancó, no tiene nada que explicar).
+    Cancelar un plan EN_PROGRESO sí lo exige, validado en el endpoint."""
+    motivo: Optional[str] = None
+
+    @field_validator("motivo")
+    @classmethod
+    def _limpiar_motivo(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        return v or None
+
+
 @router.delete("/planes/{plan_id}")
 def desactivar_plan(
     plan_id: uuid.UUID,
+    payload: Optional[DesactivarPlanRequest] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
@@ -1393,10 +1413,21 @@ def desactivar_plan(
     activa (si tenía una) -- deja de haber ambigüedad entre "el usuario
     cree que esto se detuvo" y "la ingesta lo sigue usando". Un plan ya
     CERRADO (terminó su secuencia normalmente) no se reescribe a
-    CANCELADO -- sólo se le aplica la baja lógica, igual que siempre."""
+    CANCELADO -- sólo se le aplica la baja lógica, igual que siempre.
+
+    Fase AV (FE-P0-04): cancelar un plan EN_PROGRESO exige motivo -- a
+    diferencia de "incompleta" en avanzar_orden (Fase AX), acá el
+    backend SÍ puede derivar solo la condición ("¿estaba en_progreso?"),
+    así que se valida server-side en vez de confiar sólo en que el front
+    no deje enviar el botón sin texto (mismo criterio del resto del
+    batch: no confiar una regla de negocio sólo al cliente)."""
     plan = db.exec(select(PlanProduccion).where(PlanProduccion.id == plan_id, PlanProduccion.tenant_id == context.tenant_id)).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
+
+    motivo = payload.motivo if payload else None
+    if plan.estado == EstadoPlan.EN_PROGRESO and not motivo:
+        raise HTTPException(status_code=400, detail="Motivo obligatorio para cancelar un plan en curso.")
 
     if plan.estado in (EstadoPlan.EN_PROGRESO, EstadoPlan.PROGRAMADO, EstadoPlan.BORRADOR):
         if plan.orden_activa_fk:
@@ -1411,6 +1442,7 @@ def desactivar_plan(
                 db.add(orden_activa)
             plan.orden_activa_fk = None
         plan.estado = EstadoPlan.CANCELADO
+        plan.motivo_cancelacion = motivo
 
     plan.activo = False
     db.add(plan)
