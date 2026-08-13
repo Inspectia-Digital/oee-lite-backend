@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlmodel import Session, select
-from sqlalchemy import cast, String  # <-- IMPORTANTE: Para el casteo de UUID a String
+from sqlalchemy import cast, String, false  # <-- IMPORTANTE: Para el casteo de UUID a String
 from datetime import datetime, time, date, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
@@ -496,6 +496,39 @@ def _calcular_metricas_oee(
         )
     )
     if linea_id: q_paradas = q_paradas.where(Estacion.linea_id == linea_id)
+    # QA-03 (auditoría QA): antes las paradas nunca se filtraban por
+    # orden/SKU acá, aunque `eventos` sí -- calcular OEE de un SKU (o de
+    # una orden puntual) contaminaba disponibilidad/minutos perdidos con
+    # paradas de OTROS SKU/órdenes de la misma línea y período (si SKU-A
+    # tuvo 10' de parada y SKU-B 30', el cálculo de cada uno podía
+    # incluir los 40'). orden_fk acá es un id_orden (string, ver el
+    # filtro de `eventos` arriba), pero ParadaDetectada.orden_fk es el
+    # UUID interno de la orden (Fase AF) -- hay que resolver antes de
+    # comparar.
+    if orden_fk:
+        orden_uuid = db.exec(
+            select(OrdenProduccion.id).where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.id_orden == orden_fk,
+            )
+        ).first()
+        # orden_fk no resolvió a una orden real -- no debería matchear
+        # ninguna parada (nunca "todas las que no tienen orden", que es
+        # lo que == None generaría sin este guard).
+        q_paradas = q_paradas.where(ParadaDetectada.orden_fk == orden_uuid) if orden_uuid else q_paradas.where(false())
+    elif sku_fk:
+        # Decisión del usuario (auditoría QA): paradas sin orden
+        # asociada (histórico de antes de Fase AF) quedan EXCLUIDAS del
+        # desglose por SKU -- no se prorratean ni se les asigna un SKU
+        # por adivinanza. El total sin filtro (sin sku_fk) las sigue
+        # incluyendo -- sólo desaparecen de las vistas filtradas.
+        ids_uuid_del_sku = db.exec(
+            select(OrdenProduccion.id).where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.sku_fk == sku_fk,
+            )
+        ).all()
+        q_paradas = q_paradas.where(ParadaDetectada.orden_fk.in_(ids_uuid_del_sku))
     paradas_db = db.exec(q_paradas).all()
 
     t_paradas_no_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if not m or m.tipo_parada == TipoParada.NO_PLANIFICADA)

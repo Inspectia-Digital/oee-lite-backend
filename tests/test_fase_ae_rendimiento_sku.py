@@ -158,3 +158,43 @@ def test_rendimiento_sku_sin_orden_activa_no_aparece(client, db, tenant_a, geren
     )
     assert r.status_code == 200
     assert r.json() == []
+
+
+def test_rendimiento_sku_no_contamina_disponibilidad_con_paradas_de_otro_sku(client, db, tenant_a, gerente_a):
+    """QA-03 (auditoría QA): antes _calcular_metricas_oee filtraba
+    `eventos` por sku_fk pero nunca `paradas` -- si SKU-A generaba una
+    parada real (ALERTA), esa parada contaminaba también la
+    disponibilidad de SKU-B, que no tuvo ninguna. Ahora cada SKU sólo ve
+    las paradas de SUS PROPIAS órdenes."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    credencial = _emitir_credencial(client, gerente_a, estacion.id)
+    ahora = datetime.now(timezone.utc) - timedelta(hours=3)
+
+    # SKU-A: gap de 1200s entre eventos (> tiempo_alerta_seg=1000) --
+    # genera una ParadaDetectada real, atada a la orden de A.
+    orden_a = _crear_orden_en_progreso(db, tenant_a, linea.id, f"SKU-AJ-A-{uuid.uuid4().hex[:6]}")
+    _postear_evento(client, credencial, estacion.id, ahora)
+    _postear_evento(client, credencial, estacion.id, ahora + timedelta(seconds=1200))
+    _cerrar(db, orden_a)
+
+    # SKU-B: eventos seguidos, sin ninguna parada.
+    codigo_b = f"SKU-AJ-B-{uuid.uuid4().hex[:6]}"
+    _crear_orden_en_progreso(db, tenant_a, linea.id, codigo_b)
+    _postear_evento(client, credencial, estacion.id, ahora + timedelta(minutes=30))
+    _postear_evento(client, credencial, estacion.id, ahora + timedelta(minutes=30, seconds=5))
+
+    autenticar_como(gerente_a.id)
+    hoy = datetime.now(timezone.utc).date()
+    r = client.get(
+        "/analytics/rendimiento-sku/",
+        params={"fecha_desde": (hoy - timedelta(days=1)).isoformat(), "fecha_hasta": hoy.isoformat(), "linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+    por_sku = {f["sku_fk"]: f for f in r.json()}
+    assert por_sku[orden_a.sku_fk]["disponibilidad_pct"] < 100.0  # la parada es suya
+    assert por_sku[orden_a.sku_fk]["minutos_perdidos"] > 0
+    # El bug real: sin el fix, esto también daba < 100 -- SKU-B heredaba
+    # la parada de SKU-A porque `q_paradas` no filtraba por orden/SKU.
+    assert por_sku[codigo_b]["disponibilidad_pct"] == 100.0
+    assert por_sku[codigo_b]["minutos_perdidos"] == 0
