@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlmodel import select
 
 from app.models.domain import (
-    Estacion, EstadoOrden, Linea, MaestroSKU, Planta, RolUsuario, Tenant,
+    Estacion, EstadoOrden, Linea, LiteEventoProduccion, MaestroSKU, Planta, RolUsuario, Tenant,
 )
 from tests.conftest import autenticar_como, crear_usuario
 
@@ -336,7 +336,7 @@ def test_avanzar_orden_primera_vez_activa_la_primera_de_la_secuencia(client, db,
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
 
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 200
     body = r.json()
     assert body["orden_cerrada_id_orden"] is None
@@ -350,8 +350,8 @@ def test_avanzar_orden_segunda_vez_cierra_la_primera_y_activa_la_segunda(client,
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 200
     body = r.json()
     assert body["orden_cerrada_id_orden"] == o1["id_orden"]
@@ -368,14 +368,88 @@ def test_avanzar_orden_sin_mas_ordenes_cierra_el_plan_solo(client, db, tenant_a,
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # cierra o1, activa o2
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # cierra o2, no queda nada
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # cierra o1, activa o2
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # cierra o2, no queda nada
     assert r.status_code == 200
     body = r.json()
     assert body["orden_cerrada_id_orden"] == o2["id_orden"]
     assert body["orden_activa_id_orden"] is None
     assert body["estado"] == "cerrado"
+
+
+# ---------- avanzar_orden -- motivo obligatorio si incompleta (Fase AX, FE-P0-06) ----------
+
+def test_avanzar_orden_incompleta_sin_motivo_devuelve_400(client, db, tenant_a, gerente_a):
+    """o1 espera 100, sólo se produjeron 40 (insertadas directo como
+    LiteEventoProduccion -- misma cuenta que usa el endpoint, "regla de
+    oro" nunca cantidad_producida). Cerrarla sin motivo debe rechazarse,
+    y NO debe quedar a medio cerrar (orden sigue en_progreso, el plan
+    sigue apuntando a ella)."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
+
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(estacion.id), orden_fk=o1["id_orden"], unidades_procesadas=40))
+    db.commit()
+
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={}, headers=headers)
+    assert r.status_code == 400
+
+    r_sin_body = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    assert r_sin_body.status_code == 400
+
+    o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
+    assert o1_db["estado"] == "en_progreso"
+    plan_db = client.get(f"/config/planes/{plan['id']}", headers=headers).json()
+    assert plan_db["orden_activa_fk"] == o1["id"]
+
+
+def test_avanzar_orden_incompleta_con_motivo_la_cierra_y_persiste_el_motivo(client, db, tenant_a, gerente_a):
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
+
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(estacion.id), orden_fk=o1["id_orden"], unidades_procesadas=40))
+    db.commit()
+
+    r = client.post(
+        f"/supervisor/planes/{plan['id']}/avanzar-orden/",
+        json={"motivo": "Falla de máquina, se corta acá"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["orden_cerrada_id_orden"] == o1["id_orden"]
+
+    o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
+    assert o1_db["estado"] == "cerrada"
+    assert o1_db["motivo_incompleta"] == "Falla de máquina, se corta acá"
+
+
+def test_avanzar_orden_completa_no_exige_motivo_y_no_lo_persiste(client, db, tenant_a, gerente_a):
+    """o1 espera 100 -- si se produjeron exactamente 100 (o más), avanzar
+    sin motivo sigue funcionando como siempre, y motivo_incompleta queda
+    en None (nada que explicar)."""
+    planta, linea, estacion = _preparar_escenario(db, tenant_a)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    autenticar_como(gerente_a.id)
+    plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
+
+    db.add(LiteEventoProduccion(tenant_id=tenant_a, id_estacion=str(estacion.id), orden_fk=o1["id_orden"], unidades_procesadas=100))
+    db.commit()
+
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["orden_cerrada_id_orden"] == o1["id_orden"]
+
+    o1_db = client.get(f"/config/ordenes/{o1['id_orden']}", headers=headers).json()
+    assert o1_db["estado"] == "cerrada"
+    assert o1_db["motivo_incompleta"] is None
 
 
 def test_avanzar_orden_plan_ya_cerrado_devuelve_409(client, db, tenant_a, gerente_a):
@@ -384,9 +458,9 @@ def test_avanzar_orden_plan_ya_cerrado_devuelve_409(client, db, tenant_a, gerent
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
     for _ in range(3):
-        client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+        client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
 
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 409
 
 
@@ -405,7 +479,7 @@ def test_avanzar_orden_plan_de_otro_tenant_devuelve_404(client, db, tenant_a, te
     # de la presencia del header) -- se manda la propia planta de
     # tenant_a; el aislamiento de tenant lo da el filtro tenant_id de la
     # query, no de qué planta se mande acá.
-    r = client.post(f"/supervisor/planes/{plan_b.id}/avanzar-orden/", headers={"X-Sub-Tenant-Id": str(planta_a.id)})
+    r = client.post(f"/supervisor/planes/{plan_b.id}/avanzar-orden/", json={"motivo": "Prueba"}, headers={"X-Sub-Tenant-Id": str(planta_a.id)})
     assert r.status_code == 404
 
 
@@ -421,7 +495,7 @@ def test_avanzar_orden_operario_no_puede(client, db, tenant_a, gerente_a):
     db.commit()
 
     autenticar_como(operario_usuario.id)
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 403
 
 
@@ -437,7 +511,7 @@ def test_avanzar_orden_supervisor_puede(client, db, tenant_a, gerente_a):
     db.commit()
 
     autenticar_como(supervisor_usuario.id)
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 200
 
 
@@ -463,7 +537,7 @@ def test_scans_usa_la_orden_activa_del_plan_no_el_heuristico_en_progreso(client,
     db.add(orden_ajena)
     db.commit()
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1 (sku1, ideal=10s)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1 (sku1, ideal=10s)
 
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
     r = client.post(
@@ -489,7 +563,7 @@ def test_scans_sigue_la_orden_activa_a_traves_de_un_avance(client, db, tenant_a,
     plan, o1, o2, sku1, sku2 = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
     r1 = client.post(
         "/api/lite/scans",
         json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id)},
@@ -497,7 +571,7 @@ def test_scans_sigue_la_orden_activa_a_traves_de_un_avance(client, db, tenant_a,
     )
     assert r1.status_code == 201
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # cierra o1, activa o2
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # cierra o1, activa o2
     r2 = client.post(
         "/api/lite/scans",
         json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id)},
@@ -548,7 +622,7 @@ def test_linea_en_vivo_refleja_la_orden_activa_del_plan(client, db, tenant_a, ge
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan, o1, o2, sku1, sku2 = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
 
     r = client.get("/analytics/linea-en-vivo/", params={"linea_id": str(linea.id)}, headers=headers)
     assert r.status_code == 200
@@ -646,7 +720,7 @@ def test_desactivar_plan_en_progreso_lo_cancela_y_cierra_orden_activa(client, db
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
 
     r = client.request("DELETE", f"/config/planes/{plan['id']}", json={"motivo": "Falla de máquina, se aborta el lote"}, headers=headers)
     assert r.status_code == 200
@@ -720,9 +794,9 @@ def test_desactivar_plan_cerrado_no_cambia_estado(client, db, tenant_a, gerente_
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # agota la secuencia
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # agota la secuencia
     assert r.json()["estado"] == "cerrado"
 
     # Un plan ya CERRADO no exige motivo -- no está cancelando nada en curso.
@@ -749,7 +823,7 @@ def test_avanzar_orden_bloqueado_si_plan_todavia_no_esta_en_progreso(client, db,
     ).json()
     assert p2["estado"] == "programado"
 
-    r = client.post(f"/supervisor/planes/{p2['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{p2['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 409
 
 
@@ -760,7 +834,7 @@ def test_avanzar_orden_bloqueado_si_plan_cancelado(client, db, tenant_a, gerente
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
     client.request("DELETE", f"/config/planes/{plan['id']}", json={"motivo": "Prueba"}, headers=headers)  # cancela
 
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 409
 
 
@@ -773,7 +847,7 @@ def test_resolver_orden_activa_ignora_plan_programado(client, db, tenant_a, gere
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan1, o1, o2, sku1, sku2 = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.post(f"/supervisor/planes/{plan1['id']}/avanzar-orden/", headers=headers)  # activa o1 en plan1 (en_progreso)
+    client.post(f"/supervisor/planes/{plan1['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1 en plan1 (en_progreso)
 
     plan2 = client.post(
         "/config/planes/",
@@ -840,9 +914,9 @@ def test_crear_orden_en_plan_cerrado_devuelve_409(client, db, tenant_a, gerente_
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     autenticar_como(gerente_a.id)
     plan, o1, o2, *_ = _crear_plan_con_dos_ordenes(client, db, tenant_a, planta, linea, headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # agota la secuencia, cierra el plan
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # agota la secuencia, cierra el plan
 
     r = client.post(
         "/config/ordenes/",
@@ -919,8 +993,8 @@ def test_avanzar_orden_salta_la_siguiente_si_esta_inactiva(client, db, tenant_a,
     r = client.delete(f"/config/ordenes/{o2['id_orden']}", headers=headers)
     assert r.status_code == 200
 
-    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # activa o1
-    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", headers=headers)  # o2 está inactiva -> se salta
+    client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # activa o1
+    r = client.post(f"/supervisor/planes/{plan['id']}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)  # o2 está inactiva -> se salta
     assert r.status_code == 200
     body = r.json()
     assert body["orden_cerrada_id_orden"] == o1["id_orden"]

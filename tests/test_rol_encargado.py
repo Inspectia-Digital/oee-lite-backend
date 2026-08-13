@@ -242,7 +242,7 @@ def test_encargado_no_puede_avanzar_plan(client, db, tenant_a):
     assert plan.status_code == 201
     plan_id = plan.json()["id"]
 
-    r = client.post(f"/supervisor/planes/{plan_id}/avanzar-orden/", headers=headers)
+    r = client.post(f"/supervisor/planes/{plan_id}/avanzar-orden/", json={"motivo": "Prueba"}, headers=headers)
     assert r.status_code == 403
 
 

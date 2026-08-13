@@ -434,6 +434,12 @@ class OrdenProduccion(TenantBase, table=True):
     estado: EstadoOrden = Field(default=EstadoOrden.ABIERTA)
     origen: str = Field(default="UI")
     activo: bool = Field(default=True)
+    # Fase AX (auditoría de frontend, FE-P0-06): avanzar_orden (operacion.py)
+    # exige este motivo cuando cierra la orden con menos unidades reales
+    # (sumadas de LiteEventoProduccion, nunca cantidad_producida -- ver
+    # comentario de esa columna) que cantidad_esperada. Null si se cerró
+    # completa/sobreproducida.
+    motivo_incompleta: Optional[str] = Field(default=None)
 
 class MotivoParada(TenantBase, table=True):
     __tablename__ = "dim_motivos_parada"
