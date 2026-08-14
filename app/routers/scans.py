@@ -15,6 +15,7 @@ import uuid
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
+from app.core.rate_limit import verificar_limite
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
@@ -449,6 +450,15 @@ def login_operario_terminal(
         )
     ).first()
     if not operario:
+        # Fase BY: sólo se cuenta acá, en el legajo que NO matcheó -- un
+        # turno con muchos operarios badgeando en simultáneo (éxito) no
+        # debe frenarse; barrer legajos por fuerza bruta sí. El
+        # dispositivo ya está autenticado M2M (autenticar_dispositivo,
+        # que además ya limita intentos de credencial inválida por IP).
+        verificar_limite(
+            db, f"login_operario:{dispositivo.tenant_id}:{dispositivo.estacion_id}",
+            max_intentos=20, ventana_segundos=60,
+        )
         raise HTTPException(status_code=404, detail="Legajo no encontrado o inactivo.")
 
     turno = db.exec(
