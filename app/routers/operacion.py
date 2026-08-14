@@ -695,6 +695,33 @@ def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
     return (not dias) or (dia_iso in dias)
 
 
+def _dias_semana_a_set(dias_semana: str) -> set:
+    """Vacío/corrupto = "todos los días" (mismo criterio que _dia_en_dias_semana)."""
+    try:
+        dias = {int(d) for d in dias_semana.split(",") if d.strip()}
+    except (ValueError, AttributeError):
+        return set(range(1, 8))
+    return dias if dias else set(range(1, 8))
+
+
+def _reglas_se_solapan(
+    dias_a: str, desde_a: date, hasta_a: Optional[date],
+    dias_b: str, desde_b: date, hasta_b: Optional[date],
+) -> bool:
+    """QA-16 (auditoría de reglas de negocio, Fase BL): dos reglas de
+    asignación de supervisores conflictúan si comparten AL MENOS un día
+    de la semana Y sus rangos de vigencia se superponen -- coexistir para
+    la misma (línea, turno) es intencional (ver comentario de sección más
+    arriba: ej. una regla para días hábiles y otra para el fin de
+    semana), sólo es inválido si de verdad compiten por el mismo
+    día/fecha."""
+    if not (_dias_semana_a_set(dias_a) & _dias_semana_a_set(dias_b)):
+        return False
+    fin_a = hasta_a or date.max
+    fin_b = hasta_b or date.max
+    return desde_a <= fin_b and desde_b <= fin_a
+
+
 class AsignacionSupervisorCreate(BaseModel):
     linea_id: uuid.UUID
     turno_id: uuid.UUID
@@ -769,6 +796,32 @@ def asignar_supervisor(
     ).first()
     if not supervisor:
         raise HTTPException(status_code=404, detail="Supervisor no encontrado o inactivo.")
+
+    # Auditoría (reglas de negocio, Fase BL): antes el POST siempre creaba
+    # sin comparar contra las reglas existentes -- podían coexistir dos
+    # reglas para la misma (línea, turno) compitiendo por el mismo
+    # día/fecha, sin que nada las rechazara (el front tampoco avisaba
+    # antes de guardar). Coexistir para la misma línea+turno es
+    # intencional cuando NO se superponen (ver comentario de sección),
+    # así que el chequeo es específicamente por día+vigencia, no por
+    # línea+turno solos.
+    existentes = db.exec(
+        select(AsignacionSupervisor).where(
+            AsignacionSupervisor.tenant_id == context.tenant_id,
+            AsignacionSupervisor.linea_id == payload.linea_id,
+            AsignacionSupervisor.turno_id == payload.turno_id,
+        )
+    ).all()
+    dias_nueva_csv = ",".join(str(d) for d in payload.dias_semana)
+    for existente in existentes:
+        if _reglas_se_solapan(
+            dias_nueva_csv, payload.vigencia_desde, payload.vigencia_hasta,
+            existente.dias_semana, existente.vigencia_desde, existente.vigencia_hasta,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Ya existe una regla de supervisión para esta línea y turno que se superpone en días y vigencia. Borrala primero o ajustá los días/fechas para que no se crucen.",
+            )
 
     nueva = AsignacionSupervisor(
         tenant_id=context.tenant_id,

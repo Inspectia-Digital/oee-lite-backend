@@ -197,10 +197,20 @@ def test_asignar_supervisor_y_listar(client, db, tenant_a):
     assert r.json()[0]["supervisor_id"] == str(supervisor.id)
 
 
-def test_asignaciones_supervisor_coexisten_y_delete_las_saca(client, db, tenant_a):
+def test_asignaciones_supervisor_coexisten_si_no_se_superponen_y_delete_las_saca(client, db, tenant_a):
     """El modelo ya no es upsert-por-día (Fase Q): pueden coexistir varias
-    reglas para la misma línea+turno (ej. una vigente y otra futura que la
-    va a reemplazar). Para "reasignar" se borra la regla vieja con DELETE."""
+    reglas para la misma línea+turno mientras NO compitan por el mismo
+    día+fecha -- acá: una vigente hasta ayer y otra que arranca hoy (la
+    reemplaza hacia adelante, no se pisan). Para "reasignar" HOY mismo se
+    borra la regla vieja con DELETE.
+
+    Fase BL (auditoría de reglas de negocio): esta prueba antes creaba
+    las DOS reglas con vigencia_desde IDÉNTICA y sin vigencia_hasta --
+    una doble asignación real para todos los días futuros, no el caso de
+    "una vigente y otra futura" que el docstring decía cubrir. Corregido
+    para reflejar de verdad ese escenario (ver
+    test_asignacion_supervisor_solapada_devuelve_409 para el caso que
+    ahora sí se rechaza)."""
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
     otro_supervisor = Supervisor(tenant_id=tenant_a, legajo="SUP-H2", nombre_completo="Otro Sup")
     db.add(otro_supervisor)
@@ -210,11 +220,20 @@ def test_asignaciones_supervisor_coexisten_y_delete_las_saca(client, db, tenant_
     sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
     autenticar_como(sup_usuario.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
-    hoy = datetime.utcnow().date().isoformat()
-    base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy}
+    hoy = datetime.utcnow().date()
+    ayer = hoy - timedelta(days=1)
+    base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "dias_semana": [1, 2, 3, 4, 5]}
 
-    r1 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(supervisor.id)}, headers=headers)
-    r2 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(otro_supervisor.id)}, headers=headers)
+    r1 = client.post(
+        "/asignaciones/supervisor/",
+        json={**base, "supervisor_id": str(supervisor.id), "vigencia_desde": (ayer - timedelta(days=30)).isoformat(), "vigencia_hasta": ayer.isoformat()},
+        headers=headers,
+    )
+    r2 = client.post(
+        "/asignaciones/supervisor/",
+        json={**base, "supervisor_id": str(otro_supervisor.id), "vigencia_desde": hoy.isoformat()},
+        headers=headers,
+    )
     assert r1.status_code == 201
     assert r2.status_code == 201
 
@@ -227,6 +246,57 @@ def test_asignaciones_supervisor_coexisten_y_delete_las_saca(client, db, tenant_
     filas = db.exec(select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == tenant_a)).all()
     assert len(filas) == 1
     assert filas[0].supervisor_id == otro_supervisor.id
+
+
+def test_asignacion_supervisor_solapada_devuelve_409(client, db, tenant_a):
+    """Fase BL (auditoría de reglas de negocio): antes el POST siempre
+    creaba sin comparar contra las reglas existentes -- podían coexistir
+    dos reglas para la misma línea+turno compitiendo por el mismo
+    día+fecha (doble asignación real), sin que nada las rechazara ni el
+    front avisara antes de guardar."""
+    planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
+    otro_supervisor = Supervisor(tenant_id=tenant_a, legajo="SUP-H3", nombre_completo="Otro Sup 2")
+    db.add(otro_supervisor)
+    db.commit()
+    db.refresh(otro_supervisor)
+
+    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
+    autenticar_como(sup_usuario.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    hoy = datetime.utcnow().date().isoformat()
+    base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy}
+
+    r1 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(supervisor.id)}, headers=headers)
+    assert r1.status_code == 201
+
+    r2 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(otro_supervisor.id)}, headers=headers)
+    assert r2.status_code == 409
+
+    filas = db.exec(select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == tenant_a)).all()
+    assert len(filas) == 1  # la segunda nunca se creó
+
+
+def test_asignacion_supervisor_dias_distintos_no_conflictuan(client, db, tenant_a):
+    """Dos reglas para la MISMA línea+turno+vigencia, pero con días de la
+    semana que no se cruzan (hábiles vs. fin de semana), son válidas --
+    coexistir es intencional cuando de verdad no compiten (ver comentario
+    de sección en operacion.py)."""
+    planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
+    otro_supervisor = Supervisor(tenant_id=tenant_a, legajo="SUP-H4", nombre_completo="Fin de Semana")
+    db.add(otro_supervisor)
+    db.commit()
+    db.refresh(otro_supervisor)
+
+    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
+    autenticar_como(sup_usuario.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+    hoy = datetime.utcnow().date().isoformat()
+    base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "vigencia_desde": hoy}
+
+    r1 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(supervisor.id), "dias_semana": [1, 2, 3, 4, 5]}, headers=headers)
+    r2 = client.post("/asignaciones/supervisor/", json={**base, "supervisor_id": str(otro_supervisor.id), "dias_semana": [6, 7]}, headers=headers)
+    assert r1.status_code == 201
+    assert r2.status_code == 201
 
 
 def test_asignacion_supervisor_dia_invalido_devuelve_422(client, db, tenant_a):
@@ -274,12 +344,16 @@ def test_listar_asignaciones_supervisor_filtra_por_fecha_vigente(client, db, ten
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date()
 
-    # Regla vigente hoy (todos los días).
+    # Regla vigente hoy (todos los días) -- termina el día antes de que
+    # arranque la futura (si no, Fase BL las rechazaría por solaparse:
+    # ambas listas de días son las mismas, así que sólo la vigencia las
+    # distingue).
     client.post(
         "/asignaciones/supervisor/",
         json={
             "linea_id": str(linea.id), "turno_id": str(turno.id), "supervisor_id": str(supervisor.id),
             "dias_semana": [1, 2, 3, 4, 5, 6, 7], "vigencia_desde": hoy.isoformat(),
+            "vigencia_hasta": (hoy + timedelta(days=29)).isoformat(),
         },
         headers=headers,
     )
