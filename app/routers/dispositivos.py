@@ -17,6 +17,7 @@ from sqlmodel import Session, func, select
 
 from app.core.auth import TenantContext, obtener_contexto_tenant_humano
 from app.core.database import get_session
+from app.core.rate_limit import verificar_limite
 from app.core.rbac import requerir_gerencia_o_superadmin
 from app.models.domain import ApiKeyDispositivo, Estacion, UsuarioSaaS
 
@@ -62,8 +63,14 @@ def emitir_api_key(
     payload: ApiKeyCreate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
+    # Fase BY: ya está gateado por rol Gerencia/SuperAdmin y por el tope
+    # de negocio MAX_KEYS_ACTIVAS_POR_ESTACION -- este límite es defensa
+    # en profundidad extra (ej. un bug de frontend en loop), no la
+    # protección principal.
+    verificar_limite(db, f"api_key_create:{usuario.id}", max_intentos=10, ventana_segundos=60)
+
     estacion = db.exec(
         select(Estacion).where(Estacion.id == payload.estacion_id, Estacion.tenant_id == context.tenant_id)
     ).first()
