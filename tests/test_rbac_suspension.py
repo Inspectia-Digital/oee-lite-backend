@@ -49,6 +49,36 @@ def test_suspension_total_bloquea_humano_y_me_sigue_vivo(client, db, tenant_a, g
     assert client.get("/accesos/usuarios/me").status_code == 200
 
 
+def test_ui_suspendida_y_suspension_total_tienen_mensajes_distintos(client, db, tenant_a, gerente_a):
+    """Fase BN (auditoría de reglas de negocio): antes el `detail` del 403
+    era IDÉNTICO para los dos estados -- el frontend no podía
+    diferenciarlos ni queriendo (el interceptor sólo hacía match de
+    substring sobre ese texto). Ahora cada uno tiene su propio mensaje, y
+    el de UI_SUSPENDIDA aclara que la ingesta de planta sigue activa
+    (diferencia real: SUSPENSION_TOTAL también corta Edge/M2M, ver
+    verificar_no_suspension_total; UI_SUSPENDIDA no)."""
+    t = db.get(Tenant, tenant_a)
+    t.estado = "ui_suspendida"
+    db.add(t)
+    db.commit()
+    autenticar_como(gerente_a.id)
+    r_ui = client.get("/config/lineas/")
+    assert r_ui.status_code == 403
+    detail_ui = r_ui.json()["detail"].lower()
+    assert "suspensión total" not in detail_ui
+    assert "interfaz" in detail_ui
+
+    t.estado = "suspension_total"
+    db.add(t)
+    db.commit()
+    r_total = client.get("/config/lineas/")
+    assert r_total.status_code == 403
+    detail_total = r_total.json()["detail"].lower()
+    assert "suspensión total" in detail_total
+
+    assert detail_ui != detail_total
+
+
 def test_solo_superadmin_puede_cambiar_estado_tenant(client, db, tenant_a, gerente_a, superadmin):
     autenticar_como(gerente_a.id)
     r = client.patch(f"/accesos/superadmin/tenants/{tenant_a}/estado", json={"estado": "ui_suspendida"})

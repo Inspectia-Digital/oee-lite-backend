@@ -284,13 +284,27 @@ def verificar_no_suspension_total(tenant: Optional[Tenant]) -> None:
 def _verificar_acceso_humano_habilitado(tenant: Optional[Tenant]) -> None:
     """Corta endpoints humanos si el tenant está UI_SUSPENDIDA, en
     SUSPENSION_TOTAL, o si no existe (fail-closed, ver nota en
-    verificar_no_suspension_total)."""
+    verificar_no_suspension_total).
+
+    Auditoría (reglas de negocio, Fase BN): antes mandaba el MISMO
+    `detail` para los dos estados -- el frontend no podía distinguirlos
+    ni queriendo (el interceptor de Axios sólo hace match de substring
+    sobre este texto, no lee `TenantEstado`). La diferencia real entre
+    los dos SÍ importa: SUSPENSION_TOTAL también corta Edge/M2M (ver
+    verificar_no_suspension_total, usado en obtener_contexto_tenant_edge/
+    obtener_tenant_aislado_edge), UI_SUSPENDIDA no -- los sensores/PLC
+    siguen mandando datos aunque nadie pueda entrar a la interfaz."""
     if tenant is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant no encontrado.")
-    if tenant.estado in (EstadoTenant.UI_SUSPENDIDA, EstadoTenant.SUSPENSION_TOTAL):
+    if tenant.estado == EstadoTenant.SUSPENSION_TOTAL:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="El acceso humano de esta empresa está suspendido.",
+            detail="La empresa se encuentra en suspensión total. Contactá al administrador para reactivarla.",
+        )
+    if tenant.estado == EstadoTenant.UI_SUSPENDIDA:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El acceso a la interfaz de esta empresa está suspendido -- la ingesta de datos de planta sigue activa. Contactá al administrador para reactivar el acceso.",
         )
 
 
