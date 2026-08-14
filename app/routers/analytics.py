@@ -61,6 +61,12 @@ class ReporteOperarioSpringwall(BaseModel):
 
 class ParetoParadas(BaseModel):
     motivo: str
+    # Fase CK (drill-down pérdida→evento→estación→responsable): permite
+    # que el front pida el detalle de ESTE motivo exacto (vía
+    # /supervisor/paradas?motivo_fk=...) en vez de re-matchear por
+    # nombre, que no es una clave estable. None sólo para el grupo
+    # "Sin Clasificar (Pendiente)".
+    motivo_fk: Optional[uuid.UUID] = None
     tipo: str
     frecuencia: int
     minutos_totales: float
@@ -804,16 +810,24 @@ def obtener_pareto_paradas(
         for parada, motivo in paradas:
             nombre_motivo = motivo.nombre if motivo else "Sin Clasificar (Pendiente)"
             tipo_motivo = str(motivo.tipo_parada).split(".")[-1].upper() if motivo else "DESCONOCIDO"
-            
+
             if nombre_motivo not in agrupado:
-                agrupado[nombre_motivo] = {"tipo": tipo_motivo, "frecuencia": 0, "segundos": 0}
-                
+                # Fase CK: motivo_fk viaja junto con el agregado -- lo
+                # necesita el drill-down del front para pedir el detalle
+                # de ESTE motivo exacto (mismo id en todas las paradas del
+                # grupo, agrupamos por nombre pero el motivo real es uno
+                # solo salvo para "Sin Clasificar", donde queda None).
+                agrupado[nombre_motivo] = {
+                    "motivo_fk": motivo.id if motivo else None,
+                    "tipo": tipo_motivo, "frecuencia": 0, "segundos": 0,
+                }
+
             agrupado[nombre_motivo]["frecuencia"] += 1
             agrupado[nombre_motivo]["segundos"] += parada.duracion_segundos or 0
 
         reporte = [
             ParetoParadas(
-                motivo=k, tipo=v["tipo"], frecuencia=v["frecuencia"],
+                motivo=k, motivo_fk=v["motivo_fk"], tipo=v["tipo"], frecuencia=v["frecuencia"],
                 minutos_totales=round(v["segundos"] / 60, 1)
             )
             for k, v in agrupado.items()

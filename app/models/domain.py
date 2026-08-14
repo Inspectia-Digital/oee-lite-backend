@@ -597,6 +597,13 @@ class ParadaDetectada(TenantBase, table=True):
     exclusion_resuelta_at: Optional[datetime] = Field(default=None)
     exclusion_resolucion_nota: Optional[str] = Field(default=None)
 
+    # Fase CK (diferenciadores P2, batch 3): quién clasificó la parada --
+    # hasta acá el historial mostraba el motivo pero no el responsable de
+    # la decisión. NULL para toda parada clasificada antes de esta fase
+    # (no se backfillea con una suposición). Mismo criterio de FK que
+    # exclusion_propuesta_por_id/exclusion_resuelta_por_id.
+    clasificado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""
     __tablename__ = "eventos_plc_ciclos"
