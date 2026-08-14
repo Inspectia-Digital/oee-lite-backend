@@ -66,7 +66,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "Authorization", "X-Sub-Tenant-Id"],
-    expose_headers=["X-Sub-Tenant-Id", "X-Request-Id"]
+    # Fase CA: X-Error-Code (app/core/errors.py) es CORS por naturaleza --
+    # el gateway/terminal de Green Mills corre en otro origen que el
+    # backend. Sin listarlo acá, el browser lo recibe pero JS no puede
+    # leerlo (regla de CORS: headers de respuesta no listados en
+    # Access-Control-Expose-Headers son invisibles para fetch/XHR aunque
+    # viajen igual por la red) -- el frontend habría quedado leyendo
+    # `undefined` en TODOS los casos sin este agregado.
+    expose_headers=["X-Sub-Tenant-Id", "X-Request-Id", "X-Error-Code"]
 )
 
 # Observabilidad mínima (Fase K, auditoría QA #17): request-id correlacionable

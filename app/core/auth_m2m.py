@@ -16,12 +16,13 @@ from datetime import datetime
 from typing import Optional
 
 import bcrypt
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Depends, Header, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from app.core.auth import verificar_no_suspension_total
 from app.core.database import get_session
+from app.core.errors import ErrorCode, error_terminal
 from app.core.rate_limit import clave_por_ip, verificar_limite
 from app.models.domain import ApiKeyDispositivo, Tenant
 
@@ -48,32 +49,34 @@ def autenticar_dispositivo(
     # legítimo reintentando en operación normal (posiblemente a alta
     # frecuencia, un scan por pieza), no un ataque; contar eso habría
     # rate-limiteado el escaneo normal de una línea activa.
-    def _rechazar(mensaje: str):
+    # Fase CA: cada rechazo lleva además un ErrorCode estructurado (header
+    # X-Error-Code, ver app/core/errors.py) -- `detail` no cambia.
+    def _rechazar(mensaje: str, code: ErrorCode):
         verificar_limite(db, clave_por_ip(request, "m2m_auth"), max_intentos=30, ventana_segundos=60)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=mensaje)
+        raise error_terminal(status.HTTP_401_UNAUTHORIZED, code, mensaje)
 
     if not x_device_key:
-        _rechazar("Falta la credencial del dispositivo (X-Device-Key).")
+        _rechazar("Falta la credencial del dispositivo (X-Device-Key).", ErrorCode.CREDENCIAL_FALTANTE)
 
     if "." not in x_device_key:
-        _rechazar("Formato de credencial inválido.")
+        _rechazar("Formato de credencial inválido.", ErrorCode.CREDENCIAL_FORMATO_INVALIDO)
 
     key_id, _, secret = x_device_key.partition(".")
     if not key_id or not secret:
-        _rechazar("Formato de credencial inválido.")
+        _rechazar("Formato de credencial inválido.", ErrorCode.CREDENCIAL_FORMATO_INVALIDO)
 
     api_key = db.exec(select(ApiKeyDispositivo).where(ApiKeyDispositivo.key_id == key_id)).first()
     if not api_key:
-        _rechazar("Credencial inválida.")
+        _rechazar("Credencial inválida.", ErrorCode.CREDENCIAL_INVALIDA)
 
     if not bcrypt.checkpw(secret.encode("utf-8"), api_key.secret_hash.encode("utf-8")):
-        _rechazar("Credencial inválida.")
+        _rechazar("Credencial inválida.", ErrorCode.CREDENCIAL_INVALIDA)
 
     if not api_key.activo:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credencial revocada.")
+        raise error_terminal(status.HTTP_403_FORBIDDEN, ErrorCode.CREDENCIAL_REVOCADA, "Credencial revocada.")
 
     if api_key.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credencial expirada.")
+        raise error_terminal(status.HTTP_403_FORBIDDEN, ErrorCode.CREDENCIAL_EXPIRADA, "Credencial expirada.")
 
     tenant = db.get(Tenant, api_key.tenant_id)
     verificar_no_suspension_total(tenant)

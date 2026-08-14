@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 import re
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
@@ -15,6 +15,7 @@ import uuid
 from app.core.database import get_session
 from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
+from app.core.errors import ErrorCode, error_terminal
 from app.core.rate_limit import verificar_limite
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
@@ -74,9 +75,9 @@ def _normalizar_timestamp_utc(ts: Optional[datetime], planta_timezone: Optional[
 def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:
     ahora = datetime.now(timezone.utc).replace(tzinfo=None)
     if ts_utc_naive > ahora + TOLERANCIA_FUTURO:
-        raise HTTPException(status_code=400, detail="Timestamp más de 5 minutos en el futuro; rechazado.")
+        raise error_terminal(400, ErrorCode.TIMESTAMP_FUERA_DE_RANGO, "Timestamp más de 5 minutos en el futuro; rechazado.")
     if ts_utc_naive < ahora - TOLERANCIA_ANTIGUEDAD:
-        raise HTTPException(status_code=400, detail="Timestamp con más de 7 días de antigüedad; rechazado.")
+        raise error_terminal(400, ErrorCode.TIMESTAMP_FUERA_DE_RANGO, "Timestamp con más de 7 días de antigüedad; rechazado.")
 
 
 def _calcular_payload_hash(scan: ScanRequest) -> str:
@@ -101,12 +102,12 @@ def validar_estacion_terminal(
     """(Bootstrap) Terminal/PLC solicita configuración de la estación y herencia de línea.
     Requiere API key M2M (Fase D.4a); ya no acepta JWT humano."""
     if str(estacion_id) != dispositivo.estacion_id:
-        raise HTTPException(status_code=403, detail="Esta credencial no está autorizada para esa estación.")
+        raise error_terminal(403, ErrorCode.ESTACION_NO_AUTORIZADA, "Esta credencial no está autorizada para esa estación.")
 
     estacion = db.exec(select(Estacion).where(Estacion.id == estacion_id, Estacion.tenant_id == dispositivo.tenant_id)).first()
     if not estacion:
-        raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
-        
+        raise error_terminal(403, ErrorCode.ESTACION_NO_AUTORIZADA, "Estación no autorizada para esta credencial.")
+
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
 
     modo_asignacion = estacion.modo_asignacion_operarios
@@ -132,11 +133,11 @@ def registrar_escaneo_rapido(
     Requiere API key M2M (Fase D.4a); ya no acepta JWT humano.
     """
     if str(scan.id_estacion) != dispositivo.estacion_id:
-        raise HTTPException(status_code=403, detail="Esta credencial no está autorizada para esa estación.")
+        raise error_terminal(403, ErrorCode.ESTACION_NO_AUTORIZADA, "Esta credencial no está autorizada para esa estación.")
 
     estacion = db.exec(select(Estacion).where(Estacion.id == scan.id_estacion, Estacion.tenant_id == dispositivo.tenant_id)).first()
     if not estacion:
-        raise HTTPException(status_code=403, detail="Estación no autorizada para esta credencial.")
+        raise error_terminal(403, ErrorCode.ESTACION_NO_AUTORIZADA, "Estación no autorizada para esta credencial.")
 
     # Fase K (auditoría QA #5): serializa el procesamiento por estación.
     # Antes, la deduplicación por event_id y la lectura de "el último
@@ -163,7 +164,7 @@ def registrar_escaneo_rapido(
                 "unidades": evento_existente.unidades_procesadas, "desempeno": evento_existente.estado,
                 "idempotente": True,
             })
-        raise HTTPException(status_code=409, detail="event_id ya usado con un payload diferente.")
+        raise error_terminal(409, ErrorCode.EVENTO_ID_CONFLICTO, "event_id ya usado con un payload diferente.")
 
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
     tenant_config = db.get(Tenant, dispositivo.tenant_id)
@@ -235,9 +236,9 @@ def registrar_escaneo_rapido(
 
     # 2.5 CALIDAD POR RECHAZO (Fase E2): 0 <= rechazadas <= procesadas.
     if scan.unidades_rechazadas > unidades_a_sumar:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unidades_rechazadas ({scan.unidades_rechazadas}) no puede superar unidades_procesadas ({unidades_a_sumar}).",
+        raise error_terminal(
+            400, ErrorCode.CANTIDAD_RECHAZADA_INVALIDA,
+            f"unidades_rechazadas ({scan.unidades_rechazadas}) no puede superar unidades_procesadas ({unidades_a_sumar}).",
         )
 
     # 3. CÁLCULO OEE DEDUCTIVO (Time-Based DTR)
@@ -273,9 +274,9 @@ def registrar_escaneo_rapido(
         # con un código distinguible -- no se intenta reordenar ni
         # recomputar automáticamente acá.
         if delta_t_segundos < 0:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
+            raise error_terminal(
+                status.HTTP_409_CONFLICT, ErrorCode.EVENTO_FUERA_DE_ORDEN,
+                (
                     "EVENTO_FUERA_DE_ORDEN: el timestamp del evento es anterior al último "
                     f"registrado para esta estación ({ultimo_evento.timestamp.isoformat()}Z). "
                     "No se persiste -- reenviar en orden cronológico."
@@ -406,7 +407,7 @@ def registrar_escaneo_rapido(
                 "unidades": evento_existente.unidades_procesadas, "desempeno": evento_existente.estado,
                 "idempotente": True,
             })
-        raise HTTPException(status_code=409, detail="event_id ya usado con un payload diferente.")
+        raise error_terminal(409, ErrorCode.EVENTO_ID_CONFLICTO, "event_id ya usado con un payload diferente.")
 
     return {"status": "ok", "evento_id": nuevo_evento.id, "unidades": unidades_a_sumar, "desempeno": desempeno}
 
@@ -459,13 +460,13 @@ def login_operario_terminal(
             db, f"login_operario:{dispositivo.tenant_id}:{dispositivo.estacion_id}",
             max_intentos=20, ventana_segundos=60,
         )
-        raise HTTPException(status_code=404, detail="Legajo no encontrado o inactivo.")
+        raise error_terminal(404, ErrorCode.OPERARIO_NO_ENCONTRADO, "Legajo no encontrado o inactivo.")
 
     turno = db.exec(
         select(Turno).where(Turno.id == payload.turno_fk, Turno.tenant_id == dispositivo.tenant_id)
     ).first()
     if not turno:
-        raise HTTPException(status_code=404, detail="Turno no encontrado.")
+        raise error_terminal(404, ErrorCode.TURNO_NO_ENCONTRADO, "Turno no encontrado.")
 
     hoy = date.today()
     asignacion = db.exec(
@@ -531,7 +532,7 @@ def logout_operario_terminal(
         )
     ).first()
     if not asignacion:
-        raise HTTPException(status_code=404, detail="No hay ninguna sesión abierta para cerrar en esta estación/turno hoy.")
+        raise error_terminal(404, ErrorCode.SESION_NO_ENCONTRADA, "No hay ninguna sesión abierta para cerrar en esta estación/turno hoy.")
 
     asignacion.hora_salida = datetime.utcnow()
     db.add(asignacion)
