@@ -126,6 +126,19 @@ def test_plan_vs_actual_fecha_hasta_menor_a_desde_devuelve_400(client, db, tenan
     assert r.status_code == 400
 
 
+def test_plan_vs_actual_rechaza_rango_mayor_a_90_dias(client, db, tenant_a, gerente_a):
+    """Fase BU: mismo tope de robustez que reporte-produccion/oee-tendencia."""
+    planta, _ = _preparar_linea(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/plan-vs-actual/",
+        params={"fecha_desde": "2026-01-01", "fecha_hasta": "2026-06-01"},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 400
+    assert "90" in r.json()["detail"]
+
+
 def test_plan_vs_actual_sin_planta_devuelve_vacio(client, db, tenant_a, gerente_a):
     autenticar_como(gerente_a.id)
     r = client.get(

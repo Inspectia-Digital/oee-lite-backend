@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.core.clasificacion import validar_perfil_tiempos
+from app.core.pagination import aplicar_paginacion
 from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
@@ -582,14 +583,20 @@ async def importar_skus_csv(
 @router.get("/erp/skus", response_model=List[MaestroSKU], tags=["Integración ERP"])
 def listar_skus(
     incluir_inactivos: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
+    """Fase BU: `limit`/`offset` opcionales (ver app/core/pagination.py) --
+    sin `limit`, se comporta exactamente igual que antes (lista completa)."""
     _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(MaestroSKU).where(MaestroSKU.tenant_id == context.tenant_id)
     if not incluir_inactivos:
         query = query.where(MaestroSKU.activo == True)  # noqa: E712
+    query = query.order_by(MaestroSKU.codigo_sku)
+    query = aplicar_paginacion(query, limit, offset)
     return db.exec(query).all()
 
 
@@ -1015,14 +1022,19 @@ def crear_orden(
 @router.get("/ordenes/", response_model=List[OrdenProduccion])
 def listar_ordenes(
     incluir_inactivos: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
+    """Fase BU: `limit`/`offset` opcionales -- ver listar_skus arriba."""
     _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(OrdenProduccion).where(OrdenProduccion.tenant_id == context.tenant_id)
     if not incluir_inactivos:
         query = query.where(OrdenProduccion.activo == True)  # noqa: E712
+    query = query.order_by(OrdenProduccion.id_orden)
+    query = aplicar_paginacion(query, limit, offset)
     return db.exec(query).all()
 
 
@@ -1297,13 +1309,16 @@ def listar_planes(
     linea_id: Optional[uuid.UUID] = None,
     estado: Optional[str] = None,
     incluir_inactivos: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
     """Sin `ordenes` embebidas a propósito (lista liviana para elegir un
     plan) -- para el detalle completo con órdenes y cantidad_producida
-    calculada, ver GET /planes/{plan_id}."""
+    calculada, ver GET /planes/{plan_id}. Fase BU: `limit`/`offset`
+    opcionales, ver listar_skus arriba."""
     _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(PlanProduccion).where(PlanProduccion.tenant_id == context.tenant_id)
     if not incluir_inactivos:
@@ -1313,6 +1328,7 @@ def listar_planes(
     if estado:
         query = query.where(PlanProduccion.estado == estado)
     query = query.order_by(PlanProduccion.fecha_inicio.desc())
+    query = aplicar_paginacion(query, limit, offset)
     return db.exec(query).all()
 
 
