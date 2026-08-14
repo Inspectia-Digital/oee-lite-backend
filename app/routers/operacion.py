@@ -79,6 +79,9 @@ class ParadaHistorialRow(BaseModel):
     origen: str
     motivo_fk: Optional[uuid.UUID] = None
     motivo_nombre: Optional[str] = None
+    # Fase CK (drill-down pérdida→evento→estación→responsable).
+    clasificado_por_id: Optional[uuid.UUID] = None
+    clasificado_por_nombre: Optional[str] = None
     # Fase CC (FE-P0-08): workflow de falso positivo -- ver EstadoExclusionOee.
     exclusion_oee: EstadoExclusionOee
     exclusion_motivo: Optional[str] = None
@@ -154,8 +157,13 @@ def clasificar_parada(
         raise HTTPException(status_code=404, detail="Motivo de parada no válido o no autorizado[cite: 13]")
 
     parada.motivo_fk = motivo.id
-    parada.estado = EstadoParada.CLASIFICADA 
-    
+    parada.estado = EstadoParada.CLASIFICADA
+    # Fase CK (drill-down pérdida→evento→estación→responsable): quién
+    # tomó la decisión, no sólo qué motivo -- se pisa en cada
+    # re-clasificación (la última persona que decidió es la responsable
+    # vigente), mismo criterio que motivo_fk de la línea de arriba.
+    parada.clasificado_por_id = usuario.id
+
     db.add(parada)
     db.commit()
     db.refresh(parada)
@@ -276,7 +284,9 @@ def listar_historial_paradas(
     # dispositivos.py (Fase CB).
     usuario_ids = {
         uid for p, _, _, _ in filas
-        for uid in (p.exclusion_propuesta_por_id, p.exclusion_resuelta_por_id)
+        # Fase CK: se suma clasificado_por_id al mismo batch -- misma
+        # consulta, un solo round-trip extra de nombres para las 3 FKs.
+        for uid in (p.exclusion_propuesta_por_id, p.exclusion_resuelta_por_id, p.clasificado_por_id)
         if uid
     }
     nombres_por_id: dict = {}
@@ -294,6 +304,8 @@ def listar_historial_paradas(
             inicio=p.inicio, fin=p.fin, duracion_segundos=p.duracion_segundos,
             estado=p.estado, origen=p.origen,
             motivo_fk=p.motivo_fk, motivo_nombre=m.nombre if m else None,
+            clasificado_por_id=p.clasificado_por_id,
+            clasificado_por_nombre=nombres_por_id.get(p.clasificado_por_id),
             exclusion_oee=p.exclusion_oee,
             exclusion_motivo=p.exclusion_motivo,
             exclusion_propuesta_por_id=p.exclusion_propuesta_por_id,
