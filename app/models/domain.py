@@ -50,6 +50,25 @@ class EstadoParada(str, Enum):
     PENDIENTE = "pendiente"       # Gap detectado automáticamente, esperando al supervisor
     CLASIFICADA = "clasificada"   # El supervisor ya le asignó un motivo
 
+
+class EstadoExclusionOee(str, Enum):
+    """Fase CC (FE-P0-08, auditoría de robustez, batch 3): workflow de
+    falso positivo -- una parada detectada automáticamente que en
+    realidad NO representa una pérdida real (glitch de sensor, corte de
+    red que generó un hueco artificial, etc.). Quien clasifica paradas
+    (Encargado/Supervisor/Gerencia/SuperAdmin, mismo gate que
+    clasificar_parada) puede PROPONER excluirla de los cálculos de OEE;
+    un segundo usuario -- Gerencia o SuperAdmin, distinto de quien
+    propuso -- tiene que aprobarla o rechazarla antes de que afecte el
+    cálculo (ver operacion.py, analytics.py::_calcular_metricas_oee).
+    Ninguna parada se borra ni se oculta -- el historial (/supervisor/
+    paradas) sigue mostrando TODAS, con su estado de exclusión, para
+    auditoría."""
+    NINGUNA = "ninguna"       # No propuesta -- cuenta normal en OEE (default)
+    PROPUESTA = "propuesta"   # Esperando resolución de un segundo usuario
+    APROBADA = "aprobada"     # Confirmada como falso positivo -- EXCLUIDA de OEE
+    RECHAZADA = "rechazada"   # El segundo usuario la revisó y la confirmó como real -- cuenta en OEE
+
 class RolUsuario(str, Enum):
     SUPERADMIN = "superadmin"
     GERENCIA = "gerencia"
@@ -566,6 +585,17 @@ class ParadaDetectada(TenantBase, table=True):
     # (UUID), no a id_orden -- mismo criterio C1/C2 que el resto de las
     # FKs nuevas desde Fase AA (ver nota en OrdenProduccion).
     orden_fk: Optional[uuid.UUID] = Field(default=None, foreign_key="ordenes_produccion.id")
+
+    # Fase CC (FE-P0-08): workflow de falso positivo -- ver
+    # EstadoExclusionOee. Todos nullable/con default NINGUNA porque las
+    # paradas existentes antes de esta fase nunca pasaron por el flujo.
+    exclusion_oee: EstadoExclusionOee = Field(default=EstadoExclusionOee.NINGUNA)
+    exclusion_motivo: Optional[str] = Field(default=None, description="Por qué se propone como falso positivo")
+    exclusion_propuesta_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    exclusion_propuesta_at: Optional[datetime] = Field(default=None)
+    exclusion_resuelta_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    exclusion_resuelta_at: Optional[datetime] = Field(default=None)
+    exclusion_resolucion_nota: Optional[str] = Field(default=None)
 
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""

@@ -15,6 +15,7 @@ from app.models.domain import (
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada,
     AsignacionSupervisor, Supervisor, Maquina, MaestroSKU,
+    EstadoExclusionOee,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -530,7 +531,13 @@ def _calcular_metricas_oee(
             ParadaDetectada.tenant_id == context.tenant_id,
             Linea.planta_id == context.sub_tenant_id,
             ParadaDetectada.inicio >= inicio,
-            ParadaDetectada.inicio <= fin
+            ParadaDetectada.inicio <= fin,
+            # Fase CC (FE-P0-08): una parada con exclusión de OEE APROBADA
+            # es un falso positivo confirmado por un segundo usuario -- no
+            # cuenta como pérdida real en NINGÚN cálculo de OEE. Sigue
+            # existiendo y visible en el historial (/supervisor/paradas)
+            # para auditoría, sólo se saca de la cuenta acá.
+            ParadaDetectada.exclusion_oee != EstadoExclusionOee.APROBADA,
         )
     )
     if linea_id: q_paradas = q_paradas.where(Estacion.linea_id == linea_id)
@@ -782,7 +789,11 @@ def obtener_pareto_paradas(
                 ParadaDetectada.tenant_id == context.tenant_id,
                 Linea.planta_id == context.sub_tenant_id,
                 ParadaDetectada.inicio >= inicio_dia,
-                ParadaDetectada.inicio <= fin_dia
+                ParadaDetectada.inicio <= fin_dia,
+                # Fase CC: mismo criterio que _calcular_metricas_oee -- un
+                # falso positivo confirmado no es una pérdida real, no
+                # debería aparecer en el Pareto de pérdidas.
+                ParadaDetectada.exclusion_oee != EstadoExclusionOee.APROBADA,
             )
         )
         if linea_id: query = query.where(Linea.id == linea_id)
@@ -2138,6 +2149,8 @@ def obtener_paradas_por_sku(
                 Linea.planta_id == context.sub_tenant_id,
                 ParadaDetectada.inicio >= inicio_dia,
                 ParadaDetectada.inicio <= fin_dia,
+                # Fase CC: mismo criterio que pareto-paradas/_calcular_metricas_oee.
+                ParadaDetectada.exclusion_oee != EstadoExclusionOee.APROBADA,
             )
         )
         if linea_id: query = query.where(Linea.id == linea_id)
@@ -2314,6 +2327,8 @@ def _agrupar_eventos_por_hora_planta(
             Linea.planta_id == context.sub_tenant_id,
             ParadaDetectada.inicio >= inicio,
             ParadaDetectada.inicio <= fin,
+            # Fase CC: mismo criterio que _calcular_metricas_oee.
+            ParadaDetectada.exclusion_oee != EstadoExclusionOee.APROBADA,
         )
     )
     if linea_id:
