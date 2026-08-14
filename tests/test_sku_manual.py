@@ -184,3 +184,64 @@ def test_patch_sku_perfil_invertido_devuelve_400(client, db, tenant_a, gerente_a
 
     r = client.patch(f"/config/erp/skus/{codigo}", json={"tiempo_lento_seg": 300.0, "tiempo_alerta_seg": 280.0})
     assert r.status_code == 400
+
+
+# ---------- umbral_calidad (Fase AZ, auditoría de frontend) ----------
+# Gap real preexistente: MaestroSKU.umbral_calidad existe en el modelo
+# desde Fase AC (tolerancia en estación de calidad para Linea.metodo_calidad
+# == "por_tiempo"), pero ni crear_sku ni actualizar_sku lo aceptaban --
+# quedaba clavado en el default (1800.0) para siempre, sin forma de
+# ajustarlo por tenant.
+
+def test_crear_sku_manual_usa_default_de_umbral_calidad(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+    assert r.json()["umbral_calidad"] == 1800.0
+
+
+def test_crear_sku_manual_con_umbral_calidad_explicito(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post(
+        "/config/erp/skus",
+        json={"codigo_sku": codigo, "descripcion": "Con umbral", "umbral_calidad": 900.0},
+    )
+    assert r.status_code == 201
+    assert r.json()["umbral_calidad"] == 900.0
+
+
+def test_crear_sku_manual_umbral_calidad_cero_devuelve_400(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post(
+        "/config/erp/skus",
+        json={"codigo_sku": codigo, "descripcion": "Umbral inválido", "umbral_calidad": 0},
+    )
+    assert r.status_code == 400
+
+
+def test_patch_sku_puede_ajustar_umbral_calidad(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+    assert r.json()["umbral_calidad"] == 1800.0
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"umbral_calidad": 600.0})
+    assert r.status_code == 200
+    assert r.json()["umbral_calidad"] == 600.0
+
+    sku_db = db.exec(select(MaestroSKU).where(MaestroSKU.codigo_sku == codigo, MaestroSKU.tenant_id == tenant_a)).first()
+    assert sku_db.umbral_calidad == 600.0
+
+
+def test_patch_sku_umbral_calidad_negativo_devuelve_400(client, db, tenant_a, gerente_a):
+    autenticar_como(gerente_a.id)
+    codigo = f"SKU-MANUAL-{uuid.uuid4().hex[:8]}"
+    r = client.post("/config/erp/skus", json={"codigo_sku": codigo, "descripcion": "Original"})
+    assert r.status_code == 201
+
+    r = client.patch(f"/config/erp/skus/{codigo}", json={"umbral_calidad": -100.0})
+    assert r.status_code == 400

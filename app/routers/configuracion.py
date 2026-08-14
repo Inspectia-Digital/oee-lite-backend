@@ -19,6 +19,7 @@ from app.models.domain import (
     Estacion, MotivoParada, Operario, Turno, MaestroSKU, OrdenProduccion,
     Linea, Supervisor, TipoParada, RolUsuario, Planta, ModoAsignacionOperarios, ModoAsignacionOperariosEstacion, UsuarioSaaS,
     Maquina, MaquinaEstacion, SkuTiempoEstacion, PlanProduccion, LiteEventoProduccion, Tenant, EstadoPlan, EstadoOrden,
+    MetodoCalidadLinea,
 )
 
 router = APIRouter(prefix="/config", tags=["Configuración y Maestros"])
@@ -60,6 +61,9 @@ class LineaCreate(BaseModel):
     tiempo_ideal_seg: float = 240.0
     tiempo_lento_seg: float = 280.0
     tiempo_alerta_seg: float = 300.0
+    # Fase AZ (auditoría de frontend): mismo default que el modelo -- no
+    # Optional/None a propósito, el campo no es nullable (ver Linea.metodo_calidad).
+    metodo_calidad: MetodoCalidadLinea = MetodoCalidadLinea.POR_RECHAZO
 
 class LineaUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -612,6 +616,11 @@ class MaestroSKUUpdate(BaseModel):
     tiempo_ideal_seg: Optional[float] = None
     tiempo_lento_seg: Optional[float] = None
     tiempo_alerta_seg: Optional[float] = None
+    # Fase AZ (auditoría de frontend): gap real preexistente -- el modelo
+    # ya tenía MaestroSKU.umbral_calidad desde Fase AC, pero ningún
+    # endpoint (create ni update) lo aceptaba -- quedaba clavado en el
+    # default (1800.0) para siempre, sin forma de ajustarlo por tenant.
+    umbral_calidad: Optional[float] = None
 
 
 @router.patch("/erp/skus/{codigo_sku}", response_model=MaestroSKU, tags=["Integración ERP"])
@@ -636,6 +645,11 @@ def actualizar_sku(
         validar_perfil_tiempos(sku.tiempo_ideal_seg, sku.tiempo_lento_seg, sku.tiempo_alerta_seg)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Fase AZ: mismo criterio que validar_perfil_tiempos -- una tolerancia
+    # en 0 o negativa no tiene sentido de negocio (siempre clasificaría
+    # "fuera de tiempo" o rompería la comparación delta_t <= umbral).
+    if sku.umbral_calidad <= 0:
+        raise HTTPException(status_code=400, detail="umbral_calidad debe ser mayor a 0.")
     db.add(sku)
     db.commit()
     db.refresh(sku)
@@ -657,6 +671,9 @@ class MaestroSKUCreate(BaseModel):
     tiempo_alerta_seg: Optional[float] = None
     unidades_por_ciclo: int = 1
     linea_id: Optional[uuid.UUID] = None
+    # Fase AZ (auditoría de frontend): mismo default que el modelo -- no
+    # Optional/None a propósito, el campo no es nullable (ver umbral_calidad).
+    umbral_calidad: float = 1800.0
 
 
 @router.post("/erp/skus", response_model=MaestroSKU, status_code=status.HTTP_201_CREATED, tags=["Integración ERP"])
@@ -701,6 +718,8 @@ def crear_sku(
         validar_perfil_tiempos(payload.tiempo_ideal_seg, payload.tiempo_lento_seg, payload.tiempo_alerta_seg)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if payload.umbral_calidad <= 0:
+        raise HTTPException(status_code=400, detail="umbral_calidad debe ser mayor a 0.")
 
     nuevo = MaestroSKU(tenant_id=context.tenant_id, **payload.model_dump())
     db.add(nuevo)
