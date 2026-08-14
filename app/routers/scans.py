@@ -479,6 +479,10 @@ def login_operario_terminal(
 
     if asignacion:
         asignacion.operario_fk = operario.id
+        # Fase BZ: un login nuevo reabre la sesión -- si el operario
+        # anterior había hecho [SALIR] en este mismo turno/estación/día,
+        # ese hora_salida ya no aplica al operario que acaba de fichar.
+        asignacion.hora_salida = None
         db.add(asignacion)
     else:
         asignacion = AsignacionTurno(
@@ -496,3 +500,40 @@ def login_operario_terminal(
         "mensaje": f"Operario '{operario.nombre_completo}' logueado en esta terminal para el turno actual.",
         "asignacion_id": asignacion.id,
     }
+
+
+class OperarioLogoutRequest(BaseModel):
+    turno_fk: uuid.UUID = Field(..., description="Turno de la sesión que se está cerrando.")
+
+
+@router.post("/operario/logout", status_code=status.HTTP_200_OK)
+def logout_operario_terminal(
+    payload: OperarioLogoutRequest,
+    db: Session = Depends(get_session),
+    dispositivo: ContextoDispositivo = Depends(autenticar_dispositivo),
+):
+    """Fase BZ (auditoría de robustez): formaliza [SALIR] -- antes ese
+    botón de la terminal sólo reseteaba estado LOCAL del front, sin
+    ningún registro del lado del backend. Marca `hora_salida` en la
+    AsignacionTurno de hoy para esta estación+turno (la misma fila que
+    crea/actualiza login_operario_terminal). Puramente informativo: NO
+    cambia cómo se resuelve el operario de un evento ya registrado, eso
+    sigue siendo por (tenant, estación, turno, fecha) -- ver el
+    comentario en el modelo (domain.py) sobre por qué no se formaliza
+    una ventana horaria real acá."""
+    hoy = date.today()
+    asignacion = db.exec(
+        select(AsignacionTurno).where(
+            AsignacionTurno.tenant_id == dispositivo.tenant_id,
+            AsignacionTurno.estacion_fk == uuid.UUID(dispositivo.estacion_id),
+            AsignacionTurno.turno_fk == payload.turno_fk,
+            AsignacionTurno.fecha == hoy,
+        )
+    ).first()
+    if not asignacion:
+        raise HTTPException(status_code=404, detail="No hay ninguna sesión abierta para cerrar en esta estación/turno hoy.")
+
+    asignacion.hora_salida = datetime.utcnow()
+    db.add(asignacion)
+    db.commit()
+    return {"mensaje": "Sesión cerrada.", "asignacion_id": asignacion.id}
