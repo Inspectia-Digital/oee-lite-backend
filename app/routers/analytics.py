@@ -1287,6 +1287,11 @@ def obtener_reporte_produccion(
     try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+        # Fase BU (auditoría de robustez): mismo tope que /analytics/oee-tendencia/
+        # -- sin esto, un rango de años trae TODOS los eventos crudos del
+        # tenant a memoria de una sola vez antes de agruparlos.
+        if (fecha_hasta - fecha_desde).days > 90:
+            raise HTTPException(status_code=400, detail="El rango máximo para el reporte es de 90 días.")
 
         inicio = datetime.combine(fecha_desde, time.min)
         fin = datetime.combine(fecha_hasta, time.max)
@@ -1361,6 +1366,11 @@ def obtener_plan_vs_actual(
     try:
         if fecha_hasta < fecha_desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
+        # Fase BU: mismo tope que reporte-produccion/oee-tendencia -- acá
+        # el volumen por rango son órdenes (no eventos), menos riesgoso,
+        # pero el mismo tenant puede acumular años de órdenes.
+        if (fecha_hasta - fecha_desde).days > 90:
+            raise HTTPException(status_code=400, detail="El rango máximo para este reporte es de 90 días.")
 
         query = (
             select(OrdenProduccion, Linea)

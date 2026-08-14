@@ -252,6 +252,29 @@ def test_reporte_produccion_rechaza_rango_invertido(client, db, tenant_a, gerent
     assert r.status_code == 400
 
 
+def test_reporte_produccion_rechaza_rango_mayor_a_90_dias(client, db, tenant_a, gerente_a):
+    """Fase BU: mismo tope que /analytics/oee-tendencia/ -- sin esto, un
+    rango de años trae todos los eventos crudos del tenant a memoria."""
+    planta, _, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/reporte-produccion/?fecha_desde=2026-01-01&fecha_hasta=2026-06-01",
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 400
+    assert "90" in r.json()["detail"]
+
+
+def test_reporte_produccion_acepta_rango_de_90_dias(client, db, tenant_a, gerente_a):
+    planta, _, _ = _preparar_escenario(db, tenant_a)
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/reporte-produccion/?fecha_desde=2026-01-01&fecha_hasta=2026-04-01",
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+
+
 # ---------- command-center/summary ----------
 
 def test_command_center_gerencia_ve_todas_las_plantas(client, db, tenant_a, gerente_a):

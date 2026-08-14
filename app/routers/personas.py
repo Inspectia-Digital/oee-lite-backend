@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 
 from app.core.auth import TenantContext, get_usuario_actual, obtener_contexto_tenant_humano
 from app.core.database import get_session
+from app.core.pagination import aplicar_paginacion
 from app.core.rbac import requerir_gerencia_o_superadmin
 from app.models.domain import Operario, Supervisor, UsuarioSaaS
 
@@ -78,14 +79,20 @@ def crear_operario(
 @router.get("/operarios/", response_model=List[Operario])
 def listar_operarios(
     incluir_inactivos: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
+    """Fase BU: `limit`/`offset` opcionales -- sin `limit`, lista completa
+    igual que antes (ver app/core/pagination.py)."""
     _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(Operario).where(Operario.tenant_id == context.tenant_id)
     if not incluir_inactivos:
         query = query.where(Operario.activo == True)  # noqa: E712
+    query = query.order_by(Operario.legajo)
+    query = aplicar_paginacion(query, limit, offset)
     return db.exec(query).all()
 
 
@@ -183,14 +190,19 @@ def crear_supervisor(
 @router.get("/supervisores/", response_model=List[Supervisor])
 def listar_supervisores(
     incluir_inactivos: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_session),
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
 ):
+    """Fase BU: `limit`/`offset` opcionales -- ver listar_operarios arriba."""
     _requerir_permiso_inactivos(incluir_inactivos, usuario_actual)
     query = select(Supervisor).where(Supervisor.tenant_id == context.tenant_id)
     if not incluir_inactivos:
         query = query.where(Supervisor.activo == True)  # noqa: E712
+    query = query.order_by(Supervisor.legajo)
+    query = aplicar_paginacion(query, limit, offset)
     return db.exec(query).all()
 
 
