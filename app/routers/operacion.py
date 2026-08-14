@@ -9,7 +9,7 @@ from datetime import datetime, date, time, timedelta
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.models.domain import (
-    ParadaDetectada, MotivoParada, EstadoParada,
+    ParadaDetectada, MotivoParada, EstadoParada, EstadoExclusionOee,
     Estacion, Linea, LiteEventoProduccion, Operario, UsuarioSaaS, RolUsuario, UsuarioPlanta,
     AsignacionTurno, AsignacionSupervisor, Turno, Supervisor,
     PlanProduccion, OrdenProduccion, EstadoPlan, EstadoOrden,
@@ -32,8 +32,27 @@ router_asignaciones_supervisor = APIRouter(prefix="/asignaciones", tags=["Operac
 # así que agregar el rol nuevo sin este guard le habría dado acceso a todo.
 ROLES_SUPERVISION_COMPLETA = (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN)
 
+# Fase CC (FE-P0-08): quién puede APROBAR/RECHAZAR una propuesta de
+# exclusión de OEE -- deliberadamente más angosto que
+# ROLES_SUPERVISION_COMPLETA (que incluye Supervisor/Producción, el
+# mismo nivel que suele PROPONER). Gerencia/SuperAdmin es el mismo tier
+# "de confianza" que ya se usa para acciones sensibles equivalentes
+# (emitir/revocar API keys de dispositivo, Fase D.1/CB) -- reutilizarlo
+# evita inventar un rol nuevo sólo para esto. Además de este chequeo de
+# rol, el endpoint bloquea explícitamente la auto-aprobación (que el
+# aprobador sea la misma persona que propuso), que es la propiedad real
+# que "control de dos personas" busca.
+ROLES_APROBACION_EXCLUSION_OEE = (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN)
+
 class ClasificarParada(BaseModel):
     motivo_fk: uuid.UUID
+
+class ProponerExclusionOee(BaseModel):
+    motivo: str = Field(..., min_length=3, max_length=500)
+
+class ResolverExclusionOee(BaseModel):
+    aprobar: bool
+    nota: Optional[str] = Field(default=None, max_length=500)
 
 class ParadaPlanificadaCreate(BaseModel):
     estacion_fk: uuid.UUID
@@ -60,6 +79,16 @@ class ParadaHistorialRow(BaseModel):
     origen: str
     motivo_fk: Optional[uuid.UUID] = None
     motivo_nombre: Optional[str] = None
+    # Fase CC (FE-P0-08): workflow de falso positivo -- ver EstadoExclusionOee.
+    exclusion_oee: EstadoExclusionOee
+    exclusion_motivo: Optional[str] = None
+    exclusion_propuesta_por_id: Optional[uuid.UUID] = None
+    exclusion_propuesta_por_nombre: Optional[str] = None
+    exclusion_propuesta_at: Optional[datetime] = None
+    exclusion_resuelta_por_id: Optional[uuid.UUID] = None
+    exclusion_resuelta_por_nombre: Optional[str] = None
+    exclusion_resuelta_at: Optional[datetime] = None
+    exclusion_resolucion_nota: Optional[str] = None
 
 def validar_planta(context: TenantContext, usuario: UsuarioSaaS, db: Session):
     """RBAC geolocalizado (Fase D.3): Gerencia/SuperAdmin acceden a todo el
@@ -193,6 +222,9 @@ def listar_historial_paradas(
     motivo_fk: Optional[uuid.UUID] = None,
     fecha_desde: Optional[date] = None,
     fecha_hasta: Optional[date] = None,
+    # Fase CC: filtro reusado para la cola de aprobación
+    # (?exclusion_oee=propuesta) -- mismo endpoint, sin duplicar lógica.
+    exclusion_oee: Optional[EstadoExclusionOee] = None,
     limit: int = 100,
     offset: int = 0,
     db: Session = Depends(get_session),
@@ -201,8 +233,10 @@ def listar_historial_paradas(
 ):
     """Historial completo de paradas, filtrable. `origen=PLANIFICADA` da el
     listado de "programadas"; `estado=clasificada&origen=AUTOMATICA` da el
-    historial de clasificadas por el supervisor. Sin filtros, trae todo
-    (paginado). Misma planta activa que el resto de /supervisor."""
+    historial de clasificadas por el supervisor; `exclusion_oee=propuesta`
+    da la cola de exclusiones de OEE pendientes de aprobación (Fase CC).
+    Sin filtros, trae todo (paginado). Misma planta activa que el resto
+    de /supervisor."""
     validar_planta(context, usuario, db)
     if not (1 <= limit <= 500):
         raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 500.")
@@ -231,9 +265,27 @@ def listar_historial_paradas(
         query = query.where(ParadaDetectada.inicio >= datetime.combine(fecha_desde, time.min))
     if fecha_hasta is not None:
         query = query.where(ParadaDetectada.inicio <= datetime.combine(fecha_hasta, time.max))
+    if exclusion_oee is not None:
+        query = query.where(ParadaDetectada.exclusion_oee == exclusion_oee)
 
     query = query.order_by(ParadaDetectada.inicio.desc()).offset(offset).limit(limit)
     filas = db.exec(query).all()
+
+    # Fase CC: nombres de quién propuso/resolvió, resueltos en un solo
+    # query batch (no N+1) -- mismo criterio que _nombre_usuario en
+    # dispositivos.py (Fase CB).
+    usuario_ids = {
+        uid for p, _, _, _ in filas
+        for uid in (p.exclusion_propuesta_por_id, p.exclusion_resuelta_por_id)
+        if uid
+    }
+    nombres_por_id: dict = {}
+    if usuario_ids:
+        usuarios_rel = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.id.in_(usuario_ids))).all()
+        nombres_por_id = {
+            u.id: (" ".join(p for p in [u.nombre, u.apellido] if p).strip() or u.email or "Usuario sin nombre")
+            for u in usuarios_rel
+        }
 
     return [
         ParadaHistorialRow(
@@ -242,9 +294,104 @@ def listar_historial_paradas(
             inicio=p.inicio, fin=p.fin, duracion_segundos=p.duracion_segundos,
             estado=p.estado, origen=p.origen,
             motivo_fk=p.motivo_fk, motivo_nombre=m.nombre if m else None,
+            exclusion_oee=p.exclusion_oee,
+            exclusion_motivo=p.exclusion_motivo,
+            exclusion_propuesta_por_id=p.exclusion_propuesta_por_id,
+            exclusion_propuesta_por_nombre=nombres_por_id.get(p.exclusion_propuesta_por_id),
+            exclusion_propuesta_at=p.exclusion_propuesta_at,
+            exclusion_resuelta_por_id=p.exclusion_resuelta_por_id,
+            exclusion_resuelta_por_nombre=nombres_por_id.get(p.exclusion_resuelta_por_id),
+            exclusion_resuelta_at=p.exclusion_resuelta_at,
+            exclusion_resolucion_nota=p.exclusion_resolucion_nota,
         )
         for p, e, l, m in filas
     ]
+
+
+# ==========================================
+# EXCLUSIÓN DE OEE -- WORKFLOW DE FALSO POSITIVO (Fase CC, FE-P0-08)
+# ==========================================
+@router.post("/paradas/{parada_id}/proponer-exclusion-oee", response_model=ParadaDetectada)
+def proponer_exclusion_oee(
+    parada_id: uuid.UUID,
+    datos: ProponerExclusionOee,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Propone que una parada NO representa una pérdida real (falso
+    positivo -- glitch de sensor, corte de red, etc.) y por lo tanto debe
+    excluirse del cálculo de OEE. Mismo gate que clasificar_parada
+    (validar_planta, sin restricción de rol adicional -- Encargado
+    incluido): es la misma persona, en el mismo momento, revisando la
+    misma parada. No excluye nada por sí sola -- queda PROPUESTA hasta
+    que un segundo usuario la apruebe (ver resolver_exclusion_oee)."""
+    validar_planta(context, usuario, db)
+    parada = db.get(ParadaDetectada, parada_id)
+    if not parada or parada.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")
+    _validar_estacion_en_planta(parada.estacion_fk, context, db)
+
+    if parada.exclusion_oee == EstadoExclusionOee.PROPUESTA:
+        raise HTTPException(status_code=409, detail="Ya hay una propuesta de exclusión de OEE en curso para esta parada.")
+    if parada.exclusion_oee == EstadoExclusionOee.APROBADA:
+        raise HTTPException(status_code=409, detail="Esta parada ya fue excluida de OEE.")
+
+    parada.exclusion_oee = EstadoExclusionOee.PROPUESTA
+    parada.exclusion_motivo = datos.motivo
+    parada.exclusion_propuesta_por_id = usuario.id
+    parada.exclusion_propuesta_at = datetime.utcnow()
+    # Si venía de un RECHAZADA previo, se re-propone limpio -- una
+    # resolución vieja no debe quedar mezclada con la propuesta nueva.
+    parada.exclusion_resuelta_por_id = None
+    parada.exclusion_resuelta_at = None
+    parada.exclusion_resolucion_nota = None
+
+    db.add(parada)
+    db.commit()
+    db.refresh(parada)
+    return parada
+
+
+@router.post("/paradas/{parada_id}/resolver-exclusion-oee", response_model=ParadaDetectada)
+def resolver_exclusion_oee(
+    parada_id: uuid.UUID,
+    datos: ResolverExclusionOee,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Aprueba o rechaza una propuesta de exclusión de OEE. Sólo
+    Gerencia/SuperAdmin (ROLES_APROBACION_EXCLUSION_OEE) -- y nunca la
+    misma persona que la propuso, aunque tenga ese rol -- ver el
+    comentario de ROLES_APROBACION_EXCLUSION_OEE arriba. Aprobar excluye
+    la parada de _calcular_metricas_oee (analytics.py) en el próximo
+    cálculo -- no hay recómputo retroactivo de reportes ya generados,
+    mismo criterio que el resto de la app (todo cálculo de OEE es
+    on-demand contra los datos vigentes, nunca cacheado)."""
+    validar_planta(context, usuario, db)
+    if usuario.rol not in ROLES_APROBACION_EXCLUSION_OEE:
+        raise HTTPException(status_code=403, detail="No tenés permisos para aprobar o rechazar exclusiones de OEE.")
+
+    parada = db.get(ParadaDetectada, parada_id)
+    if not parada or parada.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")
+    _validar_estacion_en_planta(parada.estacion_fk, context, db)
+
+    if parada.exclusion_oee != EstadoExclusionOee.PROPUESTA:
+        raise HTTPException(status_code=409, detail="Esta parada no tiene una propuesta de exclusión de OEE pendiente.")
+    if parada.exclusion_propuesta_por_id == usuario.id:
+        raise HTTPException(status_code=403, detail="No podés aprobar o rechazar tu propia propuesta de exclusión.")
+
+    parada.exclusion_oee = EstadoExclusionOee.APROBADA if datos.aprobar else EstadoExclusionOee.RECHAZADA
+    parada.exclusion_resuelta_por_id = usuario.id
+    parada.exclusion_resuelta_at = datetime.utcnow()
+    parada.exclusion_resolucion_nota = datos.nota
+
+    db.add(parada)
+    db.commit()
+    db.refresh(parada)
+    return parada
 
 
 @router.delete("/paradas/{parada_id}")
