@@ -284,6 +284,14 @@ class AsignacionTurno(TenantBase, table=True):
     estacion_fk: uuid.UUID = Field(foreign_key="dim_estaciones.id")
     operario_fk: uuid.UUID = Field(foreign_key="dim_operarios.id")
     turno_fk: uuid.UUID = Field(foreign_key="dim_turnos.id")
+    # Fase BZ (auditoría de robustez): antes escanear [SALIR] en la
+    # terminal sólo reseteaba estado local del front -- ningún registro
+    # quedaba del lado del backend. Puramente informativo/auditoría: NO
+    # cambia cómo se resuelve el operario de un evento (eso sigue siendo
+    # por estación+turno+fecha, ver login_operario_terminal en
+    # scans.py) -- formalizar esa resolución por ventana horaria real
+    # sería un cambio de modelo más grande, fuera de este alcance.
+    hora_salida: Optional[datetime] = Field(default=None)
 
 class AsignacionSupervisor(TenantBase, table=True):
     """Regla de supervisión programable (Fase Q -- reemplaza el tablero
