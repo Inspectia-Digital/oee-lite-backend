@@ -39,6 +39,10 @@ class ApiKeyResponse(BaseModel):
     expires_at: datetime
     created_at: datetime
     revoked_at: Optional[datetime] = None
+    # Fase CB (auditoría de robustez, batch 3): trazabilidad de historial.
+    creado_por_id: Optional[uuid.UUID] = None
+    creado_por_nombre: Optional[str] = None
+    ultimo_uso_at: Optional[datetime] = None
 
 
 class ApiKeyCreadaResponse(ApiKeyResponse):
@@ -56,6 +60,11 @@ def _generar_secret() -> str:
 
 def _hashear_secret(secret: str) -> str:
     return bcrypt.hashpw(secret.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _nombre_usuario(usuario: UsuarioSaaS) -> str:
+    completo = " ".join(p for p in [usuario.nombre, usuario.apellido] if p).strip()
+    return completo or usuario.email or "Usuario sin nombre"
 
 
 @router.post("/", response_model=ApiKeyCreadaResponse, status_code=status.HTTP_201_CREATED)
@@ -100,6 +109,8 @@ def emitir_api_key(
         estacion_id=payload.estacion_id,
         activo=True,
         expires_at=datetime.utcnow() + timedelta(days=EXPIRACION_DEFAULT_DIAS),
+        # Fase CB: quién la emitió -- ya autorizado por requerir_gerencia_o_superadmin arriba.
+        creado_por_id=usuario.id,
     )
     db.add(nueva_key)
     db.commit()
@@ -113,6 +124,9 @@ def emitir_api_key(
         expires_at=nueva_key.expires_at,
         created_at=nueva_key.created_at,
         revoked_at=nueva_key.revoked_at,
+        creado_por_id=nueva_key.creado_por_id,
+        creado_por_nombre=_nombre_usuario(usuario),
+        ultimo_uso_at=nueva_key.ultimo_uso_at,
         secret=secret,
         credencial_completa=f"{key_id}.{secret}",
     )
@@ -125,10 +139,37 @@ def listar_api_keys(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
+    """Fase CB: incluye activas Y revocadas -- historial completo, no sólo
+    lo vigente (el filtro "sólo activas" vive en el frontend, no acá).
+    Devuelve además `creado_por_nombre` resuelto con un solo query batch
+    (no N+1) para las keys que tienen `creado_por_id` (las emitidas antes
+    de esta fase no lo tienen, quedan en None)."""
     query = select(ApiKeyDispositivo).where(ApiKeyDispositivo.tenant_id == context.tenant_id)
     if estacion_id:
         query = query.where(ApiKeyDispositivo.estacion_id == estacion_id)
-    return db.exec(query).all()
+    keys = db.exec(query.order_by(ApiKeyDispositivo.created_at.desc())).all()
+
+    creador_ids = {k.creado_por_id for k in keys if k.creado_por_id}
+    nombres_por_id = {}
+    if creador_ids:
+        creadores = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.id.in_(creador_ids))).all()
+        nombres_por_id = {u.id: _nombre_usuario(u) for u in creadores}
+
+    return [
+        ApiKeyResponse(
+            id=k.id,
+            key_id=k.key_id,
+            estacion_id=k.estacion_id,
+            activo=k.activo,
+            expires_at=k.expires_at,
+            created_at=k.created_at,
+            revoked_at=k.revoked_at,
+            creado_por_id=k.creado_por_id,
+            creado_por_nombre=nombres_por_id.get(k.creado_por_id),
+            ultimo_uso_at=k.ultimo_uso_at,
+        )
+        for k in keys
+    ]
 
 
 @router.post("/{api_key_id}/revocar", response_model=ApiKeyResponse)

@@ -511,6 +511,15 @@ class ApiKeyDispositivo(TenantBase, table=True):
     expires_at: datetime
     created_at: datetime = Field(default_factory=datetime.utcnow)
     revoked_at: Optional[datetime] = Field(default=None)
+    # Fase CB (auditoría de robustez, batch 3): trazabilidad de quién
+    # emitió la credencial y si sigue viva. `creado_por_id` opcional
+    # porque las keys emitidas antes de esta fase no tienen ese dato
+    # (no se puede reconstruir retroactivamente). `ultimo_uso_at` lo
+    # actualiza autenticar_dispositivo (auth_m2m.py) con una ventana de
+    # 5 minutos -- ver el comentario ahí sobre por qué NO se escribe en
+    # cada auth (una línea activa autentica un scan por pieza).
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    ultimo_uso_at: Optional[datetime] = Field(default=None)
 
 # ==========================================
 # 5. TRANSACCIONES LEGACY (Retenidas por retrocompatibilidad)

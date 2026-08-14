@@ -12,7 +12,7 @@ Códigos de error según HANDOFF_STG_PRODUCTION_GRADE.md:
 Nunca 404: no confirmar/negar la existencia de recursos a un llamador
 no autenticado.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import bcrypt
@@ -31,6 +31,24 @@ class ContextoDispositivo(BaseModel):
     tenant_id: str
     estacion_id: str
     api_key_id: str
+
+
+# Fase CB (auditoría de robustez, batch 3): ventana de actualización de
+# `ultimo_uso_at` -- una terminal activa autentica un scan POR PIEZA
+# (potencialmente varias por minuto). Escribir la fila en cada auth
+# exitosa multiplicaría la carga de escritura de este hot path sin
+# necesidad real: para "hace cuánto se usó por última vez" alcanza con
+# resolución de minutos, no de milisegundos.
+VENTANA_ULTIMO_USO = timedelta(minutes=5)
+
+
+def _actualizar_ultimo_uso(db: Session, api_key: ApiKeyDispositivo) -> None:
+    ahora = datetime.utcnow()
+    if api_key.ultimo_uso_at and (ahora - api_key.ultimo_uso_at) < VENTANA_ULTIMO_USO:
+        return
+    api_key.ultimo_uso_at = ahora
+    db.add(api_key)
+    db.commit()
 
 
 def autenticar_dispositivo(
@@ -80,6 +98,8 @@ def autenticar_dispositivo(
 
     tenant = db.get(Tenant, api_key.tenant_id)
     verificar_no_suspension_total(tenant)
+
+    _actualizar_ultimo_uso(db, api_key)
 
     return ContextoDispositivo(
         tenant_id=api_key.tenant_id,
