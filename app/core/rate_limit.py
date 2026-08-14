@@ -24,6 +24,8 @@ from fastapi import HTTPException, status
 from sqlalchemy import text
 from sqlmodel import Session
 
+from app.core.errors import ErrorCode
+
 
 def verificar_limite(db: Session, clave: str, *, max_intentos: int, ventana_segundos: int) -> None:
     """Incrementa el contador de `clave` y aborta con 429 si superó
@@ -57,9 +59,12 @@ def verificar_limite(db: Session, clave: str, *, max_intentos: int, ventana_segu
 
     intentos = fila[0] if fila else 1
     if intentos > max_intentos:
+        # Fase CA: código estructurado en el header, `detail` sin cambios
+        # (ver app/core/errors.py -- mismo criterio en todo el módulo).
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Demasiados intentos en poco tiempo. Esperá un momento y volvé a intentar.",
+            headers={"X-Error-Code": ErrorCode.LIMITE_DE_INTENTOS.value},
         )
 
 
