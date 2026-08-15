@@ -54,6 +54,19 @@ def _supervisor_asignado(db, tenant_id, planta_id):
     return sup_usuario
 
 
+def _gerente_asignado(db, tenant_id, planta_id):
+    """Fase DC (coincide con RBAC coherente): gestionar la REGLA de
+    asignación de supervisores (a diferencia de la dotación día a día,
+    que sí es del propio Supervisor) quedó restringido a Gerencia/
+    Producción/SuperAdmin -- ver ROLES_GESTION_ASIGNACION_SUPERVISOR en
+    operacion.py. Los tests de esa regla se autentican con este rol."""
+    from app.models.domain import UsuarioPlanta
+    gerente = crear_usuario(db, tenant_id, RolUsuario.GERENCIA)
+    db.add(UsuarioPlanta(tenant_id=tenant_id, usuario_id=gerente.id, planta_id=planta_id))
+    db.commit()
+    return gerente
+
+
 # ---------- Tablero de dotación (operario ↔ estación) ----------
 
 def test_asignar_dotacion_y_listar(client, db, tenant_a):
@@ -174,8 +187,8 @@ def test_eventos_live_no_cruza_plantas(client, db, tenant_a):
 
 def test_asignar_supervisor_y_listar(client, db, tenant_a):
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date().isoformat()
 
@@ -217,8 +230,8 @@ def test_asignaciones_supervisor_coexisten_si_no_se_superponen_y_delete_las_saca
     db.commit()
     db.refresh(otro_supervisor)
 
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date()
     ayer = hoy - timedelta(days=1)
@@ -260,8 +273,8 @@ def test_asignacion_supervisor_solapada_devuelve_409(client, db, tenant_a):
     db.commit()
     db.refresh(otro_supervisor)
 
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date().isoformat()
     base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "dias_semana": [1, 2, 3, 4, 5], "vigencia_desde": hoy}
@@ -287,8 +300,8 @@ def test_asignacion_supervisor_dias_distintos_no_conflictuan(client, db, tenant_
     db.commit()
     db.refresh(otro_supervisor)
 
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date().isoformat()
     base = {"linea_id": str(linea.id), "turno_id": str(turno.id), "vigencia_desde": hoy}
@@ -301,8 +314,8 @@ def test_asignacion_supervisor_dias_distintos_no_conflictuan(client, db, tenant_
 
 def test_asignacion_supervisor_dia_invalido_devuelve_422(client, db, tenant_a):
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
 
     r = client.post(
@@ -318,8 +331,8 @@ def test_asignacion_supervisor_dia_invalido_devuelve_422(client, db, tenant_a):
 
 def test_asignacion_supervisor_vigencia_hasta_antes_de_desde_devuelve_400(client, db, tenant_a):
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date()
 
@@ -339,8 +352,8 @@ def test_listar_asignaciones_supervisor_filtra_por_fecha_vigente(client, db, ten
     """GET con `fecha` filtra a las reglas realmente vigentes ese día
     (vigencia + día de semana), no a todas las reglas del tenant."""
     planta, linea, _, turno, _, supervisor = _armar_planta_completa(db, tenant_a)
-    sup_usuario = _supervisor_asignado(db, tenant_a, planta.id)
-    autenticar_como(sup_usuario.id)
+    gerente = _gerente_asignado(db, tenant_a, planta.id)
+    autenticar_como(gerente.id)
     headers = {"X-Sub-Tenant-Id": str(planta.id)}
     hoy = datetime.utcnow().date()
 

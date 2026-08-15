@@ -16,7 +16,7 @@ from sqlmodel import Session, select
 from app.core.auth import TenantContext, get_usuario_actual, obtener_contexto_tenant_humano
 from app.core.database import get_session
 from app.core.pagination import aplicar_paginacion
-from app.core.rbac import requerir_gerencia_o_superadmin
+from app.core.rbac import requerir_gerencia_o_superadmin, requerir_gerencia_produccion_o_superadmin
 from app.models.domain import Operario, Supervisor, UsuarioSaaS
 
 router = APIRouter(prefix="/config", tags=["Personas"])
@@ -168,7 +168,9 @@ def crear_supervisor(
     payload: SupervisorCreate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    # Fase DC: Producción se suma a Gerencia/SuperAdmin -- gestión de
+    # supervisores (no de operarios, que sigue igual arriba).
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     existente = db.exec(
         select(Supervisor).where(
@@ -224,7 +226,9 @@ def actualizar_supervisor(
     payload: SupervisorUpdate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    # Fase DC: mismo endpoint que usa "vincular a usuario web" (PATCH con
+    # sólo usuario_id) -- Producción también puede vincular/desvincular.
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     supervisor = db.exec(select(Supervisor).where(Supervisor.id == supervisor_id, Supervisor.tenant_id == context.tenant_id)).first()
     if not supervisor:
@@ -259,7 +263,7 @@ def desactivar_supervisor(
     supervisor_id: uuid.UUID,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     supervisor = db.exec(select(Supervisor).where(Supervisor.id == supervisor_id, Supervisor.tenant_id == context.tenant_id)).first()
     if not supervisor:

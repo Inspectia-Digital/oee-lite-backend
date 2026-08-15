@@ -50,6 +50,17 @@ ROLES_SUPERVISION_COMPLETA = (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsu
 # Producción puede aprobar su propia propuesta.
 ROLES_APROBACION_EXCLUSION_OEE = (RolUsuario.PRODUCCION, RolUsuario.GERENCIA, RolUsuario.SUPERADMIN)
 
+# Fase DC (pedido del usuario, coherencia de RBAC): quién gestiona la
+# REGLA de asignación de supervisores (qué supervisor cubre qué línea/
+# turno/días) -- deliberadamente más angosto que ROLES_SUPERVISION_COMPLETA
+# (que incluye Supervisor, porque esa constante gatea acciones operativas
+# del día a día que un supervisor sí debe poder hacer, como clasificar
+# paradas). Decidir QUIÉN es supervisor de qué línea es una decisión de
+# gestión, no operativa -- un supervisor no debería poder autoasignarse
+# ni reasignar a otros. Antes esto vivía adentro de
+# ROLES_SUPERVISION_COMPLETA por descuido, no por diseño.
+ROLES_GESTION_ASIGNACION_SUPERVISOR = (RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN)
+
 class ClasificarParada(BaseModel):
     motivo_fk: uuid.UUID
 
@@ -949,7 +960,7 @@ def listar_asignaciones_supervisor(
     exacto (vigencia_desde/hasta + día de semana) -- por ejemplo, para
     resolver "quién cubre este turno tal día"."""
     validar_planta(context, usuario, db)
-    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+    if usuario.rol not in ROLES_GESTION_ASIGNACION_SUPERVISOR:
         raise HTTPException(status_code=403, detail="No tenés permisos para ver la asignación de supervisores.")
     query = select(AsignacionSupervisor).where(AsignacionSupervisor.tenant_id == context.tenant_id)
     if linea_id:
@@ -975,7 +986,7 @@ def asignar_supervisor(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
-    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+    if usuario.rol not in ROLES_GESTION_ASIGNACION_SUPERVISOR:
         raise HTTPException(status_code=403, detail="No tenés permisos para asignar supervisores.")
     _validar_linea_en_planta(payload.linea_id, context, db)
 
@@ -1041,7 +1052,7 @@ def eliminar_asignacion_supervisor(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
-    if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
+    if usuario.rol not in ROLES_GESTION_ASIGNACION_SUPERVISOR:
         raise HTTPException(status_code=403, detail="No tenés permisos para eliminar una asignación de supervisor.")
     regla = db.exec(
         select(AsignacionSupervisor).where(

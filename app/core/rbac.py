@@ -24,3 +24,12 @@ def requerir_roles(*roles_permitidos: RolUsuario):
 
 requerir_gerencia_o_superadmin = requerir_roles(RolUsuario.SUPERADMIN, RolUsuario.GERENCIA)
 requerir_superadmin = requerir_roles(RolUsuario.SUPERADMIN)
+
+# Fase DC (pedido del usuario, coherencia de RBAC): gestión de SUPERVISORES
+# (crear/editar/desactivar el registro de la persona, vincularla a un
+# usuario web) -- antes sólo Gerencia/SuperAdmin, ahora también Producción.
+# Deliberadamente sin RolUsuario.SUPERVISOR: un supervisor no debe poder
+# gestionar el alta de otros supervisores.
+requerir_gerencia_produccion_o_superadmin = requerir_roles(
+    RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION,
+)
