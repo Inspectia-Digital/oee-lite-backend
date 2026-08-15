@@ -156,6 +156,42 @@ def test_gerencia_puede_rechazar_exclusion(client, db, tenant_a):
     assert r.json()["exclusion_oee"] == "rechazada"
 
 
+def test_produccion_puede_aprobar_exclusion_propuesta_por_otro(client, db, tenant_a):
+    """Fase CP (auditoría de frontend, P0-05): Producción se agrega a la
+    matriz de aprobadores -- confirmado con el usuario, la restricción a
+    sólo Gerencia/SuperAdmin de Fase CC era más angosta de lo que el
+    negocio quería."""
+    planta, _, estacion = _preparar_escenario(db, tenant_a)
+    parada = _crear_parada(db, tenant_a, estacion.id)
+    encargado = _usuario_con_planta(db, tenant_a, RolUsuario.ENCARGADO, planta.id)
+    produccion = _usuario_con_planta(db, tenant_a, RolUsuario.PRODUCCION, planta.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+
+    autenticar_como(encargado.id)
+    client.post(f"/supervisor/paradas/{parada.id}/proponer-exclusion-oee", json={"motivo": "Falso positivo."}, headers=headers)
+
+    autenticar_como(produccion.id)
+    r = client.post(f"/supervisor/paradas/{parada.id}/resolver-exclusion-oee", json={"aprobar": True}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["exclusion_oee"] == "aprobada"
+    assert r.json()["exclusion_resuelta_por_id"] == str(produccion.id)
+
+
+def test_produccion_no_puede_autoaprobar_la_propia_propuesta(client, db, tenant_a):
+    """Mismo control de dos personas que ya vale para Gerencia -- Producción
+    tampoco puede aprobar su propia propuesta."""
+    planta, _, estacion = _preparar_escenario(db, tenant_a)
+    parada = _crear_parada(db, tenant_a, estacion.id)
+    produccion = _usuario_con_planta(db, tenant_a, RolUsuario.PRODUCCION, planta.id)
+    headers = {"X-Sub-Tenant-Id": str(planta.id)}
+
+    autenticar_como(produccion.id)
+    client.post(f"/supervisor/paradas/{parada.id}/proponer-exclusion-oee", json={"motivo": "Falso positivo."}, headers=headers)
+
+    r = client.post(f"/supervisor/paradas/{parada.id}/resolver-exclusion-oee", json={"aprobar": True}, headers=headers)
+    assert r.status_code == 403
+
+
 def test_supervisor_no_puede_aprobar_exclusion(client, db, tenant_a):
     """ROLES_APROBACION_EXCLUSION_OEE es más angosto que ROLES_SUPERVISION_COMPLETA
     a propósito -- Supervisor puede proponer, no aprobar."""

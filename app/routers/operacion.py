@@ -42,7 +42,13 @@ ROLES_SUPERVISION_COMPLETA = (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsu
 # rol, el endpoint bloquea explícitamente la auto-aprobación (que el
 # aprobador sea la misma persona que propuso), que es la propiedad real
 # que "control de dos personas" busca.
-ROLES_APROBACION_EXCLUSION_OEE = (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN)
+#
+# Fase CP (auditoría de frontend, P0-05): Producción se agrega a la
+# matriz de aprobadores -- la restricción a sólo Gerencia/SuperAdmin de
+# Fase CC era más angosta de lo que el negocio quería (confirmado con el
+# usuario). El bloqueo de auto-aprobación sigue exactamente igual: ni
+# Producción puede aprobar su propia propuesta.
+ROLES_APROBACION_EXCLUSION_OEE = (RolUsuario.PRODUCCION, RolUsuario.GERENCIA, RolUsuario.SUPERADMIN)
 
 class ClasificarParada(BaseModel):
     motivo_fk: uuid.UUID
