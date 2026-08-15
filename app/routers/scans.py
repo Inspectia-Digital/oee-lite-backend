@@ -118,7 +118,14 @@ def validar_estacion_terminal(
         "estacion_id": str(estacion.id),
         "estacion_nombre": estacion.nombre,
         "tipo_produccion": linea.tipo_produccion if linea else "discreta",
-        "modo_asignacion_operarios": modo_asignacion
+        "modo_asignacion_operarios": modo_asignacion,
+        # Fase CM (auditoría de frontend, P0-02): el frontend necesita
+        # saber a qué planta pertenece la estación de ESTE dispositivo
+        # para poder comparar contra los permisos del humano logueado en
+        # el navegador de la terminal -- la credencial M2M ya está
+        # autorizada (chequeo de arriba), esto es sólo para que la UI no
+        # deje operar a alguien sin asignación real a esa planta.
+        "planta_id": str(linea.planta_id) if linea else None,
     }
 
 @router.post("/scans", status_code=status.HTTP_201_CREATED)
