@@ -175,6 +175,36 @@ def clasificar_parada(
     db.refresh(parada)
     return parada
 
+@router.patch("/paradas/{parada_id}/desclasificar", response_model=ParadaDetectada)
+def desclasificar_parada(
+    parada_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Fase CQ (auditoría de frontend, P0-07): revierte una clasificación
+    -- la parada vuelve a PENDIENTE, se limpia motivo_fk/clasificado_por_id.
+    Pensado para el "Deshacer" del snackbar de modo planta (ventana corta
+    tras clasificar, no un "reabrir" administrativo separado) -- mismo
+    nivel de permiso que clasificar_parada, sin rol adicional: quien
+    puede clasificar puede deshacer su propia acción reciente."""
+    validar_planta(context, usuario, db)
+    parada = db.get(ParadaDetectada, parada_id)
+    if not parada or parada.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa")
+    _validar_estacion_en_planta(parada.estacion_fk, context, db)
+    if parada.estado != EstadoParada.CLASIFICADA:
+        raise HTTPException(status_code=409, detail="La parada no está clasificada -- no hay nada que deshacer.")
+
+    parada.estado = EstadoParada.PENDIENTE
+    parada.motivo_fk = None
+    parada.clasificado_por_id = None
+
+    db.add(parada)
+    db.commit()
+    db.refresh(parada)
+    return parada
+
 @router.post("/paradas/planificadas", response_model=ParadaDetectada)
 def registrar_parada_planificada(
     datos: ParadaPlanificadaCreate,
