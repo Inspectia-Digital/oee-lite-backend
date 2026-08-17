@@ -5,8 +5,9 @@ navegador de la terminal (ver TerminalPage.tsx) -- la credencial M2M ya
 prueba que el dispositivo está autorizado; esto es aparte, para que la
 UI no deje operar a un humano sin asignación real a esa planta."""
 import uuid
+from datetime import time
 
-from app.models.domain import Estacion, Linea, Planta
+from app.models.domain import Estacion, Linea, Planta, Turno
 from tests.conftest import autenticar_como
 
 
@@ -65,3 +66,48 @@ def test_validar_estacion_planta_id_distingue_dos_plantas(client, db, tenant_a, 
     assert r_a.json()["planta_id"] == str(planta_a.id)
     assert r_b.json()["planta_id"] == str(planta_b.id)
     assert r_a.json()["planta_id"] != r_b.json()["planta_id"]
+
+
+def test_validar_estacion_devuelve_el_contrato_que_espera_el_frontend(client, db, tenant_a, gerente_a):
+    """Bug real (investigado a partir de un reporte externo): la respuesta
+    traía `estacion_id`/`estacion_nombre` planos y `modo_asignacion_operarios`
+    plano, sin `turnos` -- el frontend (EstacionValidada, oee-lite/src/types/
+    api.ts) siempre esperó `id`/`nombre`, `configuracion.modo_asignacion_operarios`
+    anidado y `turnos[]`, y no hay ninguna capa intermedia que traduzca. En
+    producción real esto hacía que todo POST /scans mandara `id_estacion:
+    undefined` (422) y que el paso de login de operario se saltara en
+    silencio. Este test fija el contrato correcto."""
+    estacion, planta = _crear_estacion_con_planta(db, tenant_a)
+    turno = Turno(
+        tenant_id=tenant_a, nombre="Mañana", hora_inicio=time(6, 0), hora_fin=time(14, 0),
+        linea_id=estacion.linea_id, activo=True,
+    )
+    turno_inactivo = Turno(
+        tenant_id=tenant_a, nombre="Discontinuado", hora_inicio=time(22, 0), hora_fin=time(6, 0),
+        linea_id=estacion.linea_id, activo=False,
+    )
+    db.add(turno)
+    db.add(turno_inactivo)
+    db.commit()
+    credencial = _emitir_api_key(client, gerente_a, estacion.id)
+
+    r = client.get(
+        f"/api/lite/estaciones/{estacion.id}/validar",
+        headers={"X-Device-Key": credencial},
+    )
+    assert r.status_code == 200
+    body = r.json()
+
+    assert body["id"] == str(estacion.id)
+    assert body["nombre"] == estacion.nombre
+    assert "estacion_id" not in body
+    assert "estacion_nombre" not in body
+
+    assert "configuracion" in body
+    assert body["configuracion"]["modo_asignacion_operarios"]
+
+    assert len(body["turnos"]) == 1
+    assert body["turnos"][0]["id"] == str(turno.id)
+    assert body["turnos"][0]["nombre"] == "Mañana"
+    assert body["turnos"][0]["hora_inicio"] == "06:00"
+    assert body["turnos"][0]["hora_fin"] == "14:00"
