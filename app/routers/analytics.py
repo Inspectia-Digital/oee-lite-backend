@@ -368,15 +368,19 @@ def obtener_oee_general(
       (None) y se excluye del producto OEE -- nunca se reemplaza por
       100% ni 0%.
 
-    Limitación conocida y documentada: para Calidad por tiempo, resolver
-    MaestroSKU.umbral_calidad POR EVENTO (el SKU real que corría en ese
-    momento) está pendiente -- hoy usa un fallback fijo (ver
-    UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG más abajo). Implementarlo bien
-    requeriría otro snapshot inmutable por evento (igual que
-    tiempo_ideal_seg), y hoy ningún dato real ejercita este camino
-    (no hay estaciones tipo "calidad" en los tenants existentes). Nota
-    Fase AC: Estación ya NO tiene ningún umbral propio (ver domain.py) --
-    antes este camino usaba estacion.umbral_alerta, que dejó de existir.
+    Fase DS (auditoría de backend, P0-03): Calidad por tiempo resuelve
+    MaestroSKU.umbral_calidad del SKU real de cada evento (vía
+    orden_fk -> OrdenProduccion.sku_fk), con UMBRAL_CALIDAD_POR_TIEMPO_
+    FALLBACK_SEG sólo como último recurso si el evento no tiene
+    orden/SKU resoluble. Deuda documentada pendiente: es una resolución
+    en tiempo de consulta (umbral VIGENTE), no un snapshot inmutable por
+    evento (a diferencia de tiempo_ideal_seg) -- editar el umbral de un
+    SKU más adelante recalcula la calidad histórica de sus eventos
+    por_tiempo con el valor nuevo. Persistir el snapshot real (columna
+    en LiteEventoProduccion, poblada en scans.py) queda para una fase
+    aparte, toca el hot path de ingesta. Nota Fase AC: Estación ya NO
+    tiene ningún umbral propio (ver domain.py) -- antes este camino
+    usaba estacion.umbral_alerta, que dejó de existir.
     """
     try:
         validar_planta(context)
@@ -611,14 +615,63 @@ def _calcular_metricas_oee(
     unidades_calidad_total = 0
     total_rechazadas = sum(e.unidades_rechazadas for e, _, _ in eventos)
 
+    # Fase DS (auditoría de backend, P0-03): resuelve el umbral real del
+    # SKU que corría en cada evento (evento.orden_fk -> OrdenProduccion.
+    # sku_fk -> MaestroSKU.umbral_calidad) en vez del fallback fijo de
+    # antes -- mismo patrón de resolución batch (no N+1) que ya usa el
+    # filtro sku_fk más arriba en esta misma función. UMBRAL_CALIDAD_POR_
+    # TIEMPO_FALLBACK_SEG queda como último recurso sólo si el evento no
+    # tiene orden/SKU resoluble (dato incompleto, Fase 1.3).
+    #
+    # Nota (deuda documentada, no resuelta acá): esto resuelve el umbral
+    # VIGENTE de MaestroSKU al momento de la consulta, no un snapshot
+    # inmutable tomado en el momento del escaneo (a diferencia de
+    # tiempo_ideal_seg, que sí es snapshot). Si alguien edita
+    # MaestroSKU.umbral_calidad más adelante, la calidad histórica de
+    # eventos por_tiempo recalcula con el valor nuevo, no con el que
+    # regía cuando pasó el evento. Persistir un snapshot real (columna
+    # nueva en LiteEventoProduccion, poblada en scans.py como ya se hace
+    # con tiempo_ideal_seg) es el fix completo -- se deja para una fase
+    # aparte porque toca el hot path de ingesta, no sólo lectura.
+    ids_orden_calidad = {
+        evento.orden_fk
+        for evento, estacion, linea in eventos
+        if linea.metodo_calidad == "por_tiempo" and estacion.tipo.lower() == "calidad" and evento.orden_fk
+    }
+    umbral_por_id_orden: dict[str, float] = {}
+    if ids_orden_calidad:
+        ordenes_calidad = db.exec(
+            select(OrdenProduccion.id_orden, OrdenProduccion.sku_fk).where(
+                OrdenProduccion.tenant_id == context.tenant_id,
+                OrdenProduccion.id_orden.in_(ids_orden_calidad),
+                OrdenProduccion.sku_fk.is_not(None),
+            )
+        ).all()
+        skus_calidad = {sku_fk for _, sku_fk in ordenes_calidad if sku_fk}
+        umbral_por_sku: dict[str, float] = {}
+        if skus_calidad:
+            umbral_por_sku = dict(
+                db.exec(
+                    select(MaestroSKU.codigo_sku, MaestroSKU.umbral_calidad).where(
+                        MaestroSKU.tenant_id == context.tenant_id,
+                        MaestroSKU.codigo_sku.in_(skus_calidad),
+                    )
+                ).all()
+            )
+        umbral_por_id_orden = {
+            id_orden: umbral_por_sku[sku_fk]
+            for id_orden, sku_fk in ordenes_calidad
+            if sku_fk in umbral_por_sku
+        }
+
     for evento, estacion, linea in eventos:
         if linea.metodo_calidad == "por_rechazo":
             unidades_calidad_total += evento.unidades_procesadas
             unidades_buenas_total += (evento.unidades_procesadas - evento.unidades_rechazadas)
         elif linea.metodo_calidad == "por_tiempo" and estacion.tipo.lower() == "calidad":
-            # Limitación documentada en obtener_oee_general: debería resolver
-            # MaestroSKU.umbral_calidad del SKU real del evento, no un fallback fijo.
-            umbral_calidad_aplicable = UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG
+            umbral_calidad_aplicable = umbral_por_id_orden.get(
+                evento.orden_fk, UMBRAL_CALIDAD_POR_TIEMPO_FALLBACK_SEG
+            )
             unidades_calidad_total += evento.unidades_procesadas
             if (evento.delta_t_segundos or 0) <= umbral_calidad_aplicable:
                 unidades_buenas_total += evento.unidades_procesadas

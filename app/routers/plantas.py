@@ -1,9 +1,10 @@
 import uuid
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
@@ -12,16 +13,42 @@ from app.models.domain import Planta, UsuarioSaaS, RolUsuario
 
 router = APIRouter(prefix="/accesos", tags=["Organización Física"])
 
+
+def _validar_timezone_iana(v: str) -> str:
+    """Fase DP (auditoría de backend, P1-03): antes `timezone` se
+    persistía tal cual, sin validar contra la base IANA -- un typo
+    ("Norteamerica/Mexico") se guardaba sin error y rompía en silencio
+    cualquier cálculo de fecha/turno que dependiera de esa planta
+    (login/logout de operario, recómputo, dashboard)."""
+    try:
+        ZoneInfo(v)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise ValueError(f"'{v}' no es un timezone IANA válido (ej: 'America/Buenos_Aires').")
+    return v
+
+
 class PlantaCreate(BaseModel):
     nombre: str
     ubicacion: str = "N/A"
     timezone: str = "America/Buenos_Aires"
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_valido(cls, v: str) -> str:
+        return _validar_timezone_iana(v)
 
 class PlantaUpdate(BaseModel):
     nombre: Optional[str] = None
     ubicacion: Optional[str] = None
     timezone: Optional[str] = None
     activo: Optional[bool] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_valido(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validar_timezone_iana(v)
 
 
 def _serializar(p: Planta) -> dict:
