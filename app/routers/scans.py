@@ -114,11 +114,48 @@ def validar_estacion_terminal(
     if modo_asignacion == ModoAsignacionOperariosEstacion.HEREDAR and linea:
         modo_asignacion = linea.modo_asignacion_operarios
 
+    # Bug real (encontrado al investigar por qué el kiosco nunca resolvía
+    # turno): esta respuesta traía `estacion_id`/`estacion_nombre` planos y
+    # `modo_asignacion_operarios` plano, sin `turnos` -- el frontend
+    # (EstacionValidada, types/api.ts) siempre esperó `id`/`nombre`,
+    # `configuracion.modo_asignacion_operarios` anidado y `turnos[]` (así
+    # documentado en oee-lite/docs/BACKEND_REQUIREMENTS.md), y no existe
+    # ninguna capa intermedia que traduzca -- apiFetch<EstacionValidada>
+    # tipaba la respuesta cruda sin transformarla. En producción real
+    # (fuera de modo mock) esto rompía la terminal en cascada: `est.id`
+    # undefined viajaba como `id_estacion` en cada POST /scans (422 en
+    # todo escaneo), y `est.configuracion` undefined hacía que el modo de
+    # asignación cayera siempre al default "manual" del front, saltando en
+    # silencio el paso de login de operario aunque la estación estuviera
+    # configurada como "escaneo". Turnos de la línea a la que pertenece la
+    # estación (mismo criterio de herencia que modo_asignacion_operarios:
+    # el turno es de la línea, no de la estación puntual); sólo activos.
+    turnos = db.exec(
+        select(Turno)
+        .where(
+            Turno.tenant_id == dispositivo.tenant_id,
+            Turno.linea_id == estacion.linea_id,
+            Turno.activo == True,  # noqa: E712
+        )
+        .order_by(Turno.hora_inicio)
+    ).all() if linea else []
+
     return {
-        "estacion_id": str(estacion.id),
-        "estacion_nombre": estacion.nombre,
+        "id": str(estacion.id),
+        "nombre": estacion.nombre,
         "tipo_produccion": linea.tipo_produccion if linea else "discreta",
-        "modo_asignacion_operarios": modo_asignacion,
+        "configuracion": {
+            "modo_asignacion_operarios": modo_asignacion,
+        },
+        "turnos": [
+            {
+                "id": str(t.id),
+                "nombre": t.nombre,
+                "hora_inicio": t.hora_inicio.strftime("%H:%M"),
+                "hora_fin": t.hora_fin.strftime("%H:%M"),
+            }
+            for t in turnos
+        ],
         # Fase CM (auditoría de frontend, P0-02): el frontend necesita
         # saber a qué planta pertenece la estación de ESTE dispositivo
         # para poder comparar contra los permisos del humano logueado en
