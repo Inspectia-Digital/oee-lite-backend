@@ -4,7 +4,7 @@ from sqlalchemy import func
 import uuid
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
@@ -24,13 +24,24 @@ router_asignaciones_supervisor = APIRouter(prefix="/asignaciones", tags=["Operac
 # Rol "Encargado" (pedido explícito del usuario): intermedio entre
 # Supervisor y Operario -- tiene cuenta web, pero sólo puede ver/clasificar
 # paradas (obtener_paradas_pendientes, clasificar_parada,
-# listar_historial_paradas -- sin chequeo de rol, alcanza con planta
-# asignada, igual que siempre). Todo lo demás en este archivo (dotación,
+# listar_historial_paradas). Todo lo demás en este archivo (dotación,
 # asignación de supervisores, avanzar Plan, paradas planificadas) usa esta
 # constante para excluirlo explícitamente -- antes esos endpoints no
 # chequeaban rol en absoluto, sólo pertenencia a la planta (validar_planta),
 # así que agregar el rol nuevo sin este guard le habría dado acceso a todo.
 ROLES_SUPERVISION_COMPLETA = (RolUsuario.SUPERVISOR, RolUsuario.GERENCIA, RolUsuario.PRODUCCION, RolUsuario.SUPERADMIN)
+
+# Fase DR (auditoría de backend, P0-02): piso mínimo de rol para TODO lo
+# relacionado con paradas (ver/clasificar/desclasificar/proponer
+# exclusión/historial) -- antes estos endpoints sólo chequeaban
+# pertenencia a la planta (validar_planta), sin piso de rol, así que
+# cualquier UsuarioSaaS con UsuarioPlanta activo entraba, Operario
+# incluido. Por diseño Operario no debería tener cuenta web propia (ver
+# comentario de RolUsuario.OPERARIO en domain.py), pero nada en el
+# backend lo impedía a nivel de creación de usuario -- esto es la
+# defensa en profundidad que faltaba. Encargado sí entra (es justo el
+# piso pensado para él).
+MIN_ROLE_PARADAS = (RolUsuario.ENCARGADO,) + ROLES_SUPERVISION_COMPLETA
 
 # Fase CC (FE-P0-08): quién puede APROBAR/RECHAZAR una propuesta de
 # exclusión de OEE -- deliberadamente más angosto que
@@ -139,6 +150,8 @@ def obtener_paradas_pendientes(
 ):
     """Obtiene paradas huérfanas filtradas estrictamente por la Planta activa[cite: 13]."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver paradas.")
 
     query = (
         select(ParadaDetectada)
@@ -161,6 +174,8 @@ def clasificar_parada(
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
     validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para clasificar paradas.")
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa[cite: 13]")
@@ -197,9 +212,11 @@ def desclasificar_parada(
     -- la parada vuelve a PENDIENTE, se limpia motivo_fk/clasificado_por_id.
     Pensado para el "Deshacer" del snackbar de modo planta (ventana corta
     tras clasificar, no un "reabrir" administrativo separado) -- mismo
-    nivel de permiso que clasificar_parada, sin rol adicional: quien
-    puede clasificar puede deshacer su propia acción reciente."""
+    nivel de permiso que clasificar_parada (Fase DR: MIN_ROLE_PARADAS):
+    quien puede clasificar puede deshacer su propia acción reciente."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para deshacer una clasificación.")
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa")
@@ -242,17 +259,51 @@ def registrar_parada_planificada(
 
     if "planificada" not in str(motivo.tipo_parada).lower():
         raise HTTPException(status_code=400, detail="El motivo seleccionado no es PLANIFICADA[cite: 13]")
-    
-    duracion = (datos.fin - datos.inicio).total_seconds()
+
+    # Fase DQ (auditoría de backend, P1-04): `datos.inicio`/`fin` pueden
+    # llegar naive o timezone-aware según cómo el cliente serialice el
+    # ISO string -- se normalizan una sola vez acá a naive-UTC (mismo
+    # criterio que el resto del backend persiste, ver `parada.inicio` de
+    # eliminar_parada_planificada más abajo) para que todas las
+    # comparaciones de esta función (contra datetime.utcnow(), siempre
+    # naive, y contra columnas ya persistidas) sean consistentes.
+    inicio = datos.inicio.astimezone(timezone.utc).replace(tzinfo=None) if datos.inicio.tzinfo else datos.inicio
+    fin = datos.fin.astimezone(timezone.utc).replace(tzinfo=None) if datos.fin.tzinfo else datos.fin
+
+    duracion = (fin - inicio).total_seconds()
     if duracion <= 0:
          raise HTTPException(status_code=400, detail="La fecha de fin debe ser mayor a la de inicio[cite: 13]")
+
+    # "programar" una parada significa que todavía no pasó -- antes se
+    # podía crear con `inicio` en el pasado sin ningún rechazo.
+    if inicio <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="La fecha de inicio de una parada planificada debe ser futura.")
+
+    # No permitir dos paradas planificadas superpuestas en la misma
+    # estación -- overlap clásico de intervalos ([inicio,fin) se cruza
+    # con [inicio,fin) existente). Sólo mira origen=PLANIFICADA: una
+    # AUTOMATICA real no bloquea agendar algo a futuro.
+    solapada = db.exec(
+        select(ParadaDetectada).where(
+            ParadaDetectada.tenant_id == context.tenant_id,
+            ParadaDetectada.estacion_fk == datos.estacion_fk,
+            ParadaDetectada.origen == "PLANIFICADA",
+            ParadaDetectada.inicio < fin,
+            ParadaDetectada.fin > inicio,
+        )
+    ).first()
+    if solapada:
+        raise HTTPException(
+            status_code=409,
+            detail="Ya hay una parada planificada que se superpone con ese rango en esta estación.",
+        )
 
     nueva_parada = ParadaDetectada(
         tenant_id=context.tenant_id,
         estacion_fk=datos.estacion_fk,
         motivo_fk=motivo.id,
-        inicio=datos.inicio,
-        fin=datos.fin,
+        inicio=inicio,
+        fin=fin,
         duracion_segundos=duracion,
         estado=EstadoParada.CLASIFICADA,
         origen="PLANIFICADA",
@@ -293,6 +344,8 @@ def listar_historial_paradas(
     Sin filtros, trae todo (paginado). Misma planta activa que el resto
     de /supervisor."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver el historial de paradas.")
     if not (1 <= limit <= 500):
         raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 500.")
     if offset < 0:
@@ -381,11 +434,13 @@ def proponer_exclusion_oee(
     """Propone que una parada NO representa una pérdida real (falso
     positivo -- glitch de sensor, corte de red, etc.) y por lo tanto debe
     excluirse del cálculo de OEE. Mismo gate que clasificar_parada
-    (validar_planta, sin restricción de rol adicional -- Encargado
-    incluido): es la misma persona, en el mismo momento, revisando la
-    misma parada. No excluye nada por sí sola -- queda PROPUESTA hasta
-    que un segundo usuario la apruebe (ver resolver_exclusion_oee)."""
+    (Fase DR: MIN_ROLE_PARADAS -- Encargado incluido): es la misma
+    persona, en el mismo momento, revisando la misma parada. No excluye
+    nada por sí sola -- queda PROPUESTA hasta que un segundo usuario la
+    apruebe (ver resolver_exclusion_oee)."""
     validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para proponer una exclusión de OEE.")
     parada = db.get(ParadaDetectada, parada_id)
     if not parada or parada.tenant_id != context.tenant_id:
         raise HTTPException(status_code=404, detail="Parada no encontrada en su empresa.")

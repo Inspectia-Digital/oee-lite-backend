@@ -246,6 +246,81 @@ def test_encargado_no_puede_avanzar_plan(client, db, tenant_a):
     assert r.status_code == 403
 
 
+# ---------- Fase DR (auditoría de backend, P0-02): Operario no accede a paradas ----------
+# Por diseño Operario no debería tener cuenta web (ver comentario de
+# RolUsuario.OPERARIO en domain.py), pero nada en el backend lo impedía
+# a nivel de creación de usuario -- MIN_ROLE_PARADAS es la defensa en
+# profundidad para el caso en que igual exista uno.
+
+def test_operario_no_puede_ver_paradas_pendientes(client, db, tenant_a):
+    planta, linea, estacion, *_ = _preparar_escenario(db, tenant_a)
+    _crear_parada_pendiente(db, tenant_a, estacion.id)
+    operario_usuario = _usuario_con_planta(db, tenant_a, RolUsuario.OPERARIO, planta.id)
+    autenticar_como(operario_usuario.id)
+
+    r = client.get("/supervisor/paradas-pendientes", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    assert r.status_code == 403
+
+
+def test_operario_no_puede_clasificar_parada(client, db, tenant_a):
+    planta, linea, estacion, *_ = _preparar_escenario(db, tenant_a)
+    parada, motivo = _crear_parada_pendiente(db, tenant_a, estacion.id)
+    operario_usuario = _usuario_con_planta(db, tenant_a, RolUsuario.OPERARIO, planta.id)
+    autenticar_como(operario_usuario.id)
+
+    r = client.patch(
+        f"/supervisor/paradas/{parada.id}/clasificar",
+        json={"motivo_fk": str(motivo.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 403
+
+
+def test_operario_no_puede_ver_historial_paradas(client, db, tenant_a):
+    planta, linea, estacion, *_ = _preparar_escenario(db, tenant_a)
+    _crear_parada_pendiente(db, tenant_a, estacion.id)
+    operario_usuario = _usuario_con_planta(db, tenant_a, RolUsuario.OPERARIO, planta.id)
+    autenticar_como(operario_usuario.id)
+
+    r = client.get("/supervisor/paradas", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    assert r.status_code == 403
+
+
+def test_operario_no_puede_proponer_exclusion_oee(client, db, tenant_a):
+    planta, linea, estacion, *_ = _preparar_escenario(db, tenant_a)
+    parada, motivo = _crear_parada_pendiente(db, tenant_a, estacion.id)
+    parada.estado = EstadoParada.CLASIFICADA
+    parada.motivo_fk = motivo.id
+    db.add(parada)
+    db.commit()
+    operario_usuario = _usuario_con_planta(db, tenant_a, RolUsuario.OPERARIO, planta.id)
+    autenticar_como(operario_usuario.id)
+
+    r = client.post(
+        f"/supervisor/paradas/{parada.id}/proponer-exclusion-oee",
+        json={"motivo": "Glitch de sensor"},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 403
+
+
+def test_operario_no_puede_desclasificar_parada(client, db, tenant_a):
+    planta, linea, estacion, *_ = _preparar_escenario(db, tenant_a)
+    parada, motivo = _crear_parada_pendiente(db, tenant_a, estacion.id)
+    parada.estado = EstadoParada.CLASIFICADA
+    parada.motivo_fk = motivo.id
+    db.add(parada)
+    db.commit()
+    operario_usuario = _usuario_con_planta(db, tenant_a, RolUsuario.OPERARIO, planta.id)
+    autenticar_como(operario_usuario.id)
+
+    r = client.patch(
+        f"/supervisor/paradas/{parada.id}/desclasificar",
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 403
+
+
 # ---------- Regresión: los roles existentes siguen teniendo acceso ----------
 
 def test_supervisor_sigue_pudiendo_asignar_y_ver_dotacion(client, db, tenant_a):
