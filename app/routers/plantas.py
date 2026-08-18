@@ -8,7 +8,7 @@ from pydantic import BaseModel, field_validator
 
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
-from app.core.rbac import requerir_gerencia_o_superadmin
+from app.core.rbac import requerir_gerencia_produccion_o_superadmin
 from app.models.domain import Planta, UsuarioSaaS, RolUsuario
 
 router = APIRouter(prefix="/accesos", tags=["Organización Física"])
@@ -94,10 +94,15 @@ def crear_planta(
     payload: PlantaCreate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     """Crea una nueva planta física aislada bajo el Tenant actual.
-    Antes cualquier usuario autenticado podía crear una planta (sin RBAC); corregido."""
+    Antes cualquier usuario autenticado podía crear una planta (sin RBAC); corregido.
+
+    P1-A (PRD Go-Live Green Mills): Producción también puede crear/editar
+    plantas (incluido cambiar timezone) -- mismo criterio ya establecido
+    en Fase DC para gestión de supervisores (requerir_gerencia_produccion_
+    o_superadmin, app/core/rbac.py)."""
     nueva_planta = Planta(
         tenant_id=context.tenant_id,
         nombre=payload.nombre,
@@ -116,7 +121,7 @@ def actualizar_planta(
     payload: PlantaUpdate,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     planta = db.exec(select(Planta).where(Planta.id == planta_id, Planta.tenant_id == context.tenant_id)).first()
     if not planta:
@@ -137,7 +142,7 @@ def desactivar_planta(
     planta_id: uuid.UUID,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    _: UsuarioSaaS = Depends(requerir_gerencia_produccion_o_superadmin),
 ):
     """Baja lógica (activo=False). Nunca hard-delete: hay líneas/estaciones
     y trazabilidad histórica que dependen de esta planta."""
