@@ -132,6 +132,34 @@ def test_historial_limit_invalido_devuelve_400(client, db, tenant_a, gerente_a):
 # ---------- DELETE /supervisor/paradas/{id} ----------
 
 def test_eliminar_planificada_futura_funciona(client, db, tenant_a, gerente_a):
+    """Fase DU (P0-05 revisado): soft-delete -- la fila NO desaparece del
+    historial, queda con estado=ANULADA (antes era hard-delete real,
+    r2.json() == [])."""
+    planta, linea, estacion, motivo_plan, _ = _preparar_escenario(db, tenant_a)
+    futuro = datetime.utcnow() + timedelta(days=1)
+    parada = _crear_parada(db, tenant_a, estacion.id, motivo_plan.id, EstadoParada.CLASIFICADA, "PLANIFICADA", futuro)
+
+    autenticar_como(gerente_a.id)
+    # TestClient.delete() no acepta `json=` (httpx restringe el shortcut a
+    # sólo params de URL/headers para DELETE) -- .request() sí es genérico.
+    r = client.request(
+        "DELETE", f"/supervisor/paradas/{parada.id}",
+        json={"motivo": "Se canceló el cambio de formato"},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200
+
+    r2 = client.get("/supervisor/paradas", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    filas = r2.json()
+    assert len(filas) == 1
+    assert filas[0]["estado"] == "anulada"
+    assert filas[0]["motivo_anulacion"] == "Se canceló el cambio de formato"
+    assert filas[0]["anulada_por_id"] == str(gerente_a.id)
+    assert filas[0]["anulada_at"] is not None
+
+
+def test_eliminar_planificada_sin_motivo_funciona(client, db, tenant_a, gerente_a):
+    """El motivo es opcional -- DELETE sin body sigue funcionando."""
     planta, linea, estacion, motivo_plan, _ = _preparar_escenario(db, tenant_a)
     futuro = datetime.utcnow() + timedelta(days=1)
     parada = _crear_parada(db, tenant_a, estacion.id, motivo_plan.id, EstadoParada.CLASIFICADA, "PLANIFICADA", futuro)
@@ -141,7 +169,17 @@ def test_eliminar_planificada_futura_funciona(client, db, tenant_a, gerente_a):
     assert r.status_code == 200
 
     r2 = client.get("/supervisor/paradas", headers={"X-Sub-Tenant-Id": str(planta.id)})
-    assert r2.json() == []
+    assert r2.json()[0]["motivo_anulacion"] is None
+
+
+def test_eliminar_planificada_ya_anulada_devuelve_409(client, db, tenant_a, gerente_a):
+    planta, linea, estacion, motivo_plan, _ = _preparar_escenario(db, tenant_a)
+    futuro = datetime.utcnow() + timedelta(days=1)
+    parada = _crear_parada(db, tenant_a, estacion.id, motivo_plan.id, EstadoParada.ANULADA, "PLANIFICADA", futuro)
+
+    autenticar_como(gerente_a.id)
+    r = client.delete(f"/supervisor/paradas/{parada.id}", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    assert r.status_code == 409
 
 
 def test_eliminar_planificada_que_ya_empezo_devuelve_409(client, db, tenant_a, gerente_a):

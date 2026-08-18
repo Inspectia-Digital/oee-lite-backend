@@ -49,6 +49,13 @@ class EstadoPlan(str, Enum):
 class EstadoParada(str, Enum):
     PENDIENTE = "pendiente"       # Gap detectado automáticamente, esperando al supervisor
     CLASIFICADA = "clasificada"   # El supervisor ya le asignó un motivo
+    # Fase DU (auditoría de backend, P0-05 revisado): sólo para origen=
+    # PLANIFICADA que todavía no empezó -- reemplaza el hard-delete de
+    # eliminar_parada_planificada por soft-delete, consistente con el
+    # resto del sistema ("no eliminar ni ocultar", ver comentario de
+    # recomputo.py). Nunca se usa para AUTOMATICA ni para una PLANIFICADA
+    # ya en curso/pasada -- ésas nunca fueron ni son borrables.
+    ANULADA = "anulada"
 
 
 class EstadoExclusionOee(str, Enum):
@@ -603,6 +610,12 @@ class ParadaDetectada(TenantBase, table=True):
     # (no se backfillea con una suposición). Mismo criterio de FK que
     # exclusion_propuesta_por_id/exclusion_resuelta_por_id.
     clasificado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+
+    # Fase DU (P0-05 revisado): auditoría de anulación -- mismo criterio
+    # que el resto de los "quién/cuándo/por qué" de este modelo.
+    motivo_anulacion: Optional[str] = Field(default=None)
+    anulada_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    anulada_at: Optional[datetime] = Field(default=None)
 
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""

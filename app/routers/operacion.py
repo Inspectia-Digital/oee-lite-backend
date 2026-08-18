@@ -120,6 +120,11 @@ class ParadaHistorialRow(BaseModel):
     exclusion_resuelta_por_nombre: Optional[str] = None
     exclusion_resuelta_at: Optional[datetime] = None
     exclusion_resolucion_nota: Optional[str] = None
+    # Fase DU (P0-05 revisado): visible en el historial cuando estado=ANULADA.
+    motivo_anulacion: Optional[str] = None
+    anulada_por_id: Optional[uuid.UUID] = None
+    anulada_por_nombre: Optional[str] = None
+    anulada_at: Optional[datetime] = None
 
 def validar_planta(context: TenantContext, usuario: UsuarioSaaS, db: Session):
     """RBAC geolocalizado (Fase D.3): Gerencia/SuperAdmin acceden a todo el
@@ -386,7 +391,8 @@ def listar_historial_paradas(
         uid for p, _, _, _ in filas
         # Fase CK: se suma clasificado_por_id al mismo batch -- misma
         # consulta, un solo round-trip extra de nombres para las 3 FKs.
-        for uid in (p.exclusion_propuesta_por_id, p.exclusion_resuelta_por_id, p.clasificado_por_id)
+        # Fase DU: anulada_por_id se suma al mismo batch, mismo criterio.
+        for uid in (p.exclusion_propuesta_por_id, p.exclusion_resuelta_por_id, p.clasificado_por_id, p.anulada_por_id)
         if uid
     }
     nombres_por_id: dict = {}
@@ -415,6 +421,10 @@ def listar_historial_paradas(
             exclusion_resuelta_por_nombre=nombres_por_id.get(p.exclusion_resuelta_por_id),
             exclusion_resuelta_at=p.exclusion_resuelta_at,
             exclusion_resolucion_nota=p.exclusion_resolucion_nota,
+            motivo_anulacion=p.motivo_anulacion,
+            anulada_por_id=p.anulada_por_id,
+            anulada_por_nombre=nombres_por_id.get(p.anulada_por_id),
+            anulada_at=p.anulada_at,
         )
         for p, e, l, m in filas
     ]
@@ -508,17 +518,29 @@ def resolver_exclusion_oee(
     return parada
 
 
+class AnularParadaPlanificadaRequest(BaseModel):
+    motivo: Optional[str] = Field(default=None, max_length=500)
+
+
 @router.delete("/paradas/{parada_id}")
 def eliminar_parada_planificada(
     parada_id: uuid.UUID,
+    datos: Optional[AnularParadaPlanificadaRequest] = None,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     usuario: UsuarioSaaS = Depends(get_usuario_actual),
 ):
-    """Deshace una parada programada por error, mientras no haya empezado
-    todavía. No se puede borrar una parada AUTOMATICA ni una PLANIFICADA
-    que ya está en curso o pasada -- ahí se preserva trazabilidad real de
-    downtime, no es una fila de agenda editable."""
+    """Anula (soft-delete) una parada programada por error, mientras no
+    haya empezado todavía. No se puede anular una parada AUTOMATICA ni
+    una PLANIFICADA que ya está en curso o pasada -- ahí se preserva
+    trazabilidad real de downtime, no es una fila de agenda editable.
+
+    Fase DU (auditoría de backend, P0-05 revisado): antes esto era un
+    hard-delete real (db.delete()) -- acotado a filas que nunca llegaron
+    a ser downtime real, pero igual contradecía "no eliminar ni ocultar"
+    (mismo criterio que recomputo.py, que nunca borra ParadaDetectada).
+    Ahora es soft-delete: la fila queda, estado=ANULADA, visible en el
+    historial con quién/cuándo/por qué."""
     validar_planta(context, usuario, db)
     if usuario.rol not in ROLES_SUPERVISION_COMPLETA:
         raise HTTPException(status_code=403, detail="No tenés permisos para eliminar paradas planificadas.")
@@ -529,12 +551,19 @@ def eliminar_parada_planificada(
     _validar_estacion_en_planta(parada.estacion_fk, context, db)
     if parada.origen != "PLANIFICADA":
         raise HTTPException(status_code=409, detail="Sólo se pueden eliminar paradas programadas (origen PLANIFICADA).")
+    if parada.estado == EstadoParada.ANULADA:
+        raise HTTPException(status_code=409, detail="Esta parada ya está anulada.")
     if parada.inicio <= datetime.utcnow():
         raise HTTPException(status_code=409, detail="No se puede eliminar una parada programada que ya comenzó o pasó.")
 
-    db.delete(parada)
+    parada.estado = EstadoParada.ANULADA
+    parada.motivo_anulacion = datos.motivo if datos else None
+    parada.anulada_por_id = usuario.id
+    parada.anulada_at = datetime.utcnow()
+
+    db.add(parada)
     db.commit()
-    return {"mensaje": "Parada programada eliminada."}
+    return {"mensaje": "Parada programada anulada."}
 
 
 @router.post("/operarios/asignar-retroactivo")
