@@ -807,3 +807,123 @@ class MetodoPagoConfigurado(SQLModel, table=True):
     creado_at: datetime = Field(default_factory=datetime.utcnow)
     actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
     actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# Fase EC: planes comerciales (descuentos/bonificación) + asignación de
+# módulo+plan+descuento a un tenant puntual. GLOBAL igual que el resto
+# de Fase EB (catálogo de InspectIA Core) -- salvo AsignacionModuloTenant,
+# que SÍ referencia un tenant_id real (InspectIA Core administrando la
+# cuenta DE un tenant, no el tenant administrando sus propios datos).
+class EstadoPlanComercial(str, Enum):
+    ACTIVO = "activo"
+    ARCHIVADO = "archivado"
+
+
+class PlanComercial(SQLModel, table=True):
+    """Descuento/bonificación (PRD §4, "planes_comerciales"). Dos tipos
+    MUTUAMENTE EXCLUYENTES (radio button en el PRD) -- validados en el
+    endpoint, no acá: descuento_porcentaje (0 < x <= 100) O
+    es_bonificado=True (con meses_bonificados opcional, NULL=ilimitado).
+    "100% bonificado ilimitado" es el caso especial del PRD §8: el
+    tenant queda SIEMPRE "al día" sin importar facturas pendientes."""
+    __tablename__ = "planes_comerciales"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    codigo: str = Field(unique=True, index=True, description="Ej: ACME_DISCOUNT_50")
+    nombre: str
+    descripcion: Optional[str] = None
+
+    es_bonificado: bool = Field(default=False)
+    meses_bonificados: Optional[int] = Field(default=None, description="NULL = ilimitado")
+    descuento_porcentaje: Optional[Decimal] = Field(default=None, sa_column=Column(Numeric(5, 2)))
+
+    aplica_a_todos_modulos: bool = Field(default=True)
+    aplica_a_todos_planes: bool = Field(default=True)
+
+    estado: EstadoPlanComercial = Field(
+        default=EstadoPlanComercial.ACTIVO,
+        sa_column=Column(SaEnum(EstadoPlanComercial, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    fecha_inicio: date
+    fecha_fin: Optional[date] = Field(default=None, description="NULL = indefinida")
+
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class PlanComercialModulo(SQLModel, table=True):
+    """M2M: a qué módulos aplica un PlanComercial -- sólo se puebla
+    cuando aplica_a_todos_modulos=False (ver PlanComercial)."""
+    __tablename__ = "plan_comercial_modulos"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    plan_comercial_id: uuid.UUID = Field(foreign_key="planes_comerciales.id")
+    modulo_id: uuid.UUID = Field(foreign_key="modulos_disponibles.id")
+
+    __table_args__ = (
+        Index("ix_plan_comercial_modulos_unico", "plan_comercial_id", "modulo_id", unique=True),
+    )
+
+
+class PlanComercialPlan(SQLModel, table=True):
+    """M2M: a qué PlanPrecio aplica un PlanComercial -- sólo se puebla
+    cuando aplica_a_todos_planes=False (ver PlanComercial)."""
+    __tablename__ = "plan_comercial_planes"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    plan_comercial_id: uuid.UUID = Field(foreign_key="planes_comerciales.id")
+    plan_id: uuid.UUID = Field(foreign_key="planes_precio.id")
+
+    __table_args__ = (
+        Index("ix_plan_comercial_planes_unico", "plan_comercial_id", "plan_id", unique=True),
+    )
+
+
+class EstadoAsignacionModulo(str, Enum):
+    ACTIVA = "activa"
+    SUSPENDIDA = "suspendida"
+    CANCELADA = "cancelada"
+
+
+class AsignacionModuloTenant(SQLModel, table=True):
+    """Módulo+plan+descuento contratado por un tenant (PRD
+    "tenant_modulos_asignados"). `precio_base`/`precio_con_descuento` son
+    SNAPSHOTS al momento de asignar/editar -- si el PlanPrecio o el
+    PlanComercial cambian de precio/descuento después, esta fila NO se
+    recalcula sola (mismo criterio que tiempo_ideal_seg en
+    LiteEventoProduccion: snapshot inmutable, se vuelve a asignar/editar
+    para tomar un valor nuevo).
+
+    precio_con_descuento con plan_comercial es_bonificado=True queda en
+    0 -- la ventana real de "cuántos meses lleva bonificado" es un
+    cálculo temporal que vive en Fase ED (cuando se calcule el monto a
+    pagar del período), no acá."""
+    __tablename__ = "tenant_modulos_asignados"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    tenant_id: str = Field(foreign_key="tenants_saas.id", index=True)
+    modulo_id: uuid.UUID = Field(foreign_key="modulos_disponibles.id")
+    plan_id: uuid.UUID = Field(foreign_key="planes_precio.id")
+    plan_comercial_id: Optional[uuid.UUID] = Field(default=None, foreign_key="planes_comerciales.id")
+    # PRD §5: "Requerido, no null" -- toda asignación necesita un método
+    # de pago fijo desde el alta (se usa para las facturas del módulo,
+    # Fase ED). Puede cambiarse editando la asignación.
+    metodo_pago_id: uuid.UUID = Field(foreign_key="metodos_pago_configurados.id")
+
+    fecha_inicio: date
+    fecha_renovacion: date
+
+    precio_base: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False))
+    precio_con_descuento: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False))
+
+    estado: EstadoAsignacionModulo = Field(
+        default=EstadoAsignacionModulo.ACTIVA,
+        sa_column=Column(SaEnum(EstadoAsignacionModulo, values_callable=lambda obj: [e.value for e in obj])),
+    )
+
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_tenant_modulos_asignados_unico", "tenant_id", "modulo_id", unique=True),
+    )
