@@ -1040,3 +1040,51 @@ class SuscripcionTenant(SQLModel, table=True):
     )
 
     actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# Fase EE: pagos informados -- el "autoinforme" del PRD §7 (el cliente
+# informa que pagó una factura, subiendo referencia/comprobante; Admin
+# revisa y aprueba/rechaza). El PRD §9 no lista un endpoint de creación
+# para el cliente (sólo lista los 3 admin-side: listar/aprobar/rechazar),
+# pero la maqueta del PRD (§5, botón "[Informar pago]" junto a cada
+# factura) y el propio nombre de esta fase ("autoinforme del cliente")
+# confirman que hace falta -- gap de completitud del documento, no una
+# contradicción de negocio; se agrega `POST /billing/mi-empresa/
+# facturas/{id}/informar-pago` siguiendo el mismo patrón admin/mi-empresa
+# ya establecido en Fase ED.
+class EstadoPagoInformado(str, Enum):
+    PENDIENTE_REVISION = "pendiente_revision"
+    APROBADO = "aprobado"
+    RECHAZADO = "rechazado"
+
+
+class PagoInformado(SQLModel, table=True):
+    """PRD §2 (tabla `pagos_informados`). `tenant_id` está denormalizado
+    desde `factura_id` -- así lo declara el propio DDL del PRD (además de
+    ser alcanzable via factura.tenant_id), útil para filtrar/aislar sin
+    un JOIN. `aprobado_por_id`/`fecha_aprobacion` se reutilizan tanto
+    para aprobar como para rechazar (quién revisó y cuándo) -- mismo
+    nombre que el DDL del PRD, que tampoco distingue un campo separado
+    para el caso de rechazo."""
+    __tablename__ = "pagos_informados"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    factura_id: uuid.UUID = Field(foreign_key="facturas.id", index=True)
+    tenant_id: str = Field(foreign_key="tenants_saas.id", index=True)
+
+    fecha_pago: date
+    monto: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False))
+    referencia: Optional[str] = Field(default=None)
+    comprobante_url: Optional[str] = Field(default=None, description="Puntero externo -- no se sube el archivo acá")
+
+    estado: EstadoPagoInformado = Field(
+        default=EstadoPagoInformado.PENDIENTE_REVISION,
+        sa_column=Column(SaEnum(EstadoPagoInformado, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    aprobado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    fecha_aprobacion: Optional[datetime] = Field(default=None)
+    observaciones: Optional[str] = Field(default=None, description="Motivo del rechazo, u otras notas")
+
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
