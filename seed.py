@@ -2,7 +2,10 @@ import os
 
 from sqlmodel import Session, select
 from app.core.database import engine
-from app.models.domain import Tenant, Planta, Linea, Estacion, TipoProduccion, UsuarioSaaS, RolUsuario
+from app.models.domain import (
+    Tenant, Planta, Linea, Estacion, TipoProduccion, UsuarioSaaS, RolUsuario,
+    ModuloDisponible, EstadoModuloDisponible,
+)
 
 # Estructura base repetible (para resets de dev/local). El superadmin real
 # se toma de variables de entorno, nunca hardcodeado en el código:
@@ -139,6 +142,33 @@ def seed_data():
             print("✅ Tenant 'green_mills' (New Garden) creado con éxito (Producción por Lotes).")
         else:
             print("ℹ️ Tenant 'green_mills' ya existe.")
+
+        # ==========================================
+        # 4. BILLING (Fase EB, PRD "Billing MVP" v2.0): catálogo real de
+        # módulos -- mismos 5 códigos/estados que src/admin/modules.ts
+        # (MODULE_CATALOG, frontend) tenía hardcodeados, para que la
+        # migración a la tabla real (confirmado con el usuario) no
+        # cambie de entrada lo que ve un tenant existente. Idempotente
+        # (por código), igual que el resto de este script.
+        # "activo" = enabled:true en MODULE_CATALOG; el resto quedan
+        # "proximamente" (ninguno estaba en beta hoy).
+        # ==========================================
+        modulos_seed = [
+            ("tymeo", "TYMEO", "OEE y Producción", 1, EstadoModuloDisponible.ACTIVO),
+            ("oee-hub", "OEE Hub", "Factory OEE Hub", 2, EstadoModuloDisponible.PROXIMAMENTE),
+            ("vision", "InspectIA Vision", "Visión artificial de calidad", 3, EstadoModuloDisponible.PROXIMAMENTE),
+            ("logistica", "Logística", "Trazabilidad logística", 4, EstadoModuloDisponible.PROXIMAMENTE),
+            ("seguridad", "Seguridad", "Seguridad y prevención", 5, EstadoModuloDisponible.PROXIMAMENTE),
+        ]
+        for codigo, nombre, descripcion, orden, estado in modulos_seed:
+            existente = db.exec(select(ModuloDisponible).where(ModuloDisponible.codigo == codigo)).first()
+            if existente:
+                continue
+            db.add(ModuloDisponible(
+                codigo=codigo, nombre=nombre, descripcion=descripcion, orden=orden, estado=estado,
+            ))
+        db.commit()
+        print("✅ Catálogo de módulos disponibles (Billing) sembrado.")
 
     print("🚀 Proceso de Seeding multi-tenant completo finalizado correctamente.")
 

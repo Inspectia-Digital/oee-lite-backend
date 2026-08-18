@@ -5,17 +5,14 @@ from typing import List, Optional
 from sqlalchemy import func
 import uuid
 
-# Catálogo de módulos válidos (Fase M). Sólo "tymeo" tiene backend real
-# hoy -- el resto quedan como valores aceptados para cuando existan, pero
-# ningún tenant debería tener "oee-hub"/"vision"/etc. habilitado todavía
-# (no hay nada del otro lado que lo sirva).
-MODULOS_VALIDOS = {"tymeo", "oee-hub", "vision", "logistica", "seguridad"}
-
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
 from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
 from app.core.auth0_management import crear_ticket_cambio_password
-from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso
+from app.models.domain import (
+    UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso,
+    ModuloDisponible,
+)
 
 # Roles a los que no se les asigna alcance por planta -- ven todo el tenant
 # sin necesitar filas explícitas (mismo criterio ya usado por UsuarioPlanta).
@@ -85,12 +82,14 @@ class TenantModulosUpdate(BaseModel):
 
     @field_validator("modulos_contratados")
     @classmethod
-    def _validar_modulos(cls, v: List[str]) -> List[str]:
-        normalizados = [m.strip().lower() for m in v]
-        invalidos = [m for m in normalizados if m not in MODULOS_VALIDOS]
-        if invalidos:
-            raise ValueError(f"Módulos inválidos: {invalidos}. Válidos: {sorted(MODULOS_VALIDOS)}")
-        return normalizados
+    def _normalizar_modulos(cls, v: List[str]) -> List[str]:
+        # Fase EB (PRD Billing MVP, confirmado con el usuario): la
+        # validación de "¿es un módulo REAL?" se movió al endpoint (ver
+        # actualizar_modulos_tenant) -- ahora consulta ModuloDisponible
+        # en vez de MODULOS_VALIDOS (constante hardcodeada, retirada).
+        # Acá sólo queda la normalización estructural, que un
+        # field_validator sí puede hacer sin sesión de DB.
+        return [m.strip().lower() for m in v]
 
 class TicketCambioPassword(BaseModel):
     ticket_url: str
@@ -445,14 +444,28 @@ def actualizar_modulos_tenant(
     """Módulos contratados por el tenant (Fase M). Sólo SuperAdmin -- es una
     decisión comercial/de billing, no algo que el propio tenant se
     autoasigne desde /mi-empresa/tenant (por eso vive en un endpoint
-    separado del PATCH genérico de tenant, no en TenantUpdate)."""
+    separado del PATCH genérico de tenant, no en TenantUpdate).
+
+    Fase EB (PRD Billing MVP, confirmado con el usuario): "¿es un módulo
+    real?" ya no se valida contra MODULOS_VALIDOS (constante hardcodeada,
+    retirada) -- consulta ModuloDisponible, la fuente de verdad real."""
     if usuario_actual.rol != RolUsuario.SUPERADMIN:
         raise HTTPException(status_code=403, detail="Exclusivo InspectIA Core.")
     tenant = db.exec(select(Tenant).where(Tenant.id == tenant_id)).first()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
 
-    tenant.modulos_contratados = ",".join(sorted(set(payload.modulos_contratados)))
+    codigos_pedidos = set(payload.modulos_contratados)
+    if codigos_pedidos:
+        codigos_reales = set(db.exec(select(ModuloDisponible.codigo)).all())
+        invalidos = codigos_pedidos - codigos_reales
+        if invalidos:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Módulos inválidos: {sorted(invalidos)}. Válidos: {sorted(codigos_reales)}",
+            )
+
+    tenant.modulos_contratados = ",".join(sorted(codigos_pedidos))
     db.add(tenant)
     db.commit()
     db.refresh(tenant)

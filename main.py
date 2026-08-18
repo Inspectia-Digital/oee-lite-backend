@@ -31,6 +31,9 @@ from app.routers import personas
 # Fase S — recómputo de eventos ya ingeridos
 from app.routers import recomputo
 
+# Fase EB — Billing MVP (catálogo de módulos/planes/métodos de pago)
+from app.routers import billing
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -147,6 +150,9 @@ app.include_router(personas.router)
 
 # 7. Fase S — recómputo de eventos ya ingeridos
 app.include_router(recomputo.router)
+
+# 8. Fase EB — Billing MVP
+app.include_router(billing.router)
 
 
 # ==========================================

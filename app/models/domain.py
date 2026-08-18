@@ -1,9 +1,10 @@
 import uuid
 from datetime import datetime, time, date
+from decimal import Decimal
 from enum import Enum
 from typing import List, Optional
 from sqlmodel import SQLModel, Field, Relationship, Index
-from sqlalchemy import Column
+from sqlalchemy import Column, Numeric
 from sqlalchemy import Enum as SaEnum
 
 # ==========================================
@@ -703,3 +704,106 @@ class LiteEventoProduccion(TenantBase, table=True):
     # podemos saber retroactivamente qué SKU corría al momento de un evento
     # pasado. tiempo_ideal_evento = tiempo_ideal_seg * unidades_procesadas.
     tiempo_ideal_seg: float = Field(default=0.0)
+
+
+# ==========================================
+# 7. BILLING (PRD "Billing MVP + Planes Comerciales" v2.0)
+# ==========================================
+# Fase EB: catálogo de módulos/planes/métodos de pago. GLOBAL, no
+# tenant-scoped (no heredan TenantBase) -- es catálogo de InspectIA Core
+# ("Panel SaaS -> Configuración"), mismo criterio que Tenant/UsuarioSaaS,
+# nunca un dato propio de un cliente. Confirmado con el usuario
+# (AskUserQuestion, batch anterior): modulos_disponibles reemplaza al
+# MODULE_CATALOG hardcodeado del frontend y a MODULOS_VALIDOS del backend
+# (admin.py) -- ver migración de esta fase.
+#
+# Nombres de clase deliberadamente NO "Plan" a secas: ya existe
+# PlanProduccion/EstadoPlan en este mismo archivo (plan de producción del
+# día, concepto completamente distinto) -- "PlanPrecio" evita la colisión
+# de vocabulario. "PlanComercial" (descuentos/bonificación, tabla
+# planes_comerciales del PRD) llega en una fase aparte (EC).
+class EstadoModuloDisponible(str, Enum):
+    ACTIVO = "activo"
+    BETA = "beta"
+    PROXIMAMENTE = "proximamente"
+
+
+class ModuloDisponible(SQLModel, table=True):
+    __tablename__ = "modulos_disponibles"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    codigo: str = Field(unique=True, index=True, description="Ej: tymeo, oee-hub -- mismos códigos que ModuleId en el frontend")
+    nombre: str
+    descripcion: Optional[str] = None
+    orden: int = Field(default=0)
+    estado: EstadoModuloDisponible = Field(
+        default=EstadoModuloDisponible.PROXIMAMENTE,
+        sa_column=Column(SaEnum(EstadoModuloDisponible, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class EstadoPlanPrecio(str, Enum):
+    ACTIVO = "activo"
+    DEPRECADO = "deprecado"
+
+
+class PlanPrecio(SQLModel, table=True):
+    """Nivel de precio dentro de un módulo (Free/Pro/Enterprise). Tabla
+    `planes` en el PRD -- renombrada acá (planes_precio) para no chocar
+    con `planes_produccion` (PlanProduccion), ya existente."""
+    __tablename__ = "planes_precio"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    modulo_id: uuid.UUID = Field(foreign_key="modulos_disponibles.id")
+    codigo: str = Field(description="Único DENTRO del módulo, ver índice compuesto abajo")
+    nombre: str
+    descripcion: Optional[str] = None
+    # Dinero: NUMERIC explícito, nunca float -- primer dato financiero real
+    # de este backend (antes no existía ningún concepto de precio/monto en
+    # todo el esquema). PRD: "Precio (ARS) *Requerido", "0 para Free, > 0
+    # para pagos" -- validado en el endpoint (>= 0), no acá.
+    precio: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False), description="ARS. 0 = plan free.")
+    orden: int = Field(default=0, description="1 = más barato")
+    limite_usuarios: Optional[int] = Field(default=None, description="NULL = ilimitado")
+    limite_plantas: Optional[int] = Field(default=None, description="NULL = ilimitado")
+    limite_lineas: Optional[int] = Field(default=None, description="NULL = ilimitado")
+    estado: EstadoPlanPrecio = Field(
+        default=EstadoPlanPrecio.ACTIVO,
+        sa_column=Column(SaEnum(EstadoPlanPrecio, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_planes_precio_modulo_codigo", "modulo_id", "codigo", unique=True),
+    )
+
+
+class EstadoMetodoPago(str, Enum):
+    ACTIVO = "activo"
+    INACTIVO = "inactivo"
+
+
+class MetodoPagoConfigurado(SQLModel, table=True):
+    __tablename__ = "metodos_pago_configurados"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    codigo: str = Field(unique=True, index=True)
+    nombre: str
+    # Abierto (no enum estricto) a propósito -- mismo criterio que
+    # Estacion.tipo: "transferencia"/"cheque"/"efectivo" son los ejemplos
+    # del PRD, no una lista cerrada que exija una migración para agregar uno.
+    tipo: str = Field(description="Ej: transferencia, cheque, efectivo")
+    detalle: Optional[str] = Field(default=None, description="Instrucciones -- banco, cuenta, alias, etc.")
+    orden: int = Field(default=0)
+    estado: EstadoMetodoPago = Field(
+        default=EstadoMetodoPago.ACTIVO,
+        sa_column=Column(SaEnum(EstadoMetodoPago, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
