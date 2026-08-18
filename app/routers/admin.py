@@ -330,11 +330,19 @@ def crear_usuario_tenant(
     usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
-    if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA]:
-        raise HTTPException(status_code=403, detail="Solo Gerencia o SuperAdmin pueden crear usuarios.")
+    # P1-A (PRD Go-Live Green Mills, sección 5): Producción SÍ puede crear
+    # usuarios (Encargado/Supervisor/Producción) -- antes este endpoint
+    # la bloqueaba por completo, aunque el sidebar y las rutas del
+    # frontend ya la dejaban entrar a la pantalla (gap real, no sólo de
+    # UI). Nunca puede escalar hacia arriba: ni crear Gerencia/SuperAdmin.
+    if usuario_actual.rol not in [RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION]:
+        raise HTTPException(status_code=403, detail="Solo Gerencia, Producción o SuperAdmin pueden crear usuarios.")
 
     if usuario_actual.rol == RolUsuario.GERENCIA and payload.rol == RolUsuario.SUPERADMIN:
         raise HTTPException(status_code=403, detail="Infracción RBAC: Un Gerente no puede crear un SuperAdmin.")
+
+    if usuario_actual.rol == RolUsuario.PRODUCCION and payload.rol in (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN):
+        raise HTTPException(status_code=403, detail="Producción no puede crear un usuario con rol Gerencia o SuperAdmin.")
 
     if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == payload.email)).first():
         raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado.")
@@ -361,10 +369,30 @@ def actualizar_usuario(
     )).first()
 
     if not usuario_target: raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    # P1-A: este endpoint no tenía NINGÚN piso de rol -- cualquier
+    # usuario autenticado del tenant (hasta un Operario) podía cambiarle
+    # el rol o desactivar (revocar acceso) a cualquier otro usuario.
+    # Hallazgo real de pasada al implementar P1-A, no sólo el pedido
+    # original del PRD (Producción no escala) -- se cierra acá porque el
+    # piso de rol es un prerequisito para poder distinguir a Producción
+    # del resto.
+    if usuario_actual.rol not in (RolUsuario.SUPERADMIN, RolUsuario.GERENCIA, RolUsuario.PRODUCCION):
+        raise HTTPException(status_code=403, detail="Solo Gerencia, Producción o SuperAdmin pueden modificar usuarios.")
+
     if usuario_actual.auth0_id == auth0_id_target and payload.rol and payload.rol != usuario_target.rol:
         raise HTTPException(status_code=403, detail="No puedes auto-modificar tu rol.")
     if usuario_actual.rol == RolUsuario.GERENCIA and usuario_target.rol == RolUsuario.SUPERADMIN:
         raise HTTPException(status_code=403, detail="No tienes autoridad sobre un SuperAdmin.")
+    # P1-A: Producción no tiene autoridad sobre un usuario Gerencia/
+    # SuperAdmin YA EXISTENTE (ninguna modificación, incluida revocar
+    # acceso vía activo=False) -- ni puede ASCENDER a alguien a esos
+    # roles (payload.rol), aunque el target hoy sea Encargado/Supervisor.
+    if usuario_actual.rol == RolUsuario.PRODUCCION:
+        if usuario_target.rol in (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN):
+            raise HTTPException(status_code=403, detail="Producción no tiene autoridad sobre un usuario de Gerencia o SuperAdmin.")
+        if payload.rol in (RolUsuario.GERENCIA, RolUsuario.SUPERADMIN):
+            raise HTTPException(status_code=403, detail="Producción no puede asignar el rol Gerencia o SuperAdmin.")
 
     update_data = payload.model_dump(exclude_unset=True)
     for key, value in update_data.items(): setattr(usuario_target, key, value)

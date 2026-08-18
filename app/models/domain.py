@@ -122,6 +122,17 @@ class EstadoTenant(str, Enum):
     SUSPENSION_TOTAL = "suspension_total"
 
 class MetodoCalidadLinea(str, Enum):
+    # BE-P0-08 (PRD Go-Live Green Mills, sección 2): el umbral de
+    # POR_TIEMPO usaba un fallback fijo de 1800s en vez de
+    # MaestroSKU.umbral_calidad -- YA CORREGIDO (Fase DS, tarea #158).
+    # El PRD había pedido un feature flag backend que bloqueara
+    # seleccionar este método "mientras no esté corregido" -- decisión
+    # confirmada con el usuario: no se agrega ningún bloqueo, porque la
+    # condición que lo justificaba ("mientras no esté corregido") ya no
+    # aplica. Green Mills sigue usando 100% POR_RECHAZO, pero es una
+    # decisión de alcance de ESE cliente, no una limitación técnica de
+    # la plataforma -- no hay motivo para restringirlo para el resto de
+    # los tenants.
     POR_TIEMPO = "por_tiempo"
     POR_RECHAZO = "por_rechazo"
 
