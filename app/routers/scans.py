@@ -72,6 +72,32 @@ def _normalizar_timestamp_utc(ts: Optional[datetime], planta_timezone: Optional[
     return ts_utc.replace(tzinfo=None)
 
 
+def _resolver_fecha_operativa(db: Session, estacion_id: str, ahora_utc: Optional[datetime] = None) -> date:
+    """Fase DT (auditoría de backend, P0-04): fecha operativa LOCAL de la
+    planta de esta estación -- antes login/logout de operario usaban
+    `date.today()` directo (fecha del servidor, normalmente UTC),
+    ignorando Planta.timezone. Cerca de medianoche local (turnos
+    nocturnos sobre todo) eso podía loguear/desloguear contra el día
+    calendario equivocado -- mismo patrón de bug que Fase BH ya corrigió
+    en el frontend, nunca replicado acá. Mismo criterio de resolución de
+    timezone que _normalizar_timestamp_utc de arriba.
+
+    `ahora_utc` es inyectable (default: instante real) a propósito --
+    mismo criterio que _resolver_turno_por_horario (analytics.py, QA-05):
+    permite tests unitarios deterministas sin depender del wall-clock
+    real ni de ningún mock de datetime.now()."""
+    if ahora_utc is None:
+        ahora_utc = datetime.now(timezone.utc)
+    estacion = db.get(Estacion, uuid.UUID(estacion_id))
+    linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first() if estacion else None
+    planta = db.get(Planta, linea.planta_id) if linea else None
+    try:
+        tz = ZoneInfo(planta.timezone if planta and planta.timezone else TIMEZONE_DEFAULT)
+    except Exception:
+        tz = ZoneInfo(TIMEZONE_DEFAULT)
+    return ahora_utc.astimezone(tz).date()
+
+
 def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:
     ahora = datetime.now(timezone.utc).replace(tzinfo=None)
     if ts_utc_naive > ahora + TOLERANCIA_FUTURO:
@@ -512,7 +538,7 @@ def login_operario_terminal(
     if not turno:
         raise error_terminal(404, ErrorCode.TURNO_NO_ENCONTRADO, "Turno no encontrado.")
 
-    hoy = date.today()
+    hoy = _resolver_fecha_operativa(db, dispositivo.estacion_id)
     asignacion = db.exec(
         select(AsignacionTurno).where(
             AsignacionTurno.tenant_id == dispositivo.tenant_id,
@@ -566,7 +592,7 @@ def logout_operario_terminal(
     sigue siendo por (tenant, estación, turno, fecha) -- ver el
     comentario en el modelo (domain.py) sobre por qué no se formaliza
     una ventana horaria real acá."""
-    hoy = date.today()
+    hoy = _resolver_fecha_operativa(db, dispositivo.estacion_id)
     asignacion = db.exec(
         select(AsignacionTurno).where(
             AsignacionTurno.tenant_id == dispositivo.tenant_id,
