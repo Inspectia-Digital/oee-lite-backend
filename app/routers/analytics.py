@@ -15,6 +15,11 @@ from app.core.tiempo_planta import (
     hora_local as _hora_local_compartida,
     rango_utc_dia_local,
 )
+from app.core.turnos import (
+    dia_en_dias_semana,
+    dia_iso_anterior,
+    resolver_turno_vigente,
+)
 from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada,
     MotivoParada, Operario, Turno, Linea, TipoParada,
@@ -1607,17 +1612,11 @@ def _fecha_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> date:
     return _fecha_local_compartida(ts_utc_naive, planta)
 
 
-def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
-    """dias_semana: CSV de días ISO (1=lunes..7=domingo, Fase Q). Un valor
-    corrupto/vacío no bloquea -- mejor de más (aplica todos los días) que
-    hacer desaparecer un turno/regla entero por un dato mal cargado."""
-    try:
-        dias = {int(d) for d in dias_semana.split(",") if d.strip()}
-    except (ValueError, AttributeError):
-        return True
-    if not dias:
-        return True
-    return dia_iso in dias
+# FE-P0-03: la implementación vive en app/core/turnos.py -- la Terminal
+# necesita la misma resolución pero autenticada por credencial M2M, y
+# este router no puede ser el dueño de esa regla. Se re-exporta con el
+# nombre local para no tocar los ~6 llamadores de este archivo.
+_dia_en_dias_semana = dia_en_dias_semana
 
 
 def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
@@ -1631,45 +1630,12 @@ def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
     return _hora_local_compartida(ts_utc_naive, planta)
 
 
-def _dia_iso_anterior(dia_iso: int) -> int:
-    """1=lunes..7=domingo (Fase Q) -- el día anterior a lunes es domingo."""
-    return 7 if dia_iso == 1 else dia_iso - 1
-
-
-def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
-    """Qué Turno (de una lista ya acotada a una línea) está vigente para
-    una hora+día puntuales -- horario + día de semana, primer match gana.
-    Usada tanto por /analytics/linea-en-vivo/ (con la hora/día de AHORA)
-    como para resolver un timestamp arbitrario (Fase AD/AN).
-
-    QA-05 (auditoría QA): antes se chequeaba dias_semana contra el día
-    CALENDARIO del momento consultado, sin importar si el turno cruza
-    medianoche -- un turno "lunes 22:00-06:00" (dias_semana="1")
-    consultado el MARTES a las 02:00 nunca resolvía, porque dia_iso ya
-    era martes (2), no lunes (1), aunque el turno siga técnicamente en
-    curso (arrancó el lunes a la noche). dias_semana describe el día en
-    que el turno ARRANCA, no el día calendario de cada instante dentro
-    de él -- así que primero se determina si hora_local cae en la mitad
-    "de noche" (después de hora_inicio, arrancó HOY) o en la mitad
-    "de madrugada" (antes de hora_fin, arrancó AYER) de un turno que
-    cruza medianoche, y recién ahí se compara dias_semana contra el día
-    que corresponde. None si ninguno matchea -- no se inventa un turno."""
-    for t in turnos:
-        if t.hora_inicio <= t.hora_fin:
-            en_turno = t.hora_inicio <= hora_local <= t.hora_fin
-            dia_de_inicio = dia_iso
-        elif hora_local >= t.hora_inicio:
-            en_turno = True
-            dia_de_inicio = dia_iso
-        elif hora_local <= t.hora_fin:
-            en_turno = True
-            dia_de_inicio = _dia_iso_anterior(dia_iso)
-        else:
-            en_turno = False
-            dia_de_inicio = dia_iso
-        if en_turno and _dia_en_dias_semana(dia_de_inicio, t.dias_semana):
-            return t
-    return None
+# FE-P0-03: misma extracción que _dia_en_dias_semana de arriba -- la
+# regla completa de "qué turno está vigente" (incluidos sus casos borde
+# de turno nocturno, QA-05) vive ahora en app/core/turnos.py, compartida
+# con la Terminal. Alias locales para no tocar los llamadores.
+_dia_iso_anterior = dia_iso_anterior
+_resolver_turno_por_horario = resolver_turno_vigente
 
 
 @router.get("/analytics/linea-en-vivo/", response_model=LineaEnVivoResumen)
