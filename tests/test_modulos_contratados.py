@@ -1,20 +1,41 @@
 """Fase M: endpoint dedicado para que SuperAdmin edite los módulos
 contratados de un tenant (gap real: TenantUpdate no exponía este campo,
-no había forma de sacarle 'oee-hub' a un tenant que no debía tenerlo)."""
-from app.models.domain import Tenant
+no había forma de sacarle 'oee-hub' a un tenant que no debía tenerlo).
+
+Fase EB (Billing MVP) migró la validación de "¿es un módulo real?" del
+set hardcodeado MODULOS_VALIDOS a la tabla real ModuloDisponible -- los
+tests que patchean con los códigos literales "tymeo"/"oee-hub" necesitan
+sembrar esos módulos primero (antes vivían gratis en el hardcodeo).
+Bug real encontrado (no en local, donde la DB de desarrollo ya tenía
+seed.py corrido; sí en CI, con una Postgres efímera limpia en cada run
+-- exactamente el mismo desfasaje que hizo fallar el deploy real desde
+Fase EB en adelante, ver tarea #180): sin este seed, ambos tests
+devolvían 422 "Módulos inválidos" contra una base limpia."""
+from sqlmodel import select
+from app.models.domain import Tenant, ModuloDisponible
 from tests.conftest import autenticar_como
 
 
+def _sembrar_modulos(db, *codigos: str) -> None:
+    for codigo in codigos:
+        existe = db.exec(select(ModuloDisponible).where(ModuloDisponible.codigo == codigo)).first()
+        if not existe:
+            db.add(ModuloDisponible(codigo=codigo, nombre=codigo))
+    db.commit()
+
+
 def test_superadmin_puede_actualizar_modulos(client, db, tenant_a, superadmin):
+    _sembrar_modulos(db, "tymeo")
     autenticar_como(superadmin.id)
     r = client.patch(f"/accesos/superadmin/tenants/{tenant_a}/modulos", json={"modulos_contratados": ["tymeo"]})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
 
     tenant_db = db.get(Tenant, tenant_a)
     assert tenant_db.modulos_contratados == "tymeo"
 
 
 def test_quitar_oee_hub_de_un_tenant(client, db, tenant_a, superadmin):
+    _sembrar_modulos(db, "tymeo", "oee-hub")
     t = db.get(Tenant, tenant_a)
     t.modulos_contratados = "tymeo,oee-hub"
     db.add(t)
@@ -22,7 +43,7 @@ def test_quitar_oee_hub_de_un_tenant(client, db, tenant_a, superadmin):
 
     autenticar_como(superadmin.id)
     r = client.patch(f"/accesos/superadmin/tenants/{tenant_a}/modulos", json={"modulos_contratados": ["tymeo"]})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
 
     tenant_db = db.get(Tenant, tenant_a)
     assert "oee-hub" not in tenant_db.modulos_contratados.split(",")
