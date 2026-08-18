@@ -940,6 +940,24 @@ def solicitar_factura_cliente(
     return _generar_factura(db, context.tenant_id, asignacion, usuario)
 
 
+@router.get("/facturas", response_model=List[Factura])
+def listar_facturas_todas(
+    estado: Optional[EstadoFactura] = None,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Fase EF (auditoría de completitud contra PRD §9): faltaba el
+    equivalente de `GET /api/admin/facturas/solicitudes` -- la pantalla
+    admin "FACTURAS - PENDIENTE ENVÍO" (§5) lista facturas de VARIOS
+    clientes a la vez en una sola tabla; `listar_facturas_de_tenant`
+    (scoped a un tenant) no cubre esa vista. Con `?estado=pendiente_envio`
+    reproduce exactamente esa pantalla."""
+    query = select(Factura)
+    if estado is not None:
+        query = query.where(Factura.estado == estado)
+    return db.exec(query.order_by(Factura.fecha_emision.desc())).all()
+
+
 @router.get("/clientes/{tenant_id}/facturas", response_model=List[Factura])
 def listar_facturas_de_tenant(
     tenant_id: str,
