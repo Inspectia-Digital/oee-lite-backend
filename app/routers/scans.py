@@ -17,7 +17,8 @@ from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
 from app.core.errors import ErrorCode, error_terminal
 from app.core.rate_limit import verificar_limite
-from app.core.tiempo_planta import fecha_operativa_planta
+from app.core.tiempo_planta import fecha_operativa_planta, fecha_local, hora_local
+from app.core.turnos import resolver_turno_vigente
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
@@ -160,6 +161,27 @@ def validar_estacion_terminal(
         .order_by(Turno.hora_inicio)
     ).all() if linea else []
 
+    # FE-P0-03 (PRD Go-Live Green Mills): el BACKEND resuelve qué turno
+    # está vigente, no la terminal. Antes el kiosco lo calculaba con
+    # `now.getHours()` del dispositivo (TerminalPage.tsx) -- una tablet de
+    # planta con el reloj mal configurado (o simplemente en otro huso)
+    # fichaba al operario contra el turno equivocado, sin que nada lo
+    # señalara. Acá se resuelve con la hora LOCAL DE LA PLANTA
+    # (app.core.tiempo_planta) y la misma regla que usa Analytics
+    # (app.core.turnos, incluidos los casos borde de turno nocturno).
+    #
+    # Va como campo de este endpoint y no como uno nuevo a propósito: la
+    # terminal ya lo llama en el bootstrap, y hoy resuelve el turno una
+    # sola vez en ese mismo momento -- misma semántica, sin request extra.
+    # `None` = "sin turno vigente": la terminal pide selección manual.
+    planta = db.get(Planta, linea.planta_id) if linea else None
+    ahora_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    turno_vigente = resolver_turno_vigente(
+        hora_local(ahora_utc_naive, planta),
+        fecha_local(ahora_utc_naive, planta).isoweekday(),
+        turnos,
+    ) if turnos else None
+
     return {
         "id": str(estacion.id),
         "nombre": estacion.nombre,
@@ -167,6 +189,7 @@ def validar_estacion_terminal(
         "configuracion": {
             "modo_asignacion_operarios": modo_asignacion,
         },
+        "turno_vigente_id": str(turno_vigente.id) if turno_vigente else None,
         "turnos": [
             {
                 "id": str(t.id),
