@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta
 from tests.conftest import autenticar_como
 from app.models.domain import (
     AsignacionTurno, Estacion, Linea, LiteEventoProduccion, Operario, Planta,
-    Turno,
+    SesionOperario, Turno,
 )
 
 
@@ -79,6 +79,13 @@ def test_rendimiento_operarios_resuelve_evento_cerca_de_medianoche_local(client,
     # 23:00 hora de planta (UTC-3) del día `dia_local` = 02:00 UTC del
     # día SIGUIENTE -- exactamente el caso que rompía el lookup viejo.
     ts_utc = datetime.combine(dia_local, time(23, 0)) + timedelta(hours=3)
+    # BE-P0-06: la atribución real la resuelve SesionOperario, no
+    # AsignacionTurno (que arriba sigue existiendo, es dotación/staffing
+    # planificado) -- sesión abierta que cubre el evento.
+    db.add(SesionOperario(
+        tenant_id=tenant_a, estacion_fk=estacion.id, operario_fk=operario.id,
+        turno_fk=turno.id, entrada=ts_utc - timedelta(minutes=1),
+    ))
     db.add(LiteEventoProduccion(
         tenant_id=tenant_a, id_estacion=str(estacion.id), unidades_procesadas=7,
         timestamp=ts_utc, estado="OPTIMO",

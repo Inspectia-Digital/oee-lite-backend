@@ -22,7 +22,7 @@ from app.models.domain import (
     Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
     ModoAsignacionOperariosEstacion, Operario, Turno, AsignacionTurno,
-    Maquina, MaquinaEstacion,
+    Maquina, MaquinaEstacion, SesionOperario,
 )
 
 logger = logging.getLogger(__name__)
@@ -504,8 +504,17 @@ def login_operario_terminal(
     (X-Device-Key, Fase D.4a). El operario se identifica escaneando su
     legajo una vez por sesión/turno. Esto NO toca eventos históricos: crea
     o actualiza la fila de AsignacionTurno para tenant + estación (la de la
-    credencial) + turno + fecha de hoy. Los reportes resuelven el operario
-    de cada evento en tiempo de lectura, cruzando por estación + momento.
+    credencial) + turno + fecha de hoy -- dotación/staffing PLANIFICADO,
+    sigue igual que siempre.
+
+    BE-P0-06 (PRD Go-Live Green Mills): en paralelo, ABRE una
+    SesionOperario nueva -- nunca pisa una fila existente como hacía
+    AsignacionTurno arriba. Si había una sesión abierta en esta estación
+    (de este u otro operario, ej. el turno anterior nunca escaneó
+    [SALIR]), se cierra primero (`salida = ahora`) para que los
+    intervalos de sesión nunca se superpongan. La atribución de eventos
+    a operario (KPI, ver analytics.py) se resuelve contra el historial
+    de SesionOperario, no contra AsignacionTurno.
     """
     operario = db.exec(
         select(Operario).where(
@@ -559,6 +568,27 @@ def login_operario_terminal(
         )
         db.add(asignacion)
 
+    ahora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    sesion_abierta = db.exec(
+        select(SesionOperario).where(
+            SesionOperario.tenant_id == dispositivo.tenant_id,
+            SesionOperario.estacion_fk == uuid.UUID(dispositivo.estacion_id),
+            SesionOperario.salida.is_(None),
+        )
+    ).first()
+    if sesion_abierta:
+        sesion_abierta.salida = ahora_utc
+        db.add(sesion_abierta)
+
+    nueva_sesion = SesionOperario(
+        tenant_id=dispositivo.tenant_id,
+        operario_fk=operario.id,
+        estacion_fk=uuid.UUID(dispositivo.estacion_id),
+        turno_fk=payload.turno_fk,
+        entrada=ahora_utc,
+    )
+    db.add(nueva_sesion)
+
     db.commit()
     db.refresh(asignacion)
     return {
@@ -581,11 +611,13 @@ def logout_operario_terminal(
     botón de la terminal sólo reseteaba estado LOCAL del front, sin
     ningún registro del lado del backend. Marca `hora_salida` en la
     AsignacionTurno de hoy para esta estación+turno (la misma fila que
-    crea/actualiza login_operario_terminal). Puramente informativo: NO
-    cambia cómo se resuelve el operario de un evento ya registrado, eso
-    sigue siendo por (tenant, estación, turno, fecha) -- ver el
-    comentario en el modelo (domain.py) sobre por qué no se formaliza
-    una ventana horaria real acá."""
+    crea/actualiza login_operario_terminal) -- dotación/staffing
+    PLANIFICADO, sigue igual que siempre.
+
+    BE-P0-06 (PRD Go-Live Green Mills): en paralelo, cierra
+    (`salida = ahora`) la SesionOperario ABIERTA de esta estación, que
+    es lo que ahora gobierna la atribución real de eventos a operario
+    (ver analytics.py) -- ya no la AsignacionTurno de arriba."""
     hoy = _resolver_fecha_operativa(db, dispositivo.estacion_id)
     asignacion = db.exec(
         select(AsignacionTurno).where(
@@ -598,7 +630,20 @@ def logout_operario_terminal(
     if not asignacion:
         raise error_terminal(404, ErrorCode.SESION_NO_ENCONTRADA, "No hay ninguna sesión abierta para cerrar en esta estación/turno hoy.")
 
-    asignacion.hora_salida = datetime.utcnow()
+    ahora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    asignacion.hora_salida = ahora_utc
     db.add(asignacion)
+
+    sesion_abierta = db.exec(
+        select(SesionOperario).where(
+            SesionOperario.tenant_id == dispositivo.tenant_id,
+            SesionOperario.estacion_fk == uuid.UUID(dispositivo.estacion_id),
+            SesionOperario.salida.is_(None),
+        )
+    ).first()
+    if sesion_abierta:
+        sesion_abierta.salida = ahora_utc
+        db.add(sesion_abierta)
+
     db.commit()
     return {"mensaje": "Sesión cerrada.", "asignacion_id": asignacion.id}

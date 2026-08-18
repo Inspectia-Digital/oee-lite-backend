@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.models.domain import (
-    AsignacionTurno, Estacion, Linea, Operario, Planta, Turno,
+    AsignacionTurno, Estacion, Linea, Operario, Planta, SesionOperario, Turno,
 )
 from tests.conftest import autenticar_como
 
@@ -77,6 +77,27 @@ def test_rendimiento_operarios_distingue_turno_dia_de_turno_noche(client, db, te
     db.add_all([
         AsignacionTurno(tenant_id=tenant_a, fecha=dia_local, estacion_fk=estacion.id, operario_fk=op_dia.id, turno_fk=turno_dia.id),
         AsignacionTurno(tenant_id=tenant_a, fecha=dia_local, estacion_fk=estacion.id, operario_fk=op_noche.id, turno_fk=turno_noche.id),
+    ])
+    db.commit()
+
+    # BE-P0-06: la atribución real la resuelve SesionOperario (arriba
+    # sigue existiendo AsignacionTurno, dotación/staffing planificado sin
+    # cambios). Dos sesiones reales, una por turno, cada una cubriendo su
+    # propia ventana horaria -- exactamente el escenario "dos turnos,
+    # mismo día, misma estación" que este test existe para probar.
+    def _local_utc_naive(hora: time, dia=dia_local):
+        return datetime.combine(dia, hora, tzinfo=TZ).astimezone(timezone.utc).replace(tzinfo=None)
+
+    db.add_all([
+        SesionOperario(
+            tenant_id=tenant_a, estacion_fk=estacion.id, operario_fk=op_dia.id, turno_fk=turno_dia.id,
+            entrada=_local_utc_naive(time(6, 0)), salida=_local_utc_naive(time(14, 0)),
+        ),
+        SesionOperario(
+            tenant_id=tenant_a, estacion_fk=estacion.id, operario_fk=op_noche.id, turno_fk=turno_noche.id,
+            entrada=_local_utc_naive(time(22, 0)),
+            salida=_local_utc_naive(time(6, 0), dia=dia_local + timedelta(days=1)),
+        ),
     ])
     db.commit()
 

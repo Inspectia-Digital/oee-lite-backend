@@ -1,13 +1,20 @@
 """Fase O (auditoría de producción del front, ítem #4): GET
 /analytics/rendimiento-operarios/. Antes el front ya llamaba a esta URL
-pero el endpoint no existía en el backend en absoluto."""
-from datetime import datetime, time
+pero el endpoint no existía en el backend en absoluto.
+
+BE-P0-06 (PRD Go-Live Green Mills): la atribución operario->evento ahora
+resuelve contra SesionOperario (intersección de intervalo), no contra
+AsignacionTurno -- ver docstring del endpoint en analytics.py. Los tests
+siguen creando AsignacionTurno (sigue existiendo, es dotación/staffing)
+Y además una SesionOperario abierta, mismo par que scans.py crea en un
+login real."""
+from datetime import datetime, time, timedelta
 
 from sqlmodel import select
 
 from app.models.domain import (
     AsignacionTurno, Estacion, LiteEventoProduccion, Linea, Operario,
-    Planta, Turno,
+    Planta, SesionOperario, Turno,
 )
 from tests.conftest import autenticar_como
 
@@ -55,6 +62,26 @@ def _asignar_y_emitir(db, tenant_id, estacion, turno, operario, estado="OPTIMO",
         db.add(AsignacionTurno(
             tenant_id=tenant_id, fecha=hoy, estacion_fk=estacion.id,
             operario_fk=operario.id, turno_fk=turno.id,
+        ))
+        db.commit()
+
+    # BE-P0-06: la atribución real la resuelve SesionOperario, no
+    # AsignacionTurno (ver docstring del módulo) -- misma sesión abierta
+    # reusada entre llamadas sucesivas de este helper para el mismo
+    # (estación, operario), igual que un operario real que sigue logueado.
+    sesion_abierta = db.exec(
+        select(SesionOperario).where(
+            SesionOperario.tenant_id == tenant_id,
+            SesionOperario.estacion_fk == estacion.id,
+            SesionOperario.operario_fk == operario.id,
+            SesionOperario.salida.is_(None),
+        )
+    ).first()
+    if not sesion_abierta:
+        db.add(SesionOperario(
+            tenant_id=tenant_id, estacion_fk=estacion.id,
+            operario_fk=operario.id, turno_fk=turno.id,
+            entrada=datetime.utcnow() - timedelta(hours=1),
         ))
         db.commit()
 

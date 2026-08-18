@@ -320,6 +320,34 @@ class AsignacionTurno(TenantBase, table=True):
     # sería un cambio de modelo más grande, fuera de este alcance.
     hora_salida: Optional[datetime] = Field(default=None)
 
+class SesionOperario(TenantBase, table=True):
+    """BE-P0-06 (PRD Go-Live Green Mills, auditoría backend 18/8): sesión
+    de operario INMUTABLE -- cada login crea una fila nueva, nunca pisa
+    una anterior (a diferencia de AsignacionTurno, que sigue existiendo
+    tal cual para el tablero de dotación/staffing planificado, un
+    concepto distinto: "quién está asignado hoy", no "quién trabajó
+    cuándo"). login_operario_terminal/logout_operario_terminal (scans.py)
+    actualizan AMBAS tablas en paralelo -- AsignacionTurno no se toca.
+
+    La atribución de un evento a un operario se resuelve por
+    INTERSECCIÓN DE INTERVALO: la sesión de esa estación cuyo
+    [entrada, salida) contiene el timestamp del evento (salida NULL =
+    sesión todavía abierta). Un evento fuera de cualquier intervalo
+    (ej. entre el logout de A y el login de B) no se atribuye a nadie --
+    no se inventa una asignación.
+
+    Invariante que scans.py mantiene: nunca hay más de una sesión ABIERTA
+    (salida NULL) por estación a la vez -- un login nuevo cierra
+    (`salida = ahora`) cualquier sesión abierta de esa estación antes de
+    abrir la propia, así los intervalos nunca se superponen."""
+    __tablename__ = "sesiones_operario"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    operario_fk: uuid.UUID = Field(foreign_key="dim_operarios.id", index=True)
+    estacion_fk: uuid.UUID = Field(foreign_key="dim_estaciones.id", index=True)
+    turno_fk: uuid.UUID = Field(foreign_key="dim_turnos.id")
+    entrada: datetime = Field(index=True)
+    salida: Optional[datetime] = Field(default=None, index=True)
+
 class AsignacionSupervisor(TenantBase, table=True):
     """Regla de supervisión programable (Fase Q -- reemplaza el tablero
     diario de Fase H). El turno es una plantilla maestra; el supervisor a
