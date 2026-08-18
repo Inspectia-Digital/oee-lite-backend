@@ -33,6 +33,7 @@ from app.models.domain import (
     AsignacionModuloTenant, EstadoAsignacionModulo,
     Factura, EstadoFactura,
     SuscripcionTenant, EstadoCuentaTenant,
+    PagoInformado, EstadoPagoInformado,
     Tenant,
     UsuarioSaaS,
 )
@@ -1012,3 +1013,164 @@ def obtener_mi_estado_cuenta(
     hay cron que lo mantenga fresco solo) -- barato: sólo suma las
     facturas ya generadas del propio tenant, sin recorrer otros tenants."""
     return _recalcular_estado_cuenta(db, context.tenant_id)
+
+
+# ==========================================
+# Fase EE: PAGOS INFORMADOS (autoinforme del cliente) + aprobación
+# ==========================================
+class PagoInformadoCreate(BaseModel):
+    fecha_pago: date
+    monto: Decimal
+    referencia: Optional[str] = None
+    comprobante_url: Optional[str] = None
+
+
+class RechazoPagoPayload(BaseModel):
+    motivo: str
+
+    @field_validator("motivo")
+    @classmethod
+    def _validar_motivo(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("motivo es requerido para rechazar un pago.")
+        return v
+
+
+@router.post(
+    "/mi-empresa/facturas/{factura_id}/informar-pago",
+    response_model=PagoInformado, status_code=status.HTTP_201_CREATED,
+)
+def informar_pago(
+    factura_id: uuid.UUID,
+    payload: PagoInformadoCreate,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """PRD §7/§9: el "autoinforme del cliente" -- el PRD no lista este
+    endpoint explícitamente en su índice §9 (sólo los 3 admin-side), pero
+    la maqueta (§5, botón "[Informar pago]") y el propio nombre de esta
+    fase lo requieren; ver comentario en el modelo PagoInformado."""
+    factura = db.get(Factura, factura_id)
+    if not factura or factura.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Factura no encontrada.")
+    if factura.estado == EstadoFactura.PAGADA:
+        raise HTTPException(status_code=422, detail="Esta factura ya está pagada.")
+    ya_pendiente = db.exec(
+        select(PagoInformado).where(
+            PagoInformado.factura_id == factura_id,
+            PagoInformado.estado == EstadoPagoInformado.PENDIENTE_REVISION,
+        )
+    ).first()
+    if ya_pendiente:
+        raise HTTPException(status_code=409, detail="Ya hay un pago informado para esta factura pendiente de revisión.")
+
+    pago = PagoInformado(
+        factura_id=factura_id,
+        tenant_id=context.tenant_id,
+        fecha_pago=payload.fecha_pago,
+        monto=payload.monto,
+        referencia=payload.referencia,
+        comprobante_url=payload.comprobante_url,
+        creado_por_id=usuario.id,
+        actualizado_por_id=usuario.id,
+    )
+    db.add(pago)
+    db.commit()
+    db.refresh(pago)
+    return pago
+
+
+@router.get("/pagos-informados", response_model=List[PagoInformado])
+def listar_pagos_informados(
+    estado: Optional[EstadoPagoInformado] = None,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    query = select(PagoInformado)
+    if estado is not None:
+        query = query.where(PagoInformado.estado == estado)
+    return db.exec(query.order_by(PagoInformado.creado_at.desc())).all()
+
+
+@router.get("/mi-empresa/pagos-informados", response_model=List[PagoInformado])
+def listar_mis_pagos_informados(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    return db.exec(
+        select(PagoInformado).where(PagoInformado.tenant_id == context.tenant_id).order_by(PagoInformado.creado_at.desc())
+    ).all()
+
+
+@router.post("/pagos-informados/{pago_id}/aprobar", response_model=PagoInformado)
+def aprobar_pago_informado(
+    pago_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """PRD §7 "Al Aprobar": pago→aprobado, factura→pagada, deuda
+    recalcula, estado de cuenta actualiza. (Envío de email excluido --
+    nada de esta fase manda comunicaciones reales, ver docstring del
+    módulo.)"""
+    pago = db.get(PagoInformado, pago_id)
+    if not pago:
+        raise HTTPException(status_code=404, detail="Pago informado no encontrado.")
+    if pago.estado != EstadoPagoInformado.PENDIENTE_REVISION:
+        raise HTTPException(status_code=422, detail=f"Sólo se puede aprobar un pago pendiente de revisión (estado actual: {pago.estado.value}).")
+
+    factura = db.get(Factura, pago.factura_id)
+    if not factura:
+        raise HTTPException(status_code=404, detail="La factura de este pago ya no existe.")
+
+    pago.estado = EstadoPagoInformado.APROBADO
+    pago.aprobado_por_id = usuario.id
+    pago.fecha_aprobacion = datetime.utcnow()
+    pago.actualizado_por_id = usuario.id
+    pago.actualizado_at = datetime.utcnow()
+    db.add(pago)
+
+    factura.estado = EstadoFactura.PAGADA
+    factura.actualizado_por_id = usuario.id
+    factura.actualizado_at = datetime.utcnow()
+    db.add(factura)
+    db.commit()
+
+    _recalcular_estado_cuenta(db, pago.tenant_id)
+    # el commit de _recalcular_estado_cuenta expira los atributos de
+    # `pago` en esta sesión -- mismo bug/fix que en _generar_factura
+    # (Fase ED, ver comentario ahí para el detalle completo).
+    db.refresh(pago)
+    return pago
+
+
+@router.post("/pagos-informados/{pago_id}/rechazar", response_model=PagoInformado)
+def rechazar_pago_informado(
+    pago_id: uuid.UUID,
+    payload: RechazoPagoPayload,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """PRD §7 "Al Rechazar": pago→rechazado + motivo. La factura NO se
+    toca -- ya estaba en un estado no-pagado (pendiente_envio/enviada)
+    desde antes de informar el pago, y el pseudocódigo del PRD
+    ("Factura -> 'pendiente'") no corresponde a ningún estado real del
+    enum EstadoFactura; no hay nada que revertir."""
+    pago = db.get(PagoInformado, pago_id)
+    if not pago:
+        raise HTTPException(status_code=404, detail="Pago informado no encontrado.")
+    if pago.estado != EstadoPagoInformado.PENDIENTE_REVISION:
+        raise HTTPException(status_code=422, detail=f"Sólo se puede rechazar un pago pendiente de revisión (estado actual: {pago.estado.value}).")
+
+    pago.estado = EstadoPagoInformado.RECHAZADO
+    pago.aprobado_por_id = usuario.id
+    pago.fecha_aprobacion = datetime.utcnow()
+    pago.observaciones = payload.motivo
+    pago.actualizado_por_id = usuario.id
+    pago.actualizado_at = datetime.utcnow()
+    db.add(pago)
+    db.commit()
+    db.refresh(pago)
+    return pago
