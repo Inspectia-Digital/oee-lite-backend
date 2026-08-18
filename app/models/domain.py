@@ -927,3 +927,116 @@ class AsignacionModuloTenant(SQLModel, table=True):
     __table_args__ = (
         Index("ix_tenant_modulos_asignados_unico", "tenant_id", "modulo_id", unique=True),
     )
+
+
+# Fase ED: cálculo de monto a pagar. `Factura` = REGISTRO interno de lo
+# que un tenant debe por un módulo/período, NUNCA un documento real
+# (PDF/email) -- confirmado con el usuario (AskUserQuestion, antes de
+# Fase EB): el envío real pasa 100% fuera del sistema (por mail entre
+# las personas involucradas), acá sólo se calcula el monto y se deja
+# constancia.
+#
+# El PRD §5 describe un cron mensual automático que genera facturas solo,
+# pero eso CONTRADICE su propio criterio de aceptación §10 ("Cliente
+# solicita (no genera automática)") y su propio §11 ("No incluir:
+# Automatización cobranza"). Resuelto a favor de NO automatizar (mismo
+# criterio ya confirmado con el usuario): la generación es una ACCIÓN
+# explícita que dispara Gerencia (desde "Mi Empresa" -- el "cliente
+# solicita" del PRD) o SuperAdmin (desde el panel), nunca un cron. Ver
+# el helper _generar_factura en billing.py.
+class EstadoFactura(str, Enum):
+    PENDIENTE_ENVIO = "pendiente_envio"
+    ENVIADA = "enviada"
+    PAGADA = "pagada"
+    VENCIDA = "vencida"
+
+
+class Factura(SQLModel, table=True):
+    """PRD §2 (tabla `facturas`) + §6 (una factura por asignación, no una
+    combinada por tenant -- así lo hace el propio pseudocódigo del PRD,
+    iterando `for asignacion in asignaciones`). `monto` se copia de
+    `AsignacionModuloTenant.precio_con_descuento` en el momento de
+    generar (snapshot, mismo criterio que esa columna) -- por eso un
+    módulo 100% bonificado nunca genera una factura con monto > 0 sin
+    necesitar ningún caso especial acá (ver _generar_factura, billing.py).
+
+    `asignacion_id`/`periodo` no están en el DDL literal del PRD, pero
+    son necesarios para poder detectar "ya se generó factura para este
+    módulo este mes" de forma estructural (índice único), en vez de
+    parsear el string `concepto` como hacía el pseudocódigo del PRD."""
+    __tablename__ = "facturas"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    tenant_id: str = Field(foreign_key="tenants_saas.id", index=True)
+    asignacion_id: uuid.UUID = Field(foreign_key="tenant_modulos_asignados.id")
+    numero: str = Field(unique=True, index=True, description="Ej: FC-2026-001")
+    periodo: str = Field(index=True, description="YYYY-MM -- mes que cubre esta factura")
+    fecha_emision: date
+    concepto: str
+    monto: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False))
+    metodo_pago_id: uuid.UUID = Field(foreign_key="metodos_pago_configurados.id")
+    estado: EstadoFactura = Field(
+        default=EstadoFactura.PENDIENTE_ENVIO,
+        sa_column=Column(SaEnum(EstadoFactura, values_callable=lambda obj: [e.value for e in obj])),
+    )
+    fecha_vencimiento: date
+
+    enviada_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    fecha_envio: Optional[datetime] = Field(default=None)
+
+    creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)
+
+    __table_args__ = (
+        # Defensa en profundidad: ya se chequea en el endpoint antes de
+        # insertar (409 legible), pero el índice único es lo que
+        # realmente garantiza "una sola factura por módulo y mes" contra
+        # una carrera (dos clicks casi simultáneos).
+        Index("ix_facturas_asignacion_periodo_unico", "asignacion_id", "periodo", unique=True),
+    )
+
+
+class EstadoCuentaTenant(str, Enum):
+    AL_DIA = "al_dia"
+    CON_DEUDA = "con_deuda"
+    VENCIDA = "vencida"
+
+
+class EstadoSuscripcionTenant(str, Enum):
+    ACTIVA = "activa"
+    SUSPENDIDA = "suspendida"
+    CANCELADA = "cancelada"
+
+
+class SuscripcionTenant(SQLModel, table=True):
+    """PRD §2 (tabla `tenant_suscripcion`) -- resumen cacheado de deuda
+    por tenant, recalculado por `_recalcular_estado_cuenta` (billing.py)
+    cada vez que se genera una factura (Fase ED) o se aprueba/rechaza un
+    pago informado (Fase EE, que reutiliza el mismo helper). NO se
+    recalcula solo -- no hay cron en este MVP (ver Factura).
+
+    `estado` (activa/suspendida/cancelada) es el ciclo de vida de la
+    SUSCRIPCIÓN de facturación -- una dimensión de negocio nueva y
+    DISTINTA de `Tenant.estado` (activo/ui_suspendida/suspension_total,
+    Fase D.2), que sigue siendo la única que efectivamente bloquea el
+    acceso a la UI. Este MVP no cablea una a la otra (el PRD no lo pide);
+    por ahora `estado` queda en ACTIVA por defecto, sin endpoint propio
+    para cambiarlo -- es sólo un campo informativo del panel de billing."""
+    __tablename__ = "tenant_suscripcion"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    tenant_id: str = Field(foreign_key="tenants_saas.id", unique=True, index=True)
+
+    estado: EstadoSuscripcionTenant = Field(
+        default=EstadoSuscripcionTenant.ACTIVA,
+        sa_column=Column(SaEnum(EstadoSuscripcionTenant, values_callable=lambda obj: [e.value for e in obj])),
+    )
+
+    deuda_total: Decimal = Field(default=Decimal("0.00"), sa_column=Column(Numeric(10, 2), nullable=False))
+    facturas_vencidas: int = Field(default=0)
+    estado_cuenta: EstadoCuentaTenant = Field(
+        default=EstadoCuentaTenant.AL_DIA,
+        sa_column=Column(SaEnum(EstadoCuentaTenant, values_callable=lambda obj: [e.value for e in obj])),
+    )
+
+    actualizado_at: datetime = Field(default_factory=datetime.utcnow)

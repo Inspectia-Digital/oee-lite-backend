@@ -15,21 +15,24 @@ anterior a esta fase):
   un cálculo interno, nunca un PDF ni un email real).
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from sqlmodel import Session, select, func
 from pydantic import BaseModel, field_validator
 from typing import List, Optional, Tuple
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 import uuid
 
 from app.core.database import get_session
-from app.core.rbac import requerir_superadmin
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext
+from app.core.rbac import requerir_superadmin, requerir_gerencia_o_superadmin
 from app.models.domain import (
     ModuloDisponible, EstadoModuloDisponible,
     PlanPrecio, EstadoPlanPrecio,
     MetodoPagoConfigurado, EstadoMetodoPago,
     PlanComercial, EstadoPlanComercial, PlanComercialModulo, PlanComercialPlan,
     AsignacionModuloTenant, EstadoAsignacionModulo,
+    Factura, EstadoFactura,
+    SuscripcionTenant, EstadoCuentaTenant,
     Tenant,
     UsuarioSaaS,
 )
@@ -785,3 +788,227 @@ def eliminar_asignacion_modulo(
         raise HTTPException(status_code=404, detail="Asignación no encontrada.")
     db.delete(asignacion)
     db.commit()
+
+
+# ==========================================
+# Fase ED: FACTURAS (cálculo de monto a pagar) + ESTADO DE CUENTA
+# ==========================================
+MESES_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
+
+
+def _generar_numero_factura(db: Session, anio: int) -> str:
+    """Numeración global secuencial por año (FC-2026-001, FC-2026-002...),
+    tal como declara el DDL del PRD (`numero VARCHAR(50) UNIQUE`, sin
+    scope por tenant) -- el mockup de UI del PRD (§5) muestra "FC-2026-001"
+    repetido para dos clientes distintos, pero es texto de ejemplo de la
+    maqueta, no una regla real; el esquema (fuente de verdad) es único a
+    nivel global, así que la secuencia también lo es."""
+    prefijo = f"FC-{anio}-"
+    cantidad = db.exec(select(func.count(Factura.id)).where(Factura.numero.like(f"{prefijo}%"))).one()
+    return f"{prefijo}{cantidad + 1:03d}"
+
+
+def _recalcular_estado_cuenta(db: Session, tenant_id: str) -> SuscripcionTenant:
+    """PRD §8 (`calcular_deuda_cliente`). El PRD suma `monto` de las
+    facturas pendiente_envio/enviada/vencida y trata "100% bonificado
+    ilimitado" como un caso especial que fuerza deuda=0 -- acá ese caso
+    especial no hace falta: como `_resolver_precios` (Fase EC) ya deja
+    `precio_con_descuento=0.00` para un plan comercial bonificado, la
+    factura de ese módulo nace con monto=0 y por lo tanto estado='pagada'
+    de entrada (ver _generar_factura) -- nunca entra a la suma de deuda.
+    El resultado es el mismo que el caso especial del PRD, sin duplicar
+    la regla acá."""
+    facturas_pendientes = db.exec(
+        select(Factura).where(
+            Factura.tenant_id == tenant_id,
+            Factura.estado.in_([EstadoFactura.PENDIENTE_ENVIO, EstadoFactura.ENVIADA, EstadoFactura.VENCIDA]),
+        )
+    ).all()
+    deuda_total = sum((f.monto for f in facturas_pendientes), Decimal("0.00"))
+    facturas_vencidas = sum(1 for f in facturas_pendientes if f.estado == EstadoFactura.VENCIDA)
+
+    if deuda_total <= 0:
+        estado_cuenta = EstadoCuentaTenant.AL_DIA
+    elif facturas_vencidas == 0:
+        estado_cuenta = EstadoCuentaTenant.CON_DEUDA
+    else:
+        estado_cuenta = EstadoCuentaTenant.VENCIDA
+
+    suscripcion = db.exec(select(SuscripcionTenant).where(SuscripcionTenant.tenant_id == tenant_id)).first()
+    if not suscripcion:
+        suscripcion = SuscripcionTenant(tenant_id=tenant_id)
+    suscripcion.deuda_total = deuda_total
+    suscripcion.facturas_vencidas = facturas_vencidas
+    suscripcion.estado_cuenta = estado_cuenta
+    suscripcion.actualizado_at = datetime.utcnow()
+    db.add(suscripcion)
+    db.commit()
+    db.refresh(suscripcion)
+    return suscripcion
+
+
+def _generar_factura(db: Session, tenant_id: str, asignacion: AsignacionModuloTenant, usuario: UsuarioSaaS) -> Factura:
+    """Núcleo compartido por las dos acciones de generación (SuperAdmin
+    admin-side y Gerencia "solicitar factura" client-side, PRD §9
+    `POST /api/tenant/solicitar-factura`) -- mismo cálculo, distinto
+    quién lo dispara. NUNCA un cron (ver comentario en el modelo Factura,
+    domain.py)."""
+    if asignacion.estado != EstadoAsignacionModulo.ACTIVA:
+        raise HTTPException(status_code=422, detail="Sólo se puede generar factura para una asignación activa.")
+
+    hoy = date.today()
+    periodo = hoy.strftime("%Y-%m")
+    ya_existe = db.exec(
+        select(Factura).where(Factura.asignacion_id == asignacion.id, Factura.periodo == periodo)
+    ).first()
+    if ya_existe:
+        raise HTTPException(status_code=409, detail=f"Ya existe una factura para este módulo en el período {periodo} ({ya_existe.numero}).")
+
+    plan = db.get(PlanPrecio, asignacion.plan_id)
+    monto = asignacion.precio_con_descuento  # snapshot ya resuelto en Fase EC, no se recalcula acá
+    concepto = f"{plan.nombre if plan else 'Módulo'} - {MESES_ES[hoy.month]} {hoy.year}"
+
+    factura = Factura(
+        tenant_id=tenant_id,
+        asignacion_id=asignacion.id,
+        numero=_generar_numero_factura(db, hoy.year),
+        periodo=periodo,
+        fecha_emision=hoy,
+        concepto=concepto,
+        monto=monto,
+        metodo_pago_id=asignacion.metodo_pago_id,
+        # PRD §6 (pseudocódigo): "estado='pagada' if monto == 0 else 'pendiente_envio'".
+        estado=EstadoFactura.PAGADA if monto == 0 else EstadoFactura.PENDIENTE_ENVIO,
+        fecha_vencimiento=hoy + timedelta(days=30),
+        creado_por_id=usuario.id,
+        actualizado_por_id=usuario.id,
+    )
+    db.add(factura)
+    db.commit()
+    db.refresh(factura)
+    _recalcular_estado_cuenta(db, tenant_id)
+    # _recalcular_estado_cuenta hace su propio commit, que EXPIRA los
+    # atributos de `factura` en esta misma sesión -- SQLModel/Pydantic v2
+    # .model_dump() (lo que usa la serialización de response_model) NO
+    # dispara el lazy-refresh de SQLAlchemy como sí lo hace un getattr
+    # normal, así que sin este segundo refresh la respuesta HTTP sale
+    # como `{}` en silencio (bug real, encontrado probando este endpoint
+    # a mano). Refrescar de nuevo antes de devolver.
+    db.refresh(factura)
+    return factura
+
+
+@router.post(
+    "/clientes/{tenant_id}/modulos/{asignacion_id}/generar-factura",
+    response_model=Factura, status_code=status.HTTP_201_CREATED,
+)
+def generar_factura_admin(
+    tenant_id: str,
+    asignacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Generación manual desde el panel de administración (cualquier tenant)."""
+    asignacion = db.get(AsignacionModuloTenant, asignacion_id)
+    if not asignacion or asignacion.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Asignación no encontrada.")
+    return _generar_factura(db, tenant_id, asignacion, usuario)
+
+
+@router.post(
+    "/mi-empresa/modulos/{asignacion_id}/solicitar-factura",
+    response_model=Factura, status_code=status.HTTP_201_CREATED,
+)
+def solicitar_factura_cliente(
+    asignacion_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """PRD §9 `POST /api/tenant/solicitar-factura` -- el "cliente solicita"
+    del criterio de aceptación §10 es, en este backend, la propia
+    Gerencia del tenant (o SuperAdmin en Modo Dios) pidiéndola desde "Mi
+    Empresa"; nunca un cron. tenant_id sale del contexto autenticado, no
+    de un parámetro que el cliente pueda falsear."""
+    asignacion = db.get(AsignacionModuloTenant, asignacion_id)
+    if not asignacion or asignacion.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Asignación no encontrada.")
+    return _generar_factura(db, context.tenant_id, asignacion, usuario)
+
+
+@router.get("/clientes/{tenant_id}/facturas", response_model=List[Factura])
+def listar_facturas_de_tenant(
+    tenant_id: str,
+    estado: Optional[EstadoFactura] = None,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(Tenant, tenant_id):
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    query = select(Factura).where(Factura.tenant_id == tenant_id)
+    if estado is not None:
+        query = query.where(Factura.estado == estado)
+    return db.exec(query.order_by(Factura.fecha_emision.desc())).all()
+
+
+@router.get("/mi-empresa/facturas", response_model=List[Factura])
+def listar_mis_facturas(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """PRD: pantalla cliente "FACTURAS RECIENTES"."""
+    return db.exec(
+        select(Factura).where(Factura.tenant_id == context.tenant_id).order_by(Factura.fecha_emision.desc())
+    ).all()
+
+
+@router.post("/facturas/{factura_id}/marcar-enviada", response_model=Factura)
+def marcar_factura_enviada(
+    factura_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """PRD §5/§9: el PDF/envío real pasa 100% fuera del sistema (por mail
+    entre las personas involucradas) -- esto sólo deja constancia de que
+    ya se envió, y cuándo, y quién lo marcó."""
+    factura = db.get(Factura, factura_id)
+    if not factura:
+        raise HTTPException(status_code=404, detail="Factura no encontrada.")
+    if factura.estado != EstadoFactura.PENDIENTE_ENVIO:
+        raise HTTPException(status_code=422, detail=f"Sólo se puede marcar como enviada una factura pendiente de envío (estado actual: {factura.estado.value}).")
+    factura.estado = EstadoFactura.ENVIADA
+    factura.enviada_por_id = usuario.id
+    factura.fecha_envio = datetime.utcnow()
+    factura.actualizado_por_id = usuario.id
+    factura.actualizado_at = datetime.utcnow()
+    db.add(factura)
+    db.commit()
+    db.refresh(factura)
+    return factura
+
+
+@router.get("/clientes/{tenant_id}/estado-cuenta", response_model=SuscripcionTenant)
+def obtener_estado_cuenta_admin(
+    tenant_id: str,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(Tenant, tenant_id):
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    return _recalcular_estado_cuenta(db, tenant_id)
+
+
+@router.get("/mi-empresa/estado-cuenta", response_model=SuscripcionTenant)
+def obtener_mi_estado_cuenta(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """PRD `GET /api/tenant/estado-cuenta`. Recalcula en el momento (no
+    hay cron que lo mantenga fresco solo) -- barato: sólo suma las
+    facturas ya generadas del propio tenant, sin recorrer otros tenants."""
+    return _recalcular_estado_cuenta(db, context.tenant_id)
