@@ -21,7 +21,7 @@ from app.models.domain import (
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada,
     AsignacionSupervisor, Supervisor, Maquina, MaestroSKU,
-    EstadoExclusionOee, MaquinaEstacion,
+    EstadoExclusionOee, MaquinaEstacion, SesionOperario,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -1636,19 +1636,6 @@ def _dia_iso_anterior(dia_iso: int) -> int:
     return 7 if dia_iso == 1 else dia_iso - 1
 
 
-def _fecha_inicio_turno(fecha_consulta: date, hora_local: time, turno: Turno) -> date:
-    """QA-09 (auditoría QA): qué fecha usar para buscar en
-    AsignacionTurno.fecha -- el día en que el TURNO empieza, no
-    necesariamamente fecha_consulta. Para un turno que cruza medianoche,
-    si hora_local cae en la franja "de madrugada" (antes de hora_fin,
-    ver _resolver_turno_por_horario), el turno arrancó AYER -- la
-    dotación se carga pensando en "el turno del lunes a la noche", con
-    fecha=lunes, no fecha=martes."""
-    if turno.hora_inicio > turno.hora_fin and hora_local <= turno.hora_fin:
-        return fecha_consulta - timedelta(days=1)
-    return fecha_consulta
-
-
 def _resolver_turno_por_horario(hora_local: time, dia_iso: int, turnos: List[Turno]) -> Optional[Turno]:
     """Qué Turno (de una lista ya acotada a una línea) está vigente para
     una hora+día puntuales -- horario + día de semana, primer match gana.
@@ -1885,11 +1872,13 @@ def obtener_rendimiento_operarios(
     front #4 -- antes el front llamaba a esta URL pero el endpoint no
     existía en absoluto). Por defecto, últimos 7 días.
 
-    La resolución operario→evento es la misma que ya usa /eventos/live y
-    /analytics/reporte-operarios: vía AsignacionTurno por (estación,
-    fecha) del evento, no un campo directo en LiteEventoProduccion (no
-    existe). Eventos sin asignación resuelta se excluyen -- no se le
-    puede atribuir producción a "nadie" en un reporte por operario."""
+    BE-P0-06 (PRD Go-Live Green Mills): la resolución operario→evento es
+    por INTERSECCIÓN DE INTERVALO contra SesionOperario (entrada/salida
+    reales de cada login/logout), no contra AsignacionTurno (una fila
+    mutable por estación+turno+fecha que un segundo login pisaba sin
+    dejar rastro del operario anterior -- ver domain.py). Un evento que
+    cae en el hueco entre el logout de A y el login de B no se atribuye
+    a nadie, a propósito -- no se inventa una asignación."""
     try:
         validar_planta(context)
     except ValueError:
@@ -1925,74 +1914,37 @@ def obtener_rendimiento_operarios(
         if not eventos:
             return []
 
-        # Fase AB.2 (bug real, confirmado auditando "confirmar que
-        # Rendimiento Operarios funcione correctamente"): agrupaba por
-        # evento.timestamp.date() -- la fecha CALENDARIO EN UTC del
-        # timestamp persistido -- para buscar en AsignacionTurno.fecha,
-        # que un supervisor carga pensando en el día de PLANTA, no en UTC.
-        # Con Green Mills en UTC-3, cualquier evento después de las 21hs
-        # hora local cae en el día siguiente en UTC: el lookup fallaba en
-        # silencio (sin excepción, sin log) y esos eventos quedaban fuera
-        # del reporte por falta de operario resuelto -- exactamente el
-        # mismo tipo de bug que Fase Q ya había corregido en
-        # /analytics/linea-en-vivo/ (_fecha_planta), pero nunca se aplicó acá.
-        planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
         estacion_ids = {est.id for _, est in eventos}
 
-        # QA-09 (auditoría QA): antes se agrupaba operario por
-        # (estacion_fk, fecha) -- con DOS turnos en la misma estación el
-        # mismo día (el caso normal: turno día + turno noche), la
-        # segunda asignación cargada pisaba a la primera en este dict, y
-        # TODOS los eventos de ese día terminaban atribuidos a un único
-        # operario (el que ganara el orden no garantizado de las filas
-        # de Postgres). Ahora cada evento resuelve primero SU turno por
-        # horario (mismo criterio corregido en Fase AM) y la key de
-        # lookup suma turno_fk.
-        linea_ids = {est.linea_id for _, est in eventos if est.linea_id}
-        turnos_por_linea: Dict[uuid.UUID, List[Turno]] = {}
-        if linea_ids:
-            for t in db.exec(
-                select(Turno).where(
-                    Turno.tenant_id == context.tenant_id,
-                    Turno.linea_id.in_(linea_ids),
-                    Turno.activo == True,  # noqa: E712
-                )
-            ).all():
-                turnos_por_linea.setdefault(t.linea_id, []).append(t)
-
-        # Resuelto una sola vez por evento (se reusa para acotar qué
-        # fechas traer de AsignacionTurno y para el lookup real de abajo).
-        resolucion_por_evento: Dict[uuid.UUID, tuple] = {}
-        for evento, estacion in eventos:
-            hora_local = _hora_planta(evento.timestamp, planta)
-            fecha_evento = _fecha_planta(evento.timestamp, planta)
-            turno = _resolver_turno_por_horario(
-                hora_local, fecha_evento.isoweekday(), turnos_por_linea.get(estacion.linea_id, [])
+        # BE-P0-06: sesiones que pudieron estar abiertas en algún momento
+        # de la ventana [inicio, fin] -- entrada antes de que termine la
+        # ventana Y (todavía abierta O cerrada después de que empiece la
+        # ventana). Se traen una sola vez y se resuelven en memoria por
+        # evento (mismo patrón que el resto de esta función: bulk-fetch +
+        # match en Python, no una query por evento).
+        sesiones = db.exec(
+            select(SesionOperario).where(
+                SesionOperario.tenant_id == context.tenant_id,
+                SesionOperario.estacion_fk.in_(estacion_ids),
+                SesionOperario.entrada <= fin,
+                (SesionOperario.salida.is_(None)) | (SesionOperario.salida >= inicio),
             )
-            if turno:
-                resolucion_por_evento[evento.id] = (turno.id, _fecha_inicio_turno(fecha_evento, hora_local, turno))
+        ).all()
+        sesiones_por_estacion: Dict[uuid.UUID, List[SesionOperario]] = {}
+        for s in sesiones:
+            sesiones_por_estacion.setdefault(s.estacion_fk, []).append(s)
 
-        fechas_necesarias = {f for _, f in resolucion_por_evento.values()}
-        asignaciones = db.exec(
-            select(AsignacionTurno).where(
-                AsignacionTurno.tenant_id == context.tenant_id,
-                AsignacionTurno.estacion_fk.in_(estacion_ids),
-                AsignacionTurno.fecha.in_(fechas_necesarias),
-            )
-        ).all() if fechas_necesarias else []
-        operario_por_estacion_fecha_turno = {
-            (a.estacion_fk, a.fecha, a.turno_fk): a.operario_fk for a in asignaciones
-        }
+        def _operario_de_sesion(estacion_id: uuid.UUID, ts: datetime) -> Optional[uuid.UUID]:
+            for s in sesiones_por_estacion.get(estacion_id, []):
+                if s.entrada <= ts and (s.salida is None or s.salida > ts):
+                    return s.operario_fk
+            return None  # ningún intervalo contiene el evento -- no se inventa una asignación
 
         agrupado = {}
         for evento, estacion in eventos:
-            resuelto = resolucion_por_evento.get(evento.id)
-            if not resuelto:
-                continue  # sin turno resuelto, no hay forma de saber a quién atribuirlo
-            turno_id, fecha_inicio = resuelto
-            op_id = operario_por_estacion_fecha_turno.get((estacion.id, fecha_inicio, turno_id))
+            op_id = _operario_de_sesion(estacion.id, evento.timestamp)
             if not op_id:
-                continue
+                continue  # evento fuera de cualquier sesión (ver docstring) -- no se atribuye
             if operario_id and op_id != operario_id:
                 continue
 
@@ -2829,17 +2781,24 @@ def obtener_dia_radiografia(
                 )
                 es_planificada = bool(motivo and motivo.tipo_parada == TipoParada.PLANIFICADA)
 
-                asignacion = db.exec(
-                    select(AsignacionTurno, Operario)
-                    .join(Operario, AsignacionTurno.operario_fk == Operario.id)
+                # BE-P0-06: quién estaba en esta estación al MOMENTO de la
+                # parada, por intersección de intervalo contra
+                # SesionOperario (entrada/salida reales) -- no la fila
+                # mutable de AsignacionTurno de todo el turno/día, que
+                # sólo conoce al último operario que logueó (ver docstring
+                # de obtener_rendimiento_operarios más arriba en este
+                # archivo, mismo criterio).
+                sesion = db.exec(
+                    select(SesionOperario, Operario)
+                    .join(Operario, SesionOperario.operario_fk == Operario.id)
                     .where(
-                        AsignacionTurno.tenant_id == context.tenant_id,
-                        AsignacionTurno.estacion_fk == parada.estacion_fk,
-                        AsignacionTurno.turno_fk == turno.id,
-                        AsignacionTurno.fecha == fecha,
+                        SesionOperario.tenant_id == context.tenant_id,
+                        SesionOperario.estacion_fk == parada.estacion_fk,
+                        SesionOperario.entrada <= parada.inicio,
+                        (SesionOperario.salida.is_(None)) | (SesionOperario.salida > parada.inicio),
                     )
                 ).first()
-                operario_id_p, operario_nombre_p = (asignacion[1].id, asignacion[1].nombre_completo) if asignacion else (None, None)
+                operario_id_p, operario_nombre_p = (sesion[1].id, sesion[1].nombre_completo) if sesion else (None, None)
 
                 clasificador = db.get(UsuarioSaaS, parada.clasificado_por_id) if parada.clasificado_por_id else None
                 clasificador_nombre = (

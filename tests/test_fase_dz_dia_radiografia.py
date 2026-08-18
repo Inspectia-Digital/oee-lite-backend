@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta
 from app.models.domain import (
     AsignacionSupervisor, AsignacionTurno, Estacion, EstadoParada,
     Linea, LiteEventoProduccion, Maquina, MaquinaEstacion, MotivoParada,
-    Operario, Planta, Supervisor, TipoParada, Turno,
+    Operario, Planta, SesionOperario, Supervisor, TipoParada, Turno,
     ParadaDetectada as ParadaDetectadaModel,
 )
 from tests.conftest import autenticar_como
@@ -88,6 +88,17 @@ def _preparar_escenario(db, tenant_id):
     db.add(AsignacionTurno(
         tenant_id=tenant_id, fecha=FECHA, estacion_fk=estacion.id,
         operario_fk=operario.id, turno_fk=turno.id,
+    ))
+    # BE-P0-06: la atribución por PARADA (p["operario_nombre"]) resuelve
+    # contra SesionOperario, no AsignacionTurno (ver docstring en
+    # analytics.py) -- sesión cubriendo toda la ventana nominal del turno,
+    # mismo horario 08:00-16:00 local. AsignacionTurno arriba sigue
+    # existiendo para la dotación planificada (t["operarios"]), que no
+    # cambió.
+    db.add(SesionOperario(
+        tenant_id=tenant_id, estacion_fk=estacion.id,
+        operario_fk=operario.id, turno_fk=turno.id,
+        entrada=_utc_para_hora_local("08:00"), salida=_utc_para_hora_local("16:00"),
     ))
     db.commit()
 
