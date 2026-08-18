@@ -15,7 +15,7 @@ from app.models.domain import (
     Planta, UsuarioSaaS, RolUsuario, UsuarioPlanta, Tenant,
     OrdenProduccion, AsignacionTurno, EstadoParada,
     AsignacionSupervisor, Supervisor, Maquina, MaestroSKU,
-    EstadoExclusionOee,
+    EstadoExclusionOee, MaquinaEstacion,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -477,6 +477,30 @@ def _calcular_metricas_oee(
         query = query.where(LiteEventoProduccion.orden_fk.in_(ids_orden_del_sku))
     eventos = db.exec(query).all()
 
+    planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
+
+    # Fase DZ (Detalle del Día): antes `turno_id` llegaba hasta acá sin
+    # filtrar nada -- ver la nota vieja más abajo. Ahora, si se pidió un
+    # turno puntual, se acota `eventos` (y más abajo `paradas_db`) a la
+    # ventana horaria de ESE turno, en hora LOCAL de planta (nunca UTC
+    # crudo -- mismo criterio que _hora_planta/_resolver_turno_por_horario
+    # ya usan en este archivo para cualquier otra comparación turno vs.
+    # timestamp). Soporta turnos que cruzan medianoche (hora_inicio >
+    # hora_fin). Sin turno_id, comportamiento 100% igual que antes.
+    turno_ventana: Optional[Turno] = None
+    if turno_id:
+        turno_ventana = db.exec(
+            select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)
+        ).first()
+        if turno_ventana:
+            hi, hf = turno_ventana.hora_inicio, turno_ventana.hora_fin
+
+            def _en_ventana_turno(ts_utc_naive: datetime) -> bool:
+                hora = _hora_planta(ts_utc_naive, planta)
+                return (hi <= hora <= hf) if hi <= hf else (hora >= hi or hora <= hf)
+
+            eventos = [(e, est, li) for e, est, li in eventos if _en_ventana_turno(e.timestamp)]
+
     if not eventos:
         return None
 
@@ -501,7 +525,6 @@ def _calcular_metricas_oee(
     # un evento, y es lo que ahora escala tiempo_planificado. dias_consulta
     # se sigue devolviendo tal cual para tiempo_calendario_seg (ese sí
     # representa el rango pedido completo, no cuánto se produjo en él).
-    planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
     dias_produccion = len({_fecha_planta(e.timestamp, planta) for e, _, _ in eventos})
 
     # Fase Q (feedback de producto, ronda 2): tiempo_planificado dejó de
@@ -512,10 +535,11 @@ def _calcular_metricas_oee(
     # Rendimiento igual. Ahora se arma DE ABAJO HACIA ARRIBA, a partir de
     # lo que realmente pasó evento por evento:
     #   tiempo_planificado = tiempo_ideal (Efectivo) + lentitud + paradas
-    # `turno_id`/`turnos` quedan sin usar en este cálculo a partir de acá
-    # (antes sólo elegían qué turno nominal multiplicar, nunca filtraban
-    # qué eventos entraban) -- si se necesita que turno_id filtre POR
-    # VENTANA HORARIA qué eventos cuentan, es un cambio aparte, no incluido.
+    # `turno_id` YA filtra qué eventos/paradas entran (ver turno_ventana
+    # más arriba, Fase DZ) -- lo que sigue sin usar es sólo la duración
+    # NOMINAL del turno (Turno.hora_inicio/fin como multiplicador fijo),
+    # deliberadamente: tiempo_planificado sigue armándose de abajo hacia
+    # arriba a partir de eventos reales, no de la ficha del turno.
 
     # RENDIMIENTO (Fase E2): tiempo_ideal_seg es snapshot por evento
     # (umbral SKU si había uno activo), multiplicado por unidades_procesadas.
@@ -585,6 +609,8 @@ def _calcular_metricas_oee(
         ).all()
         q_paradas = q_paradas.where(ParadaDetectada.orden_fk.in_(ids_uuid_del_sku))
     paradas_db = db.exec(q_paradas).all()
+    if turno_ventana:
+        paradas_db = [(p, m) for p, m in paradas_db if _en_ventana_turno(p.inicio)]
 
     t_paradas_no_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if not m or m.tipo_parada == TipoParada.NO_PLANIFICADA)
     t_paradas_planificadas = sum(p.duracion_segundos or 0 for p, m in paradas_db if m and m.tipo_parada == TipoParada.PLANIFICADA)
@@ -2510,3 +2536,391 @@ def obtener_dia_promedio(
         )
         for h in range(24)
     ]
+
+
+# ==========================================
+# DETALLE DEL DÍA -- "radiografía" de línea/turno (Fase DZ, PRD Day
+# Detail Report v1.0). NO usa la ruta /analytics/dia-detalle/ -- ese
+# nombre ya lo tiene el endpoint de Fase AG (vista horaria de un día,
+# algo completamente distinto: 24 filas por hora, sin turnos/estaciones/
+# operarios). Reutiliza datos existentes de punta a punta, sin tablas
+# nuevas, tal como pide el documento -- las decisiones de qué se
+# aproxima y por qué quedan documentadas en cada campo de abajo.
+# ==========================================
+
+class DiaRadiografiaParada(BaseModel):
+    parada_id: uuid.UUID
+    hora_inicio: str
+    hora_fin: Optional[str] = None
+    duracion_minutos: float
+    estacion_id: uuid.UUID
+    estacion_nombre: str
+    tipo: str  # "planificada" | "no_planificada"
+    motivo: Optional[str] = None
+    # ParadaDetectada no tiene operario_fk propio (está atada a la
+    # estación, no a una persona) -- se resuelve best-effort por la
+    # dotación de esa (estación, turno, fecha), mismo criterio que ya
+    # usa el resto del backend para "quién estaba ahí" (ver
+    # login_operario_terminal en scans.py). Puede no resolver (estación
+    # sin dotación cargada ese día).
+    operario_id: Optional[uuid.UUID] = None
+    operario_nombre: Optional[str] = None
+    clasificado_por_id: Optional[uuid.UUID] = None
+    clasificado_por_nombre: Optional[str] = None
+    # Se deriva de `fin` -- el backend no persiste un timestamp de
+    # clasificación separado del cierre de la parada (mismo criterio
+    # documentado en useSupervisorData.ts::useClassifiedStopsHistory).
+    fecha_clasificacion: Optional[datetime] = None
+    exclusion_oee: bool = False
+    # None para planificadas (por diseño no restan disponibilidad) y
+    # para paradas sin duración resuelta todavía (PENDIENTE, fin=None).
+    impacto_disponibilidad_pct: Optional[float] = None
+
+
+class DiaRadiografiaEstacion(BaseModel):
+    estacion_id: uuid.UUID
+    nombre: str
+    activa_config: bool
+    tuvo_actividad: bool
+    horas_actividad: float
+    paradas_cantidad: int
+
+
+class DiaRadiografiaMaquina(BaseModel):
+    maquina_id: uuid.UUID
+    nombre: str
+    estacion_id: uuid.UUID
+    estacion_nombre: str
+    operativa: bool
+    # El modelo (Maquina/MaquinaEstacion, ver domain.py) no tiene
+    # telemetría de uptime propia ni concepto de "alerta de máquina" --
+    # uptime_horas es un derivado de la actividad de la estación
+    # asociada (misma ventana, mismas paradas restadas); alertas_cantidad
+    # queda siempre en 0 porque el dato no existe. Documentado a
+    # propósito acá para que el frontend (Fase EA) no lo presente como
+    # una métrica propia de la máquina.
+    uptime_horas: float
+    alertas_cantidad: int = 0
+
+
+class DiaRadiografiaOperario(BaseModel):
+    operario_id: uuid.UUID
+    nombre: str
+    estacion_id: uuid.UUID
+    estacion_nombre: str
+    entrada: str
+    salida: str
+    horas_totales: float
+    # AsignacionTurno no guarda una hora de entrada real (sólo
+    # hora_salida, cargada por [SALIR], Fase BZ) -- "entrada" siempre es
+    # el inicio nominal del turno, y "salida" es hora_salida si existe o
+    # si no también el fin nominal del turno. `salida_estimada=True`
+    # marca este segundo caso: no hubo un [SALIR] real, es una
+    # aproximación (mismo límite ya documentado en useSupervisorData.ts:
+    # "formalizar esa resolución por ventana horaria real sería un
+    # cambio de modelo más grande, fuera de este alcance").
+    salida_estimada: bool
+
+
+class DiaRadiografiaTurno(BaseModel):
+    turno_id: uuid.UUID
+    nombre: str
+    hora_inicio: str
+    hora_fin: str
+    supervisor_id: Optional[uuid.UUID] = None
+    supervisor_nombre: Optional[str] = None
+    oee_pct: float
+    disponibilidad_pct: float
+    rendimiento_pct: float
+    calidad_pct: Optional[float] = None
+    produccion_unidades: int
+    estaciones: List[DiaRadiografiaEstacion]
+    maquinas: List[DiaRadiografiaMaquina]
+    operarios: List[DiaRadiografiaOperario]
+    paradas: List[DiaRadiografiaParada]
+
+
+class DiaRadiografiaResponse(BaseModel):
+    fecha: date
+    linea_id: uuid.UUID
+    linea_nombre: str
+    oee_dia_pct: float
+    disponibilidad_dia_pct: float
+    rendimiento_dia_pct: float
+    calidad_dia_pct: Optional[float] = None
+    produccion_dia_unidades: int
+    turnos: List[DiaRadiografiaTurno]
+
+
+def _resolver_supervisor_turno(
+    db: Session, context: TenantContext, linea_id: uuid.UUID, turno_id: uuid.UUID, fecha: date,
+) -> Optional[Supervisor]:
+    """Misma regla y mismo patrón de query que /analytics/linea-en-vivo/
+    (Fase Q, ver comentario ahí sobre el bug real que corrigió el
+    order_by + loop): entre las reglas vigentes para (línea, turno) ese
+    día de semana + rango de vigencia, gana la de vigencia_desde más
+    reciente. Extraída como helper acá porque linea-en-vivo la resuelve
+    sólo para "ahora", nunca para una fecha arbitraria -- no se toca ese
+    call site (endpoint en vivo, ya funcionando) para no arriesgarlo."""
+    dia_iso = fecha.isoweekday()
+    reglas = db.exec(
+        select(AsignacionSupervisor, Supervisor)
+        .join(Supervisor, AsignacionSupervisor.supervisor_id == Supervisor.id)
+        .where(
+            AsignacionSupervisor.tenant_id == context.tenant_id,
+            AsignacionSupervisor.linea_id == linea_id,
+            AsignacionSupervisor.turno_id == turno_id,
+            AsignacionSupervisor.vigencia_desde <= fecha,
+        )
+        .order_by(AsignacionSupervisor.vigencia_desde.desc())
+    ).all()
+    for regla, sup in reglas:
+        vigente = regla.vigencia_hasta is None or regla.vigencia_hasta >= fecha
+        if vigente and _dia_en_dias_semana(dia_iso, regla.dias_semana):
+            return sup
+    return None
+
+
+def _ventana_turno_horas(hi: time, hf: time) -> float:
+    """Duración nominal de un turno en horas, soportando cruce de
+    medianoche (hi > hf)."""
+    hoy = date(2000, 1, 1)
+    dt_inicio = datetime.combine(hoy, hi)
+    dt_fin = datetime.combine(hoy if hi <= hf else hoy + timedelta(days=1), hf)
+    return max(0.0, (dt_fin - dt_inicio).total_seconds() / 3600)
+
+
+@router.get("/analytics/dia-radiografia/", response_model=DiaRadiografiaResponse)
+def obtener_dia_radiografia(
+    fecha: date,
+    linea_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Radiografía completa de una línea en un día puntual, desglosada
+    por turno: OEE, supervisor, estaciones, máquinas, operarios y
+    paradas -- PRD "Day Detail Report" v1.0. Sin tablas nuevas: agrupa
+    Turno/AsignacionSupervisor/Estacion/Maquina/MaquinaEstacion/
+    AsignacionTurno/ParadaDetectada/LiteEventoProduccion, todas ya
+    existentes. Cálculo on-demand (no se persiste nada acá)."""
+    try:
+        validar_planta(context)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Planta no seleccionada.")
+
+    linea = db.exec(
+        select(Linea).where(
+            Linea.id == linea_id, Linea.tenant_id == context.tenant_id, Linea.planta_id == context.sub_tenant_id,
+        )
+    ).first()
+    if not linea:
+        raise HTTPException(status_code=404, detail="Línea no encontrada.")
+
+    planta = db.get(Planta, context.sub_tenant_id) if context.sub_tenant_id else None
+
+    estaciones_linea = db.exec(
+        select(Estacion).where(Estacion.tenant_id == context.tenant_id, Estacion.linea_id == linea_id)
+    ).all()
+    estacion_por_id = {e.id: e for e in estaciones_linea}
+    estacion_ids = list(estacion_por_id.keys())
+
+    dia_iso = fecha.isoweekday()
+    turnos_dia = [
+        t for t in db.exec(
+            select(Turno).where(Turno.tenant_id == context.tenant_id, Turno.linea_id == linea_id, Turno.activo == True)  # noqa: E712
+        ).all()
+        if _dia_en_dias_semana(dia_iso, t.dias_semana)
+    ]
+    turnos_dia.sort(key=lambda t: t.hora_inicio)
+
+    maquinas_por_estacion: Dict[uuid.UUID, List[tuple]] = {}
+    if estacion_ids:
+        vinculos = db.exec(
+            select(MaquinaEstacion, Maquina)
+            .join(Maquina, MaquinaEstacion.maquina_id == Maquina.id)
+            .where(MaquinaEstacion.tenant_id == context.tenant_id, MaquinaEstacion.estacion_id.in_(estacion_ids))
+        ).all()
+        for vinculo, maquina in vinculos:
+            maquinas_por_estacion.setdefault(vinculo.estacion_id, []).append((vinculo, maquina))
+
+    turnos_resp: List[DiaRadiografiaTurno] = []
+    for turno in turnos_dia:
+        m = _calcular_metricas_oee(db, context, fecha, fecha, linea_id, turno.id)
+        oee_pct = round((m["oee_general"] if m else 0.0) * 100, 1)
+        disponibilidad_pct = round((m["disponibilidad"] if m else 0.0) * 100, 1)
+        rendimiento_pct = round((m["rendimiento"] if m else 0.0) * 100, 1)
+        calidad_pct = m["calidad_pct"] if m else None
+        produccion_unidades = m["total_unidades"] if m else 0
+        tiempo_planificado_neto_turno = m["tiempo_planificado_neto_seg"] if m else None
+
+        supervisor = _resolver_supervisor_turno(db, context, linea_id, turno.id, fecha)
+
+        duracion_turno_horas = _ventana_turno_horas(turno.hora_inicio, turno.hora_fin)
+
+        def _en_ventana(ts: datetime) -> bool:
+            hora = _hora_planta(ts, planta)
+            hi, hf = turno.hora_inicio, turno.hora_fin
+            return (hi <= hora <= hf) if hi <= hf else (hora >= hi or hora <= hf)
+
+        # Paradas de las estaciones de esta línea, dentro de la ventana
+        # del turno -- se traen TODAS (cualquier estado/exclusión), a
+        # diferencia de _calcular_metricas_oee que ya excluye las
+        # aprobadas como falso positivo: acá el objetivo es mostrar qué
+        # pasó, no recalcular OEE.
+        paradas_turno: List[DiaRadiografiaParada] = []
+        paradas_por_estacion: Dict[uuid.UUID, int] = {}
+        segundos_parada_por_estacion: Dict[uuid.UUID, float] = {}
+        if estacion_ids:
+            filas_parada = db.exec(
+                select(ParadaDetectada, MotivoParada)
+                .outerjoin(MotivoParada, ParadaDetectada.motivo_fk == MotivoParada.id)
+                .where(
+                    ParadaDetectada.tenant_id == context.tenant_id,
+                    ParadaDetectada.estacion_fk.in_(estacion_ids),
+                    ParadaDetectada.estado != EstadoParada.ANULADA,
+                )
+            ).all()
+            for parada, motivo in filas_parada:
+                if not _en_ventana(parada.inicio):
+                    continue
+                est = estacion_por_id.get(parada.estacion_fk)
+                paradas_por_estacion[parada.estacion_fk] = paradas_por_estacion.get(parada.estacion_fk, 0) + 1
+                segundos_parada_por_estacion[parada.estacion_fk] = (
+                    segundos_parada_por_estacion.get(parada.estacion_fk, 0.0) + (parada.duracion_segundos or 0.0)
+                )
+                es_planificada = bool(motivo and motivo.tipo_parada == TipoParada.PLANIFICADA)
+
+                asignacion = db.exec(
+                    select(AsignacionTurno, Operario)
+                    .join(Operario, AsignacionTurno.operario_fk == Operario.id)
+                    .where(
+                        AsignacionTurno.tenant_id == context.tenant_id,
+                        AsignacionTurno.estacion_fk == parada.estacion_fk,
+                        AsignacionTurno.turno_fk == turno.id,
+                        AsignacionTurno.fecha == fecha,
+                    )
+                ).first()
+                operario_id_p, operario_nombre_p = (asignacion[1].id, asignacion[1].nombre_completo) if asignacion else (None, None)
+
+                clasificador = db.get(UsuarioSaaS, parada.clasificado_por_id) if parada.clasificado_por_id else None
+                clasificador_nombre = (
+                    f"{clasificador.nombre or ''} {clasificador.apellido or ''}".strip() or clasificador.email
+                    if clasificador else None
+                )
+
+                impacto = None
+                if not es_planificada and parada.duracion_segundos and tiempo_planificado_neto_turno:
+                    impacto = round(-(parada.duracion_segundos / tiempo_planificado_neto_turno) * 100, 1)
+
+                paradas_turno.append(DiaRadiografiaParada(
+                    parada_id=parada.id,
+                    hora_inicio=_hora_planta(parada.inicio, planta).strftime("%H:%M"),
+                    hora_fin=_hora_planta(parada.fin, planta).strftime("%H:%M") if parada.fin else None,
+                    duracion_minutos=round((parada.duracion_segundos or 0.0) / 60, 1),
+                    estacion_id=parada.estacion_fk,
+                    estacion_nombre=est.nombre if est else "",
+                    tipo="planificada" if es_planificada else "no_planificada",
+                    motivo=motivo.nombre if motivo else None,
+                    operario_id=operario_id_p,
+                    operario_nombre=operario_nombre_p,
+                    clasificado_por_id=parada.clasificado_por_id,
+                    clasificado_por_nombre=clasificador_nombre,
+                    fecha_clasificacion=parada.fin,
+                    exclusion_oee=parada.exclusion_oee == EstadoExclusionOee.APROBADA,
+                    impacto_disponibilidad_pct=impacto,
+                ))
+
+        # Estaciones: actividad = ventana del turno menos sus propias
+        # paradas (no hay telemetría "activa/inactiva" minuto a minuto
+        # distinta de eso -- ver LiteEventoProduccion, sin un campo de
+        # estado persistente por estación).
+        estaciones_resp: List[DiaRadiografiaEstacion] = []
+        maquinas_resp: List[DiaRadiografiaMaquina] = []
+        for est in sorted(estaciones_linea, key=lambda e: e.posicion_linea):
+            segundos_parada = segundos_parada_por_estacion.get(est.id, 0.0)
+            horas_actividad = max(0.0, round(duracion_turno_horas - segundos_parada / 3600, 2)) if est.activa else 0.0
+            tuvo_actividad = paradas_por_estacion.get(est.id, 0) > 0 or horas_actividad > 0
+            estaciones_resp.append(DiaRadiografiaEstacion(
+                estacion_id=est.id,
+                nombre=est.nombre,
+                activa_config=est.activa,
+                tuvo_actividad=tuvo_actividad,
+                horas_actividad=horas_actividad,
+                paradas_cantidad=paradas_por_estacion.get(est.id, 0),
+            ))
+            for vinculo, maquina in maquinas_por_estacion.get(est.id, []):
+                maquinas_resp.append(DiaRadiografiaMaquina(
+                    maquina_id=maquina.id,
+                    nombre=maquina.nombre or maquina.codigo_externo,
+                    estacion_id=est.id,
+                    estacion_nombre=est.nombre,
+                    operativa=bool(maquina.activo and vinculo.activo),
+                    uptime_horas=horas_actividad,
+                    alertas_cantidad=0,
+                ))
+
+        # Operarios asignados (dotación real de AsignacionTurno para
+        # este turno/fecha, acotada a las estaciones de la línea).
+        operarios_resp: List[DiaRadiografiaOperario] = []
+        if estacion_ids:
+            filas_dotacion = db.exec(
+                select(AsignacionTurno, Operario)
+                .join(Operario, AsignacionTurno.operario_fk == Operario.id)
+                .where(
+                    AsignacionTurno.tenant_id == context.tenant_id,
+                    AsignacionTurno.turno_fk == turno.id,
+                    AsignacionTurno.fecha == fecha,
+                    AsignacionTurno.estacion_fk.in_(estacion_ids),
+                )
+            ).all()
+            for asign, operario in filas_dotacion:
+                est = estacion_por_id.get(asign.estacion_fk)
+                if asign.hora_salida:
+                    hora_salida_local = _hora_planta(asign.hora_salida, planta)
+                    salida_estimada = False
+                else:
+                    hora_salida_local = turno.hora_fin
+                    salida_estimada = True
+                horas_totales = _ventana_turno_horas(turno.hora_inicio, hora_salida_local)
+                operarios_resp.append(DiaRadiografiaOperario(
+                    operario_id=operario.id,
+                    nombre=operario.nombre_completo,
+                    estacion_id=asign.estacion_fk,
+                    estacion_nombre=est.nombre if est else "",
+                    entrada=turno.hora_inicio.strftime("%H:%M"),
+                    salida=hora_salida_local.strftime("%H:%M"),
+                    horas_totales=round(horas_totales, 2),
+                    salida_estimada=salida_estimada,
+                ))
+
+        turnos_resp.append(DiaRadiografiaTurno(
+            turno_id=turno.id,
+            nombre=turno.nombre,
+            hora_inicio=turno.hora_inicio.strftime("%H:%M"),
+            hora_fin=turno.hora_fin.strftime("%H:%M"),
+            supervisor_id=supervisor.id if supervisor else None,
+            supervisor_nombre=supervisor.nombre_completo if supervisor else None,
+            oee_pct=oee_pct,
+            disponibilidad_pct=disponibilidad_pct,
+            rendimiento_pct=rendimiento_pct,
+            calidad_pct=calidad_pct,
+            produccion_unidades=produccion_unidades,
+            estaciones=estaciones_resp,
+            maquinas=maquinas_resp,
+            operarios=operarios_resp,
+            paradas=paradas_turno,
+        ))
+
+    m_dia = _calcular_metricas_oee(db, context, fecha, fecha, linea_id, None)
+
+    return DiaRadiografiaResponse(
+        fecha=fecha,
+        linea_id=linea_id,
+        linea_nombre=linea.nombre,
+        oee_dia_pct=round((m_dia["oee_general"] if m_dia else 0.0) * 100, 1),
+        disponibilidad_dia_pct=round((m_dia["disponibilidad"] if m_dia else 0.0) * 100, 1),
+        rendimiento_dia_pct=round((m_dia["rendimiento"] if m_dia else 0.0) * 100, 1),
+        calidad_dia_pct=m_dia["calidad_pct"] if m_dia else None,
+        produccion_dia_unidades=m_dia["total_unidades"] if m_dia else 0,
+        turnos=turnos_resp,
+    )
