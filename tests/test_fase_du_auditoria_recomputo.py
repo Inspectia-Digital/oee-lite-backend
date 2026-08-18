@@ -43,7 +43,12 @@ def test_recomputo_persiste_registro_de_auditoria(client, db, tenant_a, gerente_
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
 
-    hoy = datetime.now(timezone.utc)
+    # BE-P0-05: fijo, no datetime.now(timezone.utc)/date.today() -- mismo
+    # motivo que test_fase_s_recomputar_eventos.py (recomputar_eventos ya
+    # convierte el rango a UTC vía la timezone real de la planta, un
+    # instante real cerca de medianoche UTC correría el día calendario
+    # para una planta en Buenos Aires).
+    hoy = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
     client.post(
         "/api/lite/scans",
         json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": hoy.isoformat()},
@@ -51,7 +56,7 @@ def test_recomputo_persiste_registro_de_auditoria(client, db, tenant_a, gerente_
     )
 
     autenticar_como(gerente_a.id)
-    hoy_date = date.today()
+    hoy_date = hoy.date()
     r = client.post(
         f"/config/estaciones/{estacion.id}/recomputar-eventos/",
         json={"fecha_desde": hoy_date.isoformat(), "fecha_hasta": hoy_date.isoformat()},
