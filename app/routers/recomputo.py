@@ -32,7 +32,7 @@ from app.core.database import get_session
 from app.core.rbac import requerir_gerencia_o_superadmin
 from app.models.domain import (
     Estacion, Linea, LiteEventoProduccion, OrdenProduccion, ParadaDetectada,
-    EstadoParada, UsuarioSaaS,
+    EstadoParada, UsuarioSaaS, RegistroAuditoria,
 )
 
 router = APIRouter(prefix="/config/estaciones", tags=["Recómputo (Fase S)"])
@@ -65,7 +65,7 @@ def recomputar_eventos(
     payload: RecomputarEventosRequest,
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
-    _: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
 ):
     if payload.fecha_hasta < payload.fecha_desde:
         raise HTTPException(status_code=400, detail="fecha_hasta no puede ser anterior a fecha_desde.")
@@ -232,6 +232,27 @@ def recomputar_eventos(
                     paradas_obsoletas.append(parada_existente.id)
 
         evento_anterior = evento
+
+    # Fase DU (auditoría de backend, P1-02 parcial): registro de quién
+    # corrió este recómputo, sobre qué rango, con qué resultado -- antes
+    # no quedaba ningún rastro (ver docstring de RegistroAuditoria). Se
+    # agrega a la MISMA transacción que el recómputo (un solo commit
+    # abajo): si el recómputo fallara, el registro de auditoría tampoco
+    # queda persistido a medias.
+    db.add(RegistroAuditoria(
+        tenant_id=context.tenant_id,
+        entidad="recomputo_eventos",
+        entidad_id=str(estacion_id),
+        accion="ejecutar",
+        usuario_id=usuario.id,
+        detalle=(
+            f"desde={payload.fecha_desde.isoformat()} hasta={payload.fecha_hasta.isoformat()} "
+            f"recomputados={eventos_recomputados} sin_cambios={eventos_sin_cambios} "
+            f"paradas_creadas={paradas_creadas} paradas_actualizadas={paradas_actualizadas} "
+            f"paradas_ya_clasificadas_sin_tocar={paradas_ya_clasificadas} "
+            f"paradas_pendientes_obsoletas={len(paradas_obsoletas)}"
+        ),
+    ))
 
     db.commit()
 
