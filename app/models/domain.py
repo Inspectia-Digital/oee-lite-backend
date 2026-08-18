@@ -617,6 +617,31 @@ class ParadaDetectada(TenantBase, table=True):
     anulada_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
     anulada_at: Optional[datetime] = Field(default=None)
 
+
+class RegistroAuditoria(TenantBase, table=True):
+    """Fase DU (auditoría de backend, P1-02 parcial): tabla de auditoría
+    GENÉRICA y reusable -- no existía ningún mecanismo de este tipo en
+    todo el backend antes de esta fase (recomputo.py documentaba
+    explícitamente la ausencia, ver comentario histórico de Fase S).
+    Primer consumidor: recomputar_eventos (operacion.py/recomputo.py).
+    Pensada para reusarse después en cualquier acción que necesite un
+    rastro de quién/cuándo/qué/por qué (ej. futuro historial de
+    reclasificaciones) sin duplicar esta infraestructura cada vez.
+
+    El cierre/reapertura formal de período (la otra mitad de P1-02)
+    queda explícitamente FUERA todavía -- necesita una decisión de
+    producto (qué cierra un período, quién puede reabrirlo y bajo qué
+    condición) que no está definida; no se inventa acá."""
+    __tablename__ = "registros_auditoria"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    entidad: str = Field(index=True, description="Tipo de acción auditada, ej. 'recomputo_eventos'")
+    entidad_id: Optional[str] = Field(default=None, index=True, description="ID del recurso afectado, ej. estacion_id")
+    accion: str = Field(description="Verbo corto de la acción, ej. 'ejecutar'")
+    usuario_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
+    detalle: Optional[str] = Field(default=None, description="Resumen legible del contexto/resultado")
+    creado_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
 class CicloProduccion(TenantBase, table=True):
     """(Legacy) Endpoint original de PLC ciego."""
     __tablename__ = "eventos_plc_ciclos"
