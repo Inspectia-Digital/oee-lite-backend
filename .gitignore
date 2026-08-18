@@ -13,6 +13,7 @@ __pycache__/
 .env
 .env.local
 .env.*
+auth.txt
 
 # Bases de datos locales (si usaras SQLite, aunque usas Postgres)
 *.sqlite3
