@@ -670,6 +670,21 @@ def listar_modulos_de_tenant(
     return db.exec(select(AsignacionModuloTenant).where(AsignacionModuloTenant.tenant_id == tenant_id)).all()
 
 
+@router.get("/mi-empresa/modulos", response_model=List[AsignacionModuloTenant])
+def listar_mis_modulos(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_gerencia_o_superadmin),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase EJ: PRD, pantalla cliente "SUSCRIPCIÓN Y FACTURACIÓN" ->
+    "MÓDULOS CONTRATADOS" (precio/descuento/renovación) -- distinto del
+    viejo `Tenant.modulos_contratados` (CSV, sólo controla qué aparece
+    en el sidebar, ver comentario en domain.py::SuscripcionTenant). No
+    estaba en el PRD §9 (que sólo lista el admin-side), mismo criterio
+    de completitud que motivó `informar_pago`/`solicitar_factura`."""
+    return db.exec(select(AsignacionModuloTenant).where(AsignacionModuloTenant.tenant_id == context.tenant_id)).all()
+
+
 @router.post("/clientes/{tenant_id}/modulos", response_model=AsignacionModuloTenant, status_code=status.HTTP_201_CREATED)
 def asignar_modulo_a_tenant(
     tenant_id: str,
