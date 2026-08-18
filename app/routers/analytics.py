@@ -9,6 +9,12 @@ import uuid
 from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext
 from app.core.clasificacion import resolver_orden_activa
+from app.core.tiempo_planta import (
+    fecha_operativa_planta,
+    fecha_local as _fecha_local_compartida,
+    hora_local as _hora_local_compartida,
+    rango_utc_dia_local,
+)
 from app.models.domain import (
     Estacion, LiteEventoProduccion, ParadaDetectada,
     MotivoParada, Operario, Turno, Linea, TipoParada,
@@ -217,7 +223,12 @@ class CommandCenterSummary(BaseModel):
 # ==========================================
 # --- HELPER FUNCTIONS ---
 # ==========================================
-def obtener_rango_dia(fecha_busqueda: Optional[date] = None, context: Optional[TenantContext] = None, db: Optional[Session] = None):
+def obtener_rango_dia(
+    fecha_busqueda: Optional[date] = None,
+    context: Optional[TenantContext] = None,
+    db: Optional[Session] = None,
+    ahora_utc: Optional[datetime] = None,
+):
     # Fase P: era datetime.now() (hora del SERVIDOR) contra
     # LiteEventoProduccion.timestamp, que siempre se guarda en UTC puro
     # (default_factory=datetime.utcnow en el modelo). En un servidor cuyo
@@ -240,20 +251,32 @@ def obtener_rango_dia(fecha_busqueda: Optional[date] = None, context: Optional[T
     # siempre están en UTC). Sin context/db (o sin planta activa/
     # timezone configurada) cae al comportamiento anterior -- red de
     # seguridad, no un camino pensado para quedarse así a propósito.
-    f = fecha_busqueda or datetime.utcnow().date()
+    # BE-P0-03 (PRD Go-Live Green Mills): el fallback de "hoy" también
+    # tiene que resolverse en hora de planta -- antes acá arriba se
+    # llamaba datetime.utcnow().date() directo, ANTES de siquiera
+    # intentar la conversión de abajo, así que cerca de medianoche UTC
+    # (21hs en Buenos Aires, UTC-3) el resultado ya arrancaba con el día
+    # calendario SIGUIENTE al que corresponde en la planta, sin importar
+    # que el resto de la función supiera convertir bien una fecha ya
+    # explícita.
+    planta = None
     if context is not None and db is not None and context.sub_tenant_id:
         planta = db.get(Planta, context.sub_tenant_id)
-        if planta and planta.timezone:
-            try:
-                tz = ZoneInfo(planta.timezone)
-                inicio_local = datetime.combine(f, time.min, tzinfo=tz)
-                fin_local = datetime.combine(f, time.max, tzinfo=tz)
-                return (
-                    inicio_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
-                    fin_local.astimezone(dt_timezone.utc).replace(tzinfo=None),
-                )
-            except Exception:
-                pass
+
+    if fecha_busqueda is not None:
+        f = fecha_busqueda
+    elif planta is not None:
+        f = fecha_operativa_planta(planta, ahora_utc)
+    elif ahora_utc is not None:
+        f = ahora_utc.date()
+    else:
+        f = datetime.utcnow().date()
+
+    if planta is not None and planta.timezone:
+        try:
+            return rango_utc_dia_local(f, planta)
+        except Exception:
+            pass
     return datetime.combine(f, time.min), datetime.combine(f, time.max)
 
 def validar_planta(context: TenantContext):
@@ -512,8 +535,10 @@ def _calcular_metricas_oee(
     # día SIGUIENTE al pedido, por el corrimiento de huso horario). Se
     # calcula sobre las fechas ORIGINALES pedidas -- las mismas que
     # entraron a obtener_rango_dia -- nunca sobre el UTC ya convertido.
-    fecha_desde_real = fecha_desde or datetime.utcnow().date()
-    fecha_hasta_real = (fecha_hasta or fecha_desde) or datetime.utcnow().date()
+    # BE-P0-03: "hoy" acá también tiene que ser el de la planta, no el
+    # del reloj UTC del servidor -- mismo bug que obtener_rango_dia.
+    fecha_desde_real = fecha_desde or fecha_operativa_planta(planta)
+    fecha_hasta_real = (fecha_hasta or fecha_desde) or fecha_operativa_planta(planta)
     dias_consulta = max(1, (fecha_hasta_real - fecha_desde_real).days + 1)
 
     # Fase Q (feedback de producto): tiempo_planificado antes se calculaba
@@ -780,8 +805,18 @@ def obtener_reporte_springwall(
         if turno_id:
             turno = db.exec(select(Turno).where(Turno.id == turno_id, Turno.tenant_id == context.tenant_id)).first()
             if turno:
+                # BE-P0-03 (PRD Go-Live Green Mills, tarea #177): `ts` es
+                # LiteEventoProduccion.timestamp, siempre UTC naive (ver
+                # scans.py::_normalizar_timestamp_utc). turno.hora_inicio/
+                # hora_fin son horas LOCALES de planta (así se cargan en
+                # Configuración) -- comparar ts.time() crudo contra ellas
+                # sin convertir corre el turno hasta 3 horas (Buenos
+                # Aires) contra la franja equivocada. Mismo criterio que
+                # _en_ventana_turno ya usa en _calcular_metricas_oee.
+                planta = db.get(Planta, context.sub_tenant_id)
+
                 def _en_turno(ts, hi, hf):
-                    hora = ts.time()
+                    hora = _hora_planta(ts, planta)
                     return (hi <= hora <= hf) if hi <= hf else (hora >= hi or hora <= hf)
                 eventos = [
                     (e, est, op) for e, est, op in eventos
@@ -1107,9 +1142,10 @@ def tendencia_oee_diaria(
         return []
 
     try:
-        # Fase P: datetime.now() (servidor) -> datetime.utcnow() (mismo
-        # fix que obtener_rango_dia; ver ese comentario para el porqué).
-        hoy = datetime.utcnow().date()
+        # BE-P0-03: "hoy" es el de la planta, no el del reloj UTC del
+        # servidor (mismo fix que obtener_rango_dia; ver ese comentario).
+        planta_hoy = db.get(Planta, context.sub_tenant_id)
+        hoy = fecha_operativa_planta(planta_hoy)
         hasta = fecha_hasta or hoy
         desde = fecha_desde or (hasta - timedelta(days=6))
         if hasta < desde:
@@ -1563,12 +1599,12 @@ def _fecha_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> date:
     producción (Fase Q, motor OEE): agrupar por fecha UTC pura correría
     el riesgo de partir en dos un mismo turno que cruza medianoche local
     (o de fusionar dos turnos reales de días distintos que caen del
-    mismo lado de la medianoche UTC)."""
-    try:
-        tz = ZoneInfo(planta.timezone) if planta and planta.timezone else ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
-    except Exception:
-        tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
-    return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).date()
+    mismo lado de la medianoche UTC).
+
+    BE-P0-03: delega a app.core.tiempo_planta -- ya no repite acá el
+    mismo ZoneInfo(planta.timezone) con el mismo try/except que también
+    vive (vivía) en scans.py y en obtener_rango_dia de este archivo."""
+    return _fecha_local_compartida(ts_utc_naive, planta)
 
 
 def _dia_en_dias_semana(dia_iso: int, dias_semana: str) -> bool:
@@ -1588,12 +1624,11 @@ def _hora_planta(ts_utc_naive: datetime, planta: Optional[Planta]) -> time:
     """Hora LOCAL de planta de un timestamp (naive UTC) -- mismo criterio
     de conversión que _fecha_planta/_ahora_planta, pero devuelve la hora
     (time), no la fecha, para resolver contra Turno.hora_inicio/fin
-    (Fase AD)."""
-    try:
-        tz = ZoneInfo(planta.timezone) if planta and planta.timezone else ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
-    except Exception:
-        tz = ZoneInfo(_TIMEZONE_DEFAULT_LINEA_VIVO)
-    return ts_utc_naive.replace(tzinfo=dt_timezone.utc).astimezone(tz).time()
+    (Fase AD).
+
+    BE-P0-03: delega a app.core.tiempo_planta, mismo criterio que
+    _fecha_planta de arriba."""
+    return _hora_local_compartida(ts_utc_naive, planta)
 
 
 def _dia_iso_anterior(dia_iso: int) -> int:
@@ -1861,9 +1896,10 @@ def obtener_rendimiento_operarios(
         return []
 
     try:
-        # Fase P: datetime.now() (servidor) -> datetime.utcnow() (mismo
-        # fix que obtener_rango_dia; ver ese comentario para el porqué).
-        hoy = datetime.utcnow().date()
+        # BE-P0-03: "hoy" es el de la planta, no el del reloj UTC del
+        # servidor (mismo fix que obtener_rango_dia; ver ese comentario).
+        planta_hoy = db.get(Planta, context.sub_tenant_id)
+        hoy = fecha_operativa_planta(planta_hoy)
         hasta = fecha_hasta or hoy
         desde = fecha_desde or (hasta - timedelta(days=6))
         if hasta < desde:
@@ -2129,7 +2165,10 @@ def obtener_rendimiento_maquinas(
         return []
 
     try:
-        hoy = datetime.utcnow().date()
+        # BE-P0-03: "hoy" es el de la planta, no el del reloj UTC del
+        # servidor (mismo fix que obtener_rango_dia; ver ese comentario).
+        planta_hoy = db.get(Planta, context.sub_tenant_id)
+        hoy = fecha_operativa_planta(planta_hoy)
         hasta = fecha_hasta or hoy
         desde = fecha_desde or (hasta - timedelta(days=6))
         if hasta < desde:

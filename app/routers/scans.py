@@ -17,6 +17,7 @@ from app.core.auth_m2m import autenticar_dispositivo, ContextoDispositivo
 from app.core.clasificacion import resolver_umbrales_evento, resolver_orden_activa
 from app.core.errors import ErrorCode, error_terminal
 from app.core.rate_limit import verificar_limite
+from app.core.tiempo_planta import fecha_operativa_planta
 from app.models.domain import (
     Estacion, Linea, MaestroSKU, OrdenProduccion, Tenant, Planta,
     LiteEventoProduccion, ParadaDetectada, EstadoParada,
@@ -79,23 +80,16 @@ def _resolver_fecha_operativa(db: Session, estacion_id: str, ahora_utc: Optional
     ignorando Planta.timezone. Cerca de medianoche local (turnos
     nocturnos sobre todo) eso podía loguear/desloguear contra el día
     calendario equivocado -- mismo patrón de bug que Fase BH ya corrigió
-    en el frontend, nunca replicado acá. Mismo criterio de resolución de
-    timezone que _normalizar_timestamp_utc de arriba.
+    en el frontend, nunca replicado acá.
 
-    `ahora_utc` es inyectable (default: instante real) a propósito --
-    mismo criterio que _resolver_turno_por_horario (analytics.py, QA-05):
-    permite tests unitarios deterministas sin depender del wall-clock
-    real ni de ningún mock de datetime.now()."""
-    if ahora_utc is None:
-        ahora_utc = datetime.now(timezone.utc)
+    BE-P0-03 (PRD Go-Live Green Mills): la conversión en sí ya no vive
+    acá -- se delega a app.core.tiempo_planta, compartida ahora con
+    analytics.py y recomputo.py, para no tener tres copias del mismo
+    ZoneInfo(planta.timezone) con el mismo fallback."""
     estacion = db.get(Estacion, uuid.UUID(estacion_id))
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first() if estacion else None
     planta = db.get(Planta, linea.planta_id) if linea else None
-    try:
-        tz = ZoneInfo(planta.timezone if planta and planta.timezone else TIMEZONE_DEFAULT)
-    except Exception:
-        tz = ZoneInfo(TIMEZONE_DEFAULT)
-    return ahora_utc.astimezone(tz).date()
+    return fecha_operativa_planta(planta, ahora_utc)
 
 
 def _validar_rango_timestamp(ts_utc_naive: datetime) -> None:

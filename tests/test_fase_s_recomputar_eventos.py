@@ -98,7 +98,17 @@ def test_recomputar_aplica_override_sku_estacion_cargado_despues_del_evento(clie
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     ts2 = ahora + timedelta(seconds=21)
@@ -137,7 +147,17 @@ def test_recomputar_crea_parada_nueva_cuando_se_endurece_el_perfil_del_sku(clien
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=10.0, tiempo_lento_seg=11.5, tiempo_alerta_seg=12.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     # 11s: con el perfil inicial del SKU (t_lento=11.5, t_alerta=12.5)
@@ -174,7 +194,17 @@ def test_recomputar_actualiza_duracion_de_parada_pendiente_existente(client, db,
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     ts2 = ahora + timedelta(seconds=21)
@@ -209,7 +239,17 @@ def test_recomputar_nunca_toca_una_parada_ya_clasificada(client, db, tenant_a, g
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     ts2 = ahora + timedelta(seconds=21)
@@ -253,7 +293,17 @@ def test_recomputar_reporta_parada_pendiente_obsoleta_sin_borrarla(client, db, t
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     ts2 = ahora + timedelta(seconds=21)
@@ -292,7 +342,17 @@ def test_recomputar_respeta_continuidad_de_orden(client, db, tenant_a, gerente_a
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden1, sku1 = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
     hace_2_horas = ahora - timedelta(hours=2)
 
     assert _postear_evento(client, credencial, estacion.id, hace_2_horas).status_code == 201
@@ -331,7 +391,17 @@ def test_recomputar_no_toca_eventos_fuera_del_rango(client, db, tenant_a, gerent
     planta, linea, estacion = _preparar_escenario(db, tenant_a)
     orden, sku = _crear_orden_en_progreso(db, tenant_a, linea.id, tiempo_ideal_seg=2.0, tiempo_lento_seg=2.3, tiempo_alerta_seg=2.5)
     credencial = _emitir_credencial(client, gerente_a, estacion.id)
-    ahora = datetime.now(timezone.utc)
+    # BE-P0-05 (PRD Go-Live Green Mills): fijo, no datetime.now(timezone.utc)
+    # -- ahora que recomputar_eventos convierte fecha_desde/fecha_hasta a
+    # UTC vía la timezone REAL de la planta (antes datetime.combine naive,
+    # ver rango_utc_multi_dia_local), un "ahora" real tomado entre las
+    # 00:00 y las 02:59 UTC cae en el día calendario ANTERIOR para una
+    # planta en Buenos Aires (UTC-3) -- `hoy = ahora.date()` (UTC) ya no
+    # sería el mismo día que `hoy` en la planta, y el recómputo de "hoy"
+    # no encontraría el evento. Instante fijo bien lejos de cualquier
+    # medianoche (15hs UTC = mediodía en Buenos Aires) para que el test
+    # sea determinista en vez de fallar ~3hs por día al azar.
+    ahora = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
 
     assert _postear_evento(client, credencial, estacion.id, ahora).status_code == 201
     ts2 = ahora + timedelta(seconds=21)

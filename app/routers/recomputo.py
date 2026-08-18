@@ -19,7 +19,7 @@ misma regla: nunca borra, nunca toca una ParadaDetectada ya CLASIFICADA
 por un supervisor.
 """
 import uuid
-from datetime import date, datetime, time
+from datetime import date
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -30,9 +30,10 @@ from app.core.auth import TenantContext, obtener_contexto_tenant_humano
 from app.core.clasificacion import resolver_umbrales_evento
 from app.core.database import get_session
 from app.core.rbac import requerir_gerencia_o_superadmin
+from app.core.tiempo_planta import rango_utc_multi_dia_local
 from app.models.domain import (
     Estacion, Linea, LiteEventoProduccion, OrdenProduccion, ParadaDetectada,
-    EstadoParada, UsuarioSaaS, RegistroAuditoria,
+    EstadoParada, UsuarioSaaS, RegistroAuditoria, Planta,
 )
 
 router = APIRouter(prefix="/config/estaciones", tags=["Recómputo (Fase S)"])
@@ -88,9 +89,16 @@ def recomputar_eventos(
     db.exec(select(Estacion).where(Estacion.id == estacion_id).with_for_update()).first()
 
     linea = db.exec(select(Linea).where(Linea.id == estacion.linea_id)).first()
+    planta = db.get(Planta, linea.planta_id) if linea else None
 
-    desde_dt = datetime.combine(payload.fecha_desde, time.min)
-    hasta_dt = datetime.combine(payload.fecha_hasta, time.max)
+    # BE-P0-05 (PRD Go-Live Green Mills): esto era datetime.combine naive
+    # -- trataba fecha_desde/fecha_hasta como si ya fueran UTC. Para una
+    # planta en UTC-3 eso pierde las últimas 3 horas del día local
+    # pedido (caen en el UTC del día siguiente) y arrastra 3 horas de la
+    # noche local del día anterior. Mismo criterio de conversión
+    # local->UTC que ya usa Analytics (obtener_rango_dia), ahora
+    # compartido vía app.core.tiempo_planta.
+    desde_dt, hasta_dt = rango_utc_multi_dia_local(payload.fecha_desde, payload.fecha_hasta, planta)
 
     eventos = db.exec(
         select(LiteEventoProduccion)
