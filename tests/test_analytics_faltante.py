@@ -2,6 +2,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from app.core.tiempo_planta import fecha_operativa_planta
 from app.models.domain import Estacion, Linea, Planta, RolUsuario, Turno
 from tests.conftest import autenticar_como, crear_usuario
 
@@ -230,7 +231,16 @@ def test_reporte_produccion_filas_planas_por_fecha(client, db, tenant_a, gerente
     _emitir_evento(client, credencial, estacion.id)
 
     autenticar_como(gerente_a.id)
-    hoy = datetime.utcnow().date().isoformat()  # Fase P: alinear con timestamp UTC de LiteEventoProduccion
+    # BE-P0-03 (fase EK, bug real encontrado por CI cerca de medianoche
+    # UTC): /analytics/reporte-produccion/ trata fecha_desde/fecha_hasta
+    # como fecha LOCAL de planta (mismo criterio que el resto de
+    # /analytics/*, ver rendimiento-operarios/rendimiento-maquinas) --
+    # antes las comparaba naive contra el timestamp UTC del evento, y
+    # este test se había escrito a propósito para "alinear" con ESE bug
+    # (comentario viejo: "alinear con timestamp UTC"). Ahora que el
+    # endpoint es consistente con el resto, el test debe pedir la fecha
+    # LOCAL, no la de calendario UTC.
+    hoy = fecha_operativa_planta(planta).isoformat()
     r = client.get(
         f"/analytics/reporte-produccion/?fecha_desde={hoy}&fecha_hasta={hoy}",
         headers={"X-Sub-Tenant-Id": str(planta.id)},

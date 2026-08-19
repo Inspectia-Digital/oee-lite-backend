@@ -15,12 +15,18 @@ bugs reales que la falta de unificación escondía:
 
 Todos los tests unitarios usan ahora_utc/timestamps fijos (nunca
 wall-clock real). La única excepción es el test de integración de
-recomputar_eventos: usa "ayer" relativo a la hora real porque el propio
-endpoint de ingesta (scans.py::_validar_rango_timestamp) rechaza
-timestamps a más de 5 minutos en el futuro o más de 7 días de
-antigüedad -- una fecha fija se volvería inválida con el correr de los
-días."""
+recomputar_eventos: usa un momento relativo a la hora real (ahora - 90
+min) porque el propio endpoint de ingesta
+(scans.py::_validar_rango_timestamp) rechaza timestamps a más de 5
+minutos en el futuro o más de 7 días de antigüedad -- una fecha fija se
+volvería inválida con el correr de los días. Ese momento se convierte a
+hora LOCAL de la planta una sola vez, y de ahí se derivan fecha Y hora
+juntas -- la versión anterior calculaba la fecha por CALENDARIO UTC y le
+pegaba una hora LOCAL fija (23:30), lo que cerca de medianoche UTC podía
+dar un timestamp en el futuro respecto del reloj real (bug real,
+encontrado por un fallo de CI)."""
 import uuid
+import zoneinfo
 from datetime import date, datetime, time, timedelta, timezone
 
 from app.core.auth import TenantContext
@@ -167,13 +173,25 @@ def test_recomputar_eventos_encuentra_evento_de_la_noche_local_del_dia_pedido(cl
     assert r.status_code == 201
     credencial = r.json()["credencial_completa"]
 
-    # 23:30 LOCAL Buenos Aires de AYER (el endpoint rechaza timestamps a
-    # más de 5 minutos en el futuro o más de 7 días de antigüedad contra
-    # el reloj real -- "ayer" mantiene el test válido sin importar cuándo
-    # se corra, a diferencia de una fecha fija). Offset explícito
-    # (-03:00) para que _normalizar_timestamp_utc no lo reinterprete.
-    ayer_local = datetime.now(timezone.utc).date() - timedelta(days=1)
-    ts_local_con_offset = f"{ayer_local.isoformat()}T23:30:00-03:00"
+    # Un momento real, con margen de sobra hacia el pasado (el endpoint
+    # rechaza timestamps a más de 5 minutos en el futuro o más de 7 días
+    # de antigüedad contra el reloj real -- "recién" mantiene el test
+    # válido sin importar cuándo se corra, a diferencia de una fecha
+    # fija). Bug real que este mismo fix corrige (encontrado por CI cerca
+    # de medianoche UTC): la versión anterior calculaba "ayer" a partir
+    # de la FECHA UTC de "ahora" y le pegaba 23:30 hora LOCAL de Buenos
+    # Aires -- cerca de medianoche UTC, ese "ayer 23:30 local" cae
+    # DESPUÉS del "ahora" real (ya cruzó a UTC del día siguiente, pero
+    # Buenos Aires -3h todavía no llega a las 23:30 de ese mismo día
+    # calendario UTC), violando la tolerancia de 5 minutos a futuro.
+    # Acá se deriva la fecha Y la hora del mismo momento real
+    # (ahora - 90 min, siempre en el pasado), convertido a hora LOCAL de
+    # la planta -- sin mezclar "fecha por calendario UTC" con "hora local".
+    momento_local = (datetime.now(timezone.utc) - timedelta(minutes=90)).astimezone(
+        zoneinfo.ZoneInfo("America/Buenos_Aires")
+    )
+    fecha_pedida = momento_local.date()
+    ts_local_con_offset = momento_local.strftime("%Y-%m-%dT%H:%M:%S-03:00")
     r = client.post(
         "/api/lite/scans",
         json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ts_local_con_offset},
@@ -184,13 +202,13 @@ def test_recomputar_eventos_encuentra_evento_de_la_noche_local_del_dia_pedido(cl
     from sqlmodel import select
     from app.models.domain import LiteEventoProduccion
     evento = db.exec(select(LiteEventoProduccion).where(LiteEventoProduccion.id_estacion == str(estacion.id))).first()
-    dia_utc_siguiente = ayer_local + timedelta(days=1)
-    assert evento.timestamp == datetime(dia_utc_siguiente.year, dia_utc_siguiente.month, dia_utc_siguiente.day, 2, 30)
+    momento_utc_naive = momento_local.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+    assert evento.timestamp == momento_utc_naive
 
     autenticar_como(gerente_a.id)
     r = client.post(
         f"/config/estaciones/{estacion.id}/recomputar-eventos/",
-        json={"fecha_desde": ayer_local.isoformat(), "fecha_hasta": ayer_local.isoformat()},
+        json={"fecha_desde": fecha_pedida.isoformat(), "fecha_hasta": fecha_pedida.isoformat()},
     )
     assert r.status_code == 200
     body = r.json()

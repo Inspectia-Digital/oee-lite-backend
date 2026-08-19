@@ -7,6 +7,7 @@ re-matchear por nombre)."""
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from app.core.tiempo_planta import fecha_operativa_planta
 from app.models.domain import (
     Estacion, EstadoParada, Linea, MotivoParada, Planta,
     ParadaDetectada, RolUsuario, TipoParada, UsuarioPlanta,
@@ -119,7 +120,12 @@ def test_pareto_expone_motivo_fk_para_drilldown(client, db, tenant_a, gerente_a)
     parada = _crear_parada(db, tenant_a, estacion.id)
     client.patch(f"/supervisor/paradas/{parada.id}/clasificar", json={"motivo_fk": str(motivo.id)}, headers=headers)
 
-    hoy = datetime.now(timezone.utc).date().isoformat()
+    # /analytics/pareto-paradas/ trata fecha_desde/fecha_hasta como fecha
+    # LOCAL de planta (obtener_rango_dia) -- pedirlo con la fecha de
+    # CALENDARIO UTC ("ahora".date()) es un bug real cerca de medianoche
+    # UTC: el evento que se acaba de crear (inicio = UTC real) puede caer
+    # en el día LOCAL anterior, y la query no lo encuentra.
+    hoy = fecha_operativa_planta(planta).isoformat()
     r = client.get(f"/analytics/pareto-paradas/?fecha_desde={hoy}&fecha_hasta={hoy}", headers=headers)
     assert r.status_code == 200
     filas = r.json()

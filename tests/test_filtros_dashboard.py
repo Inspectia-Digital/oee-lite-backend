@@ -4,6 +4,7 @@ backend. Antes varios endpoints sólo aceptaban `fecha` (un día) y no
 `linea_id`/`orden_fk`."""
 from datetime import datetime, timedelta
 
+from app.core.tiempo_planta import fecha_operativa_planta
 from app.models.domain import (
     Estacion, EstadoParada, LiteEventoProduccion, Linea, MotivoParada,
     OrdenProduccion, ParadaDetectada, Planta, TipoParada,
@@ -94,7 +95,9 @@ def test_reporte_produccion_filtra_por_orden(client, db, tenant_a, gerente_a):
     db.commit()
 
     autenticar_como(gerente_a.id)
-    hoy = datetime.utcnow().date().isoformat()  # Fase P: alinear con timestamp UTC de LiteEventoProduccion
+    # BE-P0-03 (fase EK): fecha_desde/fecha_hasta son fecha LOCAL de
+    # planta (ver comentario homólogo en test_analytics_faltante.py).
+    hoy = fecha_operativa_planta(planta).isoformat()
     r = client.get(
         "/analytics/reporte-produccion/",
         params={"fecha_desde": hoy, "fecha_hasta": hoy, "orden_fk": "OP-FILTRO-1"},

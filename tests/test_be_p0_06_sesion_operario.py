@@ -15,6 +15,7 @@ from datetime import timedelta
 
 from sqlmodel import select
 
+from app.core.tiempo_planta import fecha_local
 from app.models.domain import (
     Estacion, Linea, LiteEventoProduccion, Operario, Planta,
     SesionOperario, Turno,
@@ -140,12 +141,12 @@ def test_evento_entre_salida_de_a_y_entrada_de_b_no_se_atribuye_a_nadie(client, 
     db.commit()
 
     autenticar_como(gerente_a.id)
+    # BE-P0-03 (fase EK): fecha LOCAL de planta, no de calendario UTC
+    # (ver comentario homólogo más abajo en este archivo).
+    fecha_hueco = fecha_local(mitad_del_hueco, planta).isoformat()
     r = client.get(
         "/analytics/rendimiento-operarios/",
-        params={
-            "fecha_desde": mitad_del_hueco.date().isoformat(),
-            "fecha_hasta": mitad_del_hueco.date().isoformat(),
-        },
+        params={"fecha_desde": fecha_hueco, "fecha_hasta": fecha_hueco},
         headers={"X-Sub-Tenant-Id": str(planta.id)},
     )
     assert r.status_code == 200
@@ -191,7 +192,13 @@ def test_kpi_reconstruible_desde_historial_de_sesiones_dos_operarios_mismo_dia(c
         ))
     db.commit()
 
-    fecha = sesion_a.entrada.date().isoformat()
+    # BE-P0-03 (fase EK, bug real encontrado por CI cerca de medianoche
+    # UTC): /analytics/rendimiento-operarios/ trata fecha_desde/
+    # fecha_hasta como fecha LOCAL de planta -- tomar la fecha de
+    # CALENDARIO UTC de `entrada` (naive) puede diferir de la fecha
+    # LOCAL de ese mismo instante. `fecha_local` hace la conversión
+    # correcta (misma que usa el propio endpoint).
+    fecha = fecha_local(sesion_a.entrada, planta).isoformat()
     autenticar_como(gerente_a.id)
     r = client.get(
         "/analytics/rendimiento-operarios/",

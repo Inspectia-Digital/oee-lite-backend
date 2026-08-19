@@ -12,6 +12,7 @@ from datetime import datetime, time, timedelta
 
 from sqlmodel import select
 
+from app.core.tiempo_planta import fecha_operativa_planta
 from app.models.domain import (
     AsignacionTurno, Estacion, LiteEventoProduccion, Linea, Operario,
     Planta, SesionOperario, Turno,
@@ -49,7 +50,14 @@ def _preparar_escenario(db, tenant_id):
 
 
 def _asignar_y_emitir(db, tenant_id, estacion, turno, operario, estado="OPTIMO", unidades=1, rechazadas=0):
-    hoy = datetime.utcnow().date()
+    # BE-P0-03 (bug real, encontrado por CI cerca de medianoche UTC): el
+    # endpoint bajo prueba resuelve "hoy" con fecha_operativa_planta (hora
+    # LOCAL de la planta, default America/Buenos_Aires -- mismo default
+    # que usa Planta() acá arriba, sin timezone explícito). Usar
+    # datetime.utcnow().date() acá desincroniza el fixture del propio
+    # endpoint durante la ventana en que UTC ya cruzó de día pero Buenos
+    # Aires (UTC-3) todavía no.
+    hoy = fecha_operativa_planta(None)
     existente = db.exec(
         select(AsignacionTurno).where(
             AsignacionTurno.tenant_id == tenant_id,

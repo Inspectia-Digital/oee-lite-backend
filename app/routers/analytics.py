@@ -14,6 +14,7 @@ from app.core.tiempo_planta import (
     fecha_local as _fecha_local_compartida,
     hora_local as _hora_local_compartida,
     rango_utc_dia_local,
+    rango_utc_multi_dia_local,
 )
 from app.core.turnos import (
     dia_en_dias_semana,
@@ -1438,8 +1439,11 @@ def obtener_reporte_produccion(
         if (fecha_hasta - fecha_desde).days > 90:
             raise HTTPException(status_code=400, detail="El rango máximo para el reporte es de 90 días.")
 
-        inicio = datetime.combine(fecha_desde, time.min)
-        fin = datetime.combine(fecha_hasta, time.max)
+        # BE-P0-03 (mismo bug que rendimiento-operarios/rendimiento-maquinas,
+        # ver esos comentarios): datetime.combine naive perdía las últimas
+        # 3 horas del día LOCAL pedido para plantas en Buenos Aires (UTC-3).
+        planta_reporte = db.get(Planta, context.sub_tenant_id)
+        inicio, fin = rango_utc_multi_dia_local(fecha_desde, fecha_hasta, planta_reporte)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -1860,8 +1864,12 @@ def obtener_rendimiento_operarios(
         if hasta < desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
-        inicio = datetime.combine(desde, time.min)
-        fin = datetime.combine(hasta, time.max)
+        # BE-P0-03 (bug real, encontrado por CI cerca de medianoche UTC):
+        # datetime.combine naive comparaba límites de día LOCAL contra
+        # LiteEventoProduccion.timestamp (UTC naive) sin convertir -- para
+        # Buenos Aires (UTC-3) eso pierde las últimas 3 horas del día
+        # local pedido. Mismo fix que recomputar_eventos (BE-P0-05).
+        inicio, fin = rango_utc_multi_dia_local(desde, hasta, planta_hoy)
 
         query = (
             select(LiteEventoProduccion, Estacion)
@@ -2092,8 +2100,12 @@ def obtener_rendimiento_maquinas(
         if hasta < desde:
             raise HTTPException(status_code=400, detail="fecha_hasta debe ser mayor o igual a fecha_desde.")
 
-        inicio = datetime.combine(desde, time.min)
-        fin = datetime.combine(hasta, time.max)
+        # BE-P0-03 (bug real, encontrado por CI cerca de medianoche UTC):
+        # datetime.combine naive comparaba límites de día LOCAL contra
+        # LiteEventoProduccion.timestamp (UTC naive) sin convertir -- para
+        # Buenos Aires (UTC-3) eso pierde las últimas 3 horas del día
+        # local pedido. Mismo fix que recomputar_eventos (BE-P0-05).
+        inicio, fin = rango_utc_multi_dia_local(desde, hasta, planta_hoy)
 
         # Inner join a Maquina: sólo eventos con máquina resuelta entran a
         # este reporte -- si el hardware no informó maquina_id (Fase E1,
