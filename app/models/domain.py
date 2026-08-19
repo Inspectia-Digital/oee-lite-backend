@@ -745,6 +745,38 @@ class LiteEventoProduccion(TenantBase, table=True):
     tiempo_ideal_seg: float = Field(default=0.0)
 
 
+class RegistroRechazoManual(TenantBase, table=True):
+    """Fase EN (PRD_HALLAZGOS_REVISION_DIRECTA.md, hallazgo #1): carga
+    manual de unidades rechazadas para líneas con Linea.metodo_calidad ==
+    "por_rechazo" cuya estación de calidad no está instrumentada con
+    scanner (confirmado con el usuario: la línea de Green Mills que usa
+    calidad por rechazo necesita carga manual, no tiene el scanner ahí).
+
+    No reemplaza LiteEventoProduccion.unidades_rechazadas -- esa sigue
+    siendo la fuente para líneas SÍ instrumentadas. _calcular_metricas_oee
+    (analytics.py) suma AMBAS fuentes antes de calcular el % de calidad,
+    nunca usa una en lugar de la otra (regla de agregación segura,
+    F§15.2: sumar antes de dividir, nunca por evento individual).
+
+    orden_fk es el id_orden (string), mismo criterio que
+    LiteEventoProduccion.orden_fk -- sin FK dura a propósito (Fase 1.3,
+    adopción sobre completitud: la carga no se bloquea si la orden ya no
+    existe o el dato viene incompleto)."""
+    __tablename__ = "registros_rechazo_manual"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    orden_fk: Optional[str] = Field(default=None, index=True)
+    estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id", index=True)
+    # Validado > 0 en el payload del endpoint vía Pydantic field_validator,
+    # no con un CHECK de DB -- este codebase no usa CHECK constraints en
+    # ningún lado (grep sin resultados), la convención establecida es
+    # validar en el BaseModel del router (ver configuracion.py).
+    cantidad_rechazada: int = Field(description="Unidades rechazadas cargadas a mano, > 0")
+    motivo: Optional[str] = Field(default=None)
+    timestamp: datetime = Field(default_factory=datetime.utcnow, index=True)
+    registrado_por_id: uuid.UUID = Field(foreign_key="usuarios_saas.id")
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # ==========================================
 # 7. BILLING (PRD "Billing MVP + Planes Comerciales" v2.0)
 # ==========================================

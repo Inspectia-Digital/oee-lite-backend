@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlmodel import Session, select
-from sqlalchemy import cast, String, false  # <-- IMPORTANTE: Para el casteo de UUID a String
+from sqlalchemy import cast, String, false, func  # <-- IMPORTANTE: Para el casteo de UUID a String
 from datetime import datetime, time, date, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
@@ -28,6 +28,7 @@ from app.models.domain import (
     OrdenProduccion, AsignacionTurno, EstadoParada,
     AsignacionSupervisor, Supervisor, Maquina, MaestroSKU,
     EstadoExclusionOee, MaquinaEstacion, SesionOperario,
+    RegistroRechazoManual,
 )
 from app.core.auth import get_usuario_actual
 from pydantic import BaseModel
@@ -732,6 +733,38 @@ def _calcular_metricas_oee(
             unidades_calidad_total += evento.unidades_procesadas
             if (evento.delta_t_segundos or 0) <= umbral_calidad_aplicable:
                 unidades_buenas_total += evento.unidades_procesadas
+
+    # Fase EN (PRD_HALLAZGOS_REVISION_DIRECTA.md #1): líneas con
+    # metodo_calidad == "por_rechazo" cuya estación de calidad no está
+    # instrumentada con scanner cargan el rechazo a mano
+    # (RegistroRechazoManual, operacion.py). Se suma DESPUÉS del loop de
+    # arriba -- una vez por orden (no por evento, para no duplicar si una
+    # orden tiene varios eventos) -- a las unidades rechazadas ya
+    # contadas por scan. Regla de agregación segura (F§15.2): sumar
+    # ambas fuentes ANTES de calcular el %, nunca recalcular por evento.
+    ids_orden_por_rechazo = {
+        evento.orden_fk
+        for evento, estacion, linea in eventos
+        if linea.metodo_calidad == "por_rechazo" and evento.orden_fk
+    }
+    total_rechazos_manuales = 0
+    if ids_orden_por_rechazo:
+        filas_rechazo_manual = db.exec(
+            select(RegistroRechazoManual.orden_fk, func.sum(RegistroRechazoManual.cantidad_rechazada))
+            .where(
+                RegistroRechazoManual.tenant_id == context.tenant_id,
+                RegistroRechazoManual.orden_fk.in_(ids_orden_por_rechazo),
+                RegistroRechazoManual.timestamp >= inicio,
+                RegistroRechazoManual.timestamp <= fin,
+            )
+            .group_by(RegistroRechazoManual.orden_fk)
+        ).all()
+        total_rechazos_manuales = sum(cantidad for _, cantidad in filas_rechazo_manual)
+        # Clip a 0: unidades_buenas_total nunca se muestra negativo aunque
+        # lo cargado a mano supere lo procesado por scan (dato incompleto
+        # o scanner que no vio todo lo que pasó -- Fase 1.3, no se
+        # bloquea, sólo no se expone un "buenas" absurdo).
+        unidades_buenas_total = max(0, unidades_buenas_total - total_rechazos_manuales)
 
     if unidades_calidad_total > 0:
         calidad = unidades_buenas_total / unidades_calidad_total

@@ -13,6 +13,7 @@ from app.models.domain import (
     Estacion, Linea, LiteEventoProduccion, Operario, UsuarioSaaS, RolUsuario, UsuarioPlanta,
     AsignacionTurno, AsignacionSupervisor, Turno, Supervisor,
     PlanProduccion, OrdenProduccion, EstadoPlan, EstadoOrden,
+    RegistroRechazoManual,
 )
 
 router = APIRouter(prefix="/supervisor", tags=["Operacion (UI Supervisor)"])
@@ -613,6 +614,85 @@ def _validar_estacion_en_planta(estacion_id: uuid.UUID, context: TenantContext, 
     if estacion.linea_id:
         _validar_linea_en_planta(estacion.linea_id, context, db)
     return estacion
+
+
+# ==========================================
+# CARGA MANUAL DE RECHAZOS (Fase EN, PRD_HALLAZGOS_REVISION_DIRECTA.md #1)
+# Para líneas con Linea.metodo_calidad == "por_rechazo" cuya estación de
+# calidad no está instrumentada con scanner (confirmado con el usuario:
+# la línea de Green Mills que usa este método necesita carga manual).
+# _calcular_metricas_oee (analytics.py) suma estos registros a
+# LiteEventoProduccion.unidades_rechazadas -- no reemplaza esa fuente,
+# la complementa. Mismo piso de rol que el resto de acciones de
+# supervisor sobre paradas/calidad (MIN_ROLE_PARADAS, Fase DR).
+# ==========================================
+class RechazoManualCreate(BaseModel):
+    orden_fk: Optional[str] = Field(default=None, description="id_orden; opcional, mismo criterio que LiteEventoProduccion.orden_fk (Fase 1.3)")
+    estacion_id: uuid.UUID
+    cantidad_rechazada: int
+    motivo: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("cantidad_rechazada")
+    @classmethod
+    def _cantidad_positiva(cls, v: int) -> int:
+        # Validación en el payload, no CHECK de DB -- este codebase no usa
+        # CHECK constraints en ningún lado (mismo criterio que el resto
+        # de validadores de este archivo/configuracion.py).
+        if v <= 0:
+            raise ValueError("cantidad_rechazada debe ser mayor a 0.")
+        return v
+
+
+@router.post("/rechazos-manuales", response_model=RegistroRechazoManual, status_code=status.HTTP_201_CREATED)
+def registrar_rechazo_manual(
+    datos: RechazoManualCreate,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para registrar un rechazo manual.")
+    # QA-06 (mismo criterio que clasificar_parada): la estación tiene que
+    # pertenecer realmente a la planta activa, no sólo al tenant.
+    _validar_estacion_en_planta(datos.estacion_id, context, db)
+
+    registro = RegistroRechazoManual(
+        tenant_id=context.tenant_id,
+        orden_fk=datos.orden_fk,
+        estacion_id=datos.estacion_id,
+        cantidad_rechazada=datos.cantidad_rechazada,
+        motivo=datos.motivo,
+        registrado_por_id=usuario.id,
+    )
+    db.add(registro)
+    db.commit()
+    db.refresh(registro)
+    return registro
+
+
+@router.get("/rechazos-manuales", response_model=List[RegistroRechazoManual])
+def listar_rechazos_manuales(
+    orden_fk: Optional[str] = None,
+    estacion_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_session),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+    usuario: UsuarioSaaS = Depends(get_usuario_actual),
+):
+    """Lectura simple para mostrar "Rechazos manuales: N" en la UI de la
+    orden activa (Fase EN frontend) -- sin paginación porque el volumen
+    esperado por orden/estación es bajo (cargas manuales puntuales, no
+    eventos de scanner de alta frecuencia)."""
+    validar_planta(context, usuario, db)
+    if usuario.rol not in MIN_ROLE_PARADAS:
+        raise HTTPException(status_code=403, detail="No tenés permisos para ver los rechazos manuales.")
+    query = select(RegistroRechazoManual).where(RegistroRechazoManual.tenant_id == context.tenant_id)
+    if orden_fk:
+        query = query.where(RegistroRechazoManual.orden_fk == orden_fk)
+    if estacion_id:
+        _validar_estacion_en_planta(estacion_id, context, db)
+        query = query.where(RegistroRechazoManual.estacion_id == estacion_id)
+    return db.exec(query.order_by(RegistroRechazoManual.timestamp.desc())).all()
 
 
 # ==========================================
