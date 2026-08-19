@@ -641,6 +641,59 @@ def _resolver_precios(plan: PlanPrecio, plan_comercial: Optional[PlanComercial])
     return precio_base, precio_con_descuento
 
 
+def _sincronizar_modulos_contratados(db: Session, tenant_id: str, modulo_tocado_id: Optional[uuid.UUID] = None) -> None:
+    """Fase EK.2 (plan "Unificación mínima de módulos", ago 2026): hace
+    que asignar un plan de Billing para un módulo efectivamente OTORGUE
+    ese módulo en la navegación real del tenant (Sistema A,
+    `Tenant.modulos_contratados` -- el CSV que leen ShellSidebar/Index/
+    `usuarios/me`). Hasta acá nada conectaba esto: asignar/suspender/
+    eliminar un módulo desde Billing (Sistema B, este router) no tocaba
+    el CSV, y viceversa -- eran dos sistemas de "módulos contratados"
+    sin sincronizar.
+
+    Recalcula el CSV a partir de las `AsignacionModuloTenant` de este
+    tenant, pero SÓLO toca códigos "gestionados por billing" -- nunca
+    pisa "tymeo" (el default gratuito de todo tenant nuevo,
+    `Field(default="tymeo")` en `Tenant`, que no pasa por este sistema)
+    ni cualquier otro código que el tenant tenga por fuera de Billing.
+
+    `modulo_tocado_id`: el módulo de la asignación que se acaba de
+    crear/editar/ELIMINAR en este mismo request. Es obligatorio pasarlo
+    en el DELETE -- una vez borrada la fila ya no hay ningún
+    `AsignacionModuloTenant` del que derivar "este código está
+    gestionado por billing" (bug real encontrado por
+    `test_eliminar_asignacion_quita_acceso`: sin este parámetro, borrar
+    la única asignación de un módulo dejaba el código pegado en el CSV
+    para siempre, porque "gestionados" se recalculaba SOLO de filas que
+    ya no existían).
+
+    Llamar dentro de la misma transacción, antes del `commit()` del
+    handler -- confía en el autoflush por defecto de la Session para que
+    el `select` de abajo vea el alta/baja recién hecha."""
+    tenant = db.get(Tenant, tenant_id)
+    if not tenant:
+        return
+    actuales = {m.strip().lower() for m in (tenant.modulos_contratados or "").split(",") if m.strip()}
+
+    filas = db.exec(
+        select(AsignacionModuloTenant.modulo_id, AsignacionModuloTenant.estado)
+        .where(AsignacionModuloTenant.tenant_id == tenant_id)
+    ).all()
+    codigos_por_id = dict(db.exec(select(ModuloDisponible.id, ModuloDisponible.codigo)).all())
+
+    gestionados_billing = {codigos_por_id[m] for m, _e in filas if m in codigos_por_id}
+    if modulo_tocado_id is not None and modulo_tocado_id in codigos_por_id:
+        gestionados_billing.add(codigos_por_id[modulo_tocado_id])
+    activos_billing = {
+        codigos_por_id[m] for m, e in filas
+        if e == EstadoAsignacionModulo.ACTIVA and m in codigos_por_id
+    }
+
+    nuevos = (actuales - gestionados_billing) | activos_billing
+    tenant.modulos_contratados = ",".join(sorted(nuevos))
+    db.add(tenant)
+
+
 class AsignacionModuloCreate(BaseModel):
     modulo_id: uuid.UUID
     plan_id: uuid.UUID
@@ -737,6 +790,7 @@ def asignar_modulo_a_tenant(
         actualizado_por_id=usuario.id,
     )
     db.add(asignacion)
+    _sincronizar_modulos_contratados(db, tenant_id, asignacion.modulo_id)
     db.commit()
     db.refresh(asignacion)
     return asignacion
@@ -787,6 +841,7 @@ def actualizar_asignacion_modulo(
     asignacion.actualizado_por_id = usuario.id
     asignacion.actualizado_at = datetime.utcnow()
     db.add(asignacion)
+    _sincronizar_modulos_contratados(db, tenant_id, asignacion.modulo_id)
     db.commit()
     db.refresh(asignacion)
     return asignacion
@@ -802,7 +857,9 @@ def eliminar_asignacion_modulo(
     asignacion = db.get(AsignacionModuloTenant, asignacion_id)
     if not asignacion or asignacion.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Asignación no encontrada.")
+    modulo_id = asignacion.modulo_id
     db.delete(asignacion)
+    _sincronizar_modulos_contratados(db, tenant_id, modulo_id)
     db.commit()
 
 
