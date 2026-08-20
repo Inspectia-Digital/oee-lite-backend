@@ -15,12 +15,14 @@ auth.py importara este módulo y este módulo importara auth0_management,
 el ciclo sería auth.py -> onboarding.py -> auth0_management.py -> auth.py."""
 import logging
 import uuid
+from typing import Optional, Tuple
 
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from app.core.auth0_management import obtener_email_usuario_auth0
+from app.core.auth0_management import crear_ticket_cambio_password, crear_usuario_auth0, obtener_email_usuario_auth0
 from app.models.domain import RolUsuario, Tenant, UsuarioSaaS
 
 logger = logging.getLogger(__name__)
@@ -121,3 +123,39 @@ def provisionar_tenant_y_usuario(auth0_sub: str, db: Session) -> UsuarioSaaS:
     db.refresh(usuario)
     logger.info(f"Auto-provisioning: nuevo tenant {tenant.id} + usuario {usuario.id} (auth0_sub={auth0_sub}).")
     return usuario
+
+
+def invitar_usuario_en_auth0(email: str, nombre: str, apellido: str) -> Tuple[str, bool, Optional[str]]:
+    """Fase EV (pedido del usuario: "si creo un usuario desde el front se
+    cree en auth0"): al invitar a alguien desde el panel
+    (crear_usuario_tenant/crear_usuario_b2b, admin.py), intenta crear la
+    cuenta REAL en Auth0 de una -- en vez de sólo el placeholder
+    `auth0|mock_xxxx` de antes (Fase EU.2 sigue vigente como red de
+    seguridad para las filas que ya quedaron así, o si esto falla).
+
+    Best-effort a nivel de ESTE llamador: si Auth0 rechaza el alta (email
+    ya existe ahí, credenciales sin el scope create:users, etc.), cae al
+    mock de siempre -- crear al usuario en NUESTRA base nunca se bloquea
+    por un fallo del lado de Auth0.
+
+    Si la creación en Auth0 sí funciona, genera de una el link de "elegí
+    tu contraseña" (mismo ticket que ya usa el botón de reset-password) --
+    la password real con la que se crea en Auth0 es aleatoria y
+    descartable, nadie la usa nunca.
+
+    Devuelve (auth0_id, auth0_creado, ticket_url) -- ticket_url puede ser
+    None aunque auth0_creado sea True (el alta funcionó pero el ticket
+    falló; se puede regenerar después con el botón de la llave)."""
+    try:
+        auth0_id = crear_usuario_auth0(email, nombre, apellido)
+    except Exception as e:
+        logger.warning(f"No se pudo crear el usuario en Auth0 para {email}, se usa el placeholder mock: {e}")
+        return f"auth0|mock_{uuid.uuid4().hex[:8]}", False, None
+
+    ticket_url: Optional[str] = None
+    try:
+        ticket_url = crear_ticket_cambio_password(auth0_id)
+    except HTTPException as e:
+        logger.warning(f"Usuario {auth0_id} creado en Auth0 pero no se pudo generar el link de contraseña: {e.detail}")
+
+    return auth0_id, True, ticket_url

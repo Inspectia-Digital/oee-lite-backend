@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     AUTH0_MGMT_CLIENT_ID: str = ""
     AUTH0_MGMT_CLIENT_SECRET: str = ""
     AUTH0_MGMT_TIMEOUT_SECONDS: float = 5.0
+    # Fase EV: conexión de Auth0 (Database Connection) donde se crean los
+    # usuarios invitados desde el panel -- configurable porque el nombre
+    # puede variar entre tenants de Auth0 (dev vs. el nuevo de prod), no
+    # hay garantía de que sea siempre el default de Auth0.
+    AUTH0_DB_CONNECTION_NAME: str = "Username-Password-Authentication"
 
     # Lista separada por comas, ej: "https://app.midominio.com,https://admin.midominio.com"
     CORS_ORIGINS: str = ""
