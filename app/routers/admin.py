@@ -9,7 +9,7 @@ from app.core.database import get_session
 from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual, verificar_token_auth0
 from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
 from app.core.auth0_management import crear_ticket_cambio_password
-from app.core.onboarding import provisionar_tenant_y_usuario
+from app.core.onboarding import invitar_usuario_en_auth0, provisionar_tenant_y_usuario
 from app.models.domain import (
     UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso,
     ModuloDisponible,
@@ -369,14 +369,25 @@ def crear_usuario_tenant(
     if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == payload.email)).first():
         raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado.")
 
-    mock_auth0_id = payload.auth0_id or f"auth0|mock_{uuid.uuid4().hex[:8]}"
+    # Fase EV: si el caller ya pasó un auth0_id explícito (poco común, ver
+    # UsuarioCreate.auth0_id), se respeta tal cual -- no se intenta crear
+    # en Auth0 de nuevo. Si no, se intenta el alta real (best-effort, cae
+    # al placeholder mock si falla -- ver invitar_usuario_en_auth0).
+    if payload.auth0_id:
+        auth0_id, auth0_creado, ticket_url = payload.auth0_id, False, None
+    else:
+        auth0_id, auth0_creado, ticket_url = invitar_usuario_en_auth0(payload.email, payload.nombre, payload.apellido)
+
     nuevo_usuario = UsuarioSaaS(
-        auth0_id=mock_auth0_id, tenant_id=context.tenant_id, email=payload.email,
+        auth0_id=auth0_id, tenant_id=context.tenant_id, email=payload.email,
         nombre=payload.nombre, apellido=payload.apellido, rol=payload.rol, activo=True
     )
     db.add(nuevo_usuario)
     db.commit()
-    return {"mensaje": "Usuario creado con éxito", "id": str(nuevo_usuario.id)}
+    return {
+        "mensaje": "Usuario creado con éxito", "id": str(nuevo_usuario.id),
+        "auth0_creado": auth0_creado, "ticket_url": ticket_url,
+    }
 
 @router.patch("/mi-empresa/usuarios/{auth0_id_target}")
 def actualizar_usuario(
@@ -569,14 +580,26 @@ def crear_usuario_b2b(nuevo_usuario: NuevoUsuarioSaaS, db: Session = Depends(get
     if db.exec(select(UsuarioSaaS).where(UsuarioSaaS.email == nuevo_usuario.email)).first():
         raise HTTPException(status_code=400, detail="Email ya registrado.")
     
-    mock_auth0_id = f"auth0|mock_{uuid.uuid4().hex[:8]}"
+    # Fase EV: alta real en Auth0, best-effort (ver invitar_usuario_en_auth0
+    # -- cae al placeholder mock de siempre si falla).
+    auth0_id, auth0_creado, ticket_url = invitar_usuario_en_auth0(
+        nuevo_usuario.email, nuevo_usuario.nombre, nuevo_usuario.apellido
+    )
     db_usuario = UsuarioSaaS(
-        auth0_id=mock_auth0_id, tenant_id=nuevo_usuario.tenant_id, email=nuevo_usuario.email,
+        auth0_id=auth0_id, tenant_id=nuevo_usuario.tenant_id, email=nuevo_usuario.email,
         rol=nuevo_usuario.rol, nombre=nuevo_usuario.nombre, apellido=nuevo_usuario.apellido, activo=True
     )
     db.add(db_usuario)
     db.commit()
-    return {"mensaje": "Usuario B2B creado exitosamente.", "usuario": db_usuario}
+    # Bug real preexistente (no de Fase EV): sin refresh acá, el objeto
+    # serializaba vacío en la respuesta -- expire_on_commit por default
+    # deja sus atributos "expirados", y para cuando FastAPI lo serializa
+    # la sesión de esta request ya se cerró (no puede hacer lazy-load).
+    db.refresh(db_usuario)
+    return {
+        "mensaje": "Usuario B2B creado exitosamente.", "usuario": db_usuario,
+        "auth0_creado": auth0_creado, "ticket_url": ticket_url,
+    }
 
 @router.patch("/superadmin/usuarios/{auth0_id}", tags=["SuperAdmin (Global)"])
 def actualizar_usuario_global(auth0_id: str, payload: UsuarioGlobalUpdate, db: Session = Depends(get_session), usuario_actual: UsuarioSaaS = Depends(get_usuario_actual)):

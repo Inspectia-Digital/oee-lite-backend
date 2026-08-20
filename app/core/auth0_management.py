@@ -5,6 +5,7 @@ scope create:user_tickets -- alcanza para generar un link de cambio de
 password sin necesitar update:users (más privilegio del que hace falta).
 """
 import logging
+import secrets
 from typing import Optional
 
 import requests
@@ -90,3 +91,40 @@ def obtener_email_usuario_auth0(auth0_id: str) -> Optional[str]:
     except requests.RequestException as e:
         logger.warning(f"No se pudo resolver el email de Auth0 para {auth0_id}: {e}")
         return None
+
+
+def crear_usuario_auth0(email: str, nombre: str, apellido: str) -> str:
+    """Fase EV: crea un usuario REAL en Auth0 cuando se lo invita desde el
+    panel -- reemplaza al placeholder `auth0|mock_xxxx` que se usaba antes
+    (ver domain de RegistroInvitado en admin.py). Password aleatoria
+    DESCARTABLE: nunca se usa para loguearse -- el llamador genera un
+    ticket de cambio de password (crear_ticket_cambio_password) inmediato
+    después de esto, ese es el único link real que la persona recibe.
+
+    A diferencia de obtener_email_usuario_auth0, esto NO es best-effort:
+    levanta la excepción real (HTTPException 503, o requests.HTTPError si
+    Auth0 rechaza el alta -- ej. el email ya existe ahí) para que el
+    llamador decida el fallback explícitamente (hoy: degradar al mock de
+    toda la vida, ver crear_usuario_tenant/crear_usuario_b2b en admin.py).
+
+    Requiere el scope create:users en el M2M client de Management API
+    (configurado fuera del repo, dashboard de Auth0) -- si no está,
+    Auth0 devuelve 403 acá mismo."""
+    token = _obtener_token_management_api()
+    password_descartable = secrets.token_urlsafe(24) + "Aa1!"
+    resp = requests.post(
+        f"https://{AUTH0_DOMAIN}/api/v2/users",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "email": email,
+            "given_name": nombre,
+            "family_name": apellido,
+            "name": f"{nombre} {apellido}".strip(),
+            "connection": settings.AUTH0_DB_CONNECTION_NAME,
+            "password": password_descartable,
+            "email_verified": False,
+        },
+        timeout=settings.AUTH0_MGMT_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["user_id"]
