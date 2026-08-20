@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from main import app
-from app.core.auth import get_usuario_actual
+from app.core.auth import get_usuario_actual, verificar_token_auth0
 from app.core.database import engine
 from app.models.domain import UsuarioSaaS, RolUsuario, Tenant, EstadoTenant
 
@@ -82,18 +82,37 @@ def superadmin(db, tenant_a):
 
 @pytest.fixture(autouse=True)
 def limpiar_overrides():
-    """Evita que un override de un test se filtre al siguiente."""
+    """Evita que un override de un test se filtre al siguiente. Incluye
+    verificar_token_auth0 (Fase EU: tests de auto-provisioning lo
+    overridean directo, un nivel más abajo que get_usuario_actual, para
+    poder simular un auth0_sub sin UsuarioSaaS todavía)."""
     yield
     app.dependency_overrides.pop(get_usuario_actual, None)
+    app.dependency_overrides.pop(verificar_token_auth0, None)
 
 
 def autenticar_como(usuario_id):
     """Reemplaza get_usuario_actual para simular un login ya resuelto, sin
     necesitar un JWT real de Auth0 (igual que se hizo durante todo el
-    desarrollo de estas fases)."""
+    desarrollo de estas fases).
+
+    Fase EU: también overridea verificar_token_auth0 con el auth0_id real
+    del usuario. Necesario porque GET /accesos/usuarios/me ya no depende
+    de get_usuario_actual directo -- depende de
+    resolver_o_provisionar_usuario_actual (admin.py), un nivel más abajo,
+    para poder auto-provisionar un Tenant en el primer login. Sin esto,
+    cualquier test existente que llame a /usuarios/me vía autenticar_como()
+    dejaría de funcionar: el override de get_usuario_actual seguiría sin
+    tener ningún efecto sobre ese endpoint puntual."""
     def _fake():
         with Session(engine) as s:
             u = s.get(UsuarioSaaS, usuario_id)
             s.expunge(u)
             return u
     app.dependency_overrides[get_usuario_actual] = _fake
+
+    with Session(engine) as s:
+        usuario = s.get(UsuarioSaaS, usuario_id)
+        auth0_id = usuario.auth0_id if usuario else None
+    if auth0_id:
+        app.dependency_overrides[verificar_token_auth0] = lambda: {"sub": auth0_id}
