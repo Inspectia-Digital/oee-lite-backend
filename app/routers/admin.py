@@ -6,9 +6,10 @@ from sqlalchemy import func
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual
+from app.core.auth import obtener_contexto_tenant_humano, TenantContext, get_usuario_actual, verificar_token_auth0
 from app.core.rbac import requerir_gerencia_o_superadmin, requerir_superadmin
 from app.core.auth0_management import crear_ticket_cambio_password
+from app.core.onboarding import provisionar_tenant_y_usuario
 from app.models.domain import (
     UsuarioSaaS, RolUsuario, Tenant, Planta, UsuarioPlanta, EstadoTenant, ModuloPermiso,
     ModuloDisponible,
@@ -138,9 +139,30 @@ class PerfilMeResponse(BaseModel):
 # ==========================================
 # RUTAS DE PERFIL (FRONTEND BOOTSTRAP)
 # ==========================================
+def resolver_o_provisionar_usuario_actual(
+    payload: dict = Depends(verificar_token_auth0),
+    db: Session = Depends(get_session),
+) -> UsuarioSaaS:
+    """Fase EU: variante de get_usuario_actual() SÓLO para el bootstrap de
+    perfil (/usuarios/me) -- get_usuario_actual() en sí NO se toca, lo
+    siguen usando decenas de otros endpoints con su 403 duro intacto.
+    Auto-provisionar como side-effect de cualquier request random sería
+    un riesgo real (carreras, tenants fantasma); acá es seguro porque es
+    el único endpoint que el frontend llama, una vez, justo después del
+    login -- exactamente donde tiene sentido resolver el "limbo" de un
+    usuario de Auth0 sin Tenant/UsuarioSaaS asociado todavía."""
+    auth0_sub = payload.get("sub")
+    usuario_db = db.exec(select(UsuarioSaaS).where(UsuarioSaaS.auth0_id == auth0_sub)).first()
+    if not usuario_db:
+        usuario_db = provisionar_tenant_y_usuario(auth0_sub, db)
+    if not usuario_db.activo:
+        raise HTTPException(status_code=403, detail="Usuario inactivo.")
+    return usuario_db
+
+
 @router.get("/usuarios/me", response_model=PerfilMeResponse, tags=["Perfil"])
 def obtener_perfil_actual(
-    usuario_actual: UsuarioSaaS = Depends(get_usuario_actual),
+    usuario_actual: UsuarioSaaS = Depends(resolver_o_provisionar_usuario_actual),
     db: Session = Depends(get_session),
 ):
     """Devuelve los datos del usuario logueado más su matriz de permisos por
