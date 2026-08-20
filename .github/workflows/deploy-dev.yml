@@ -176,8 +176,8 @@ jobs:
             --region $REGION \
             --project $PROJECT_ID \
             --add-cloudsql-instances $DB_INSTANCE \
-            --set-secrets="DATABASE_URL=DEV_DATABASE_URL:latest" \
-            --set-env-vars="AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}" \
+            --set-secrets="DATABASE_URL=DEV_DATABASE_URL:latest,AUTH0_MGMT_CLIENT_SECRET=DEV_AUTH0_MGMT_CLIENT_SECRET:latest" \
+            --set-env-vars="AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }},AUTH0_MGMT_CLIENT_ID=Mj73xiHNsKsqCR9G6yGpVv26oTsBEqK1" \
             --allow-unauthenticated \
             --min-instances 0 \
             --max-instances 5 \
