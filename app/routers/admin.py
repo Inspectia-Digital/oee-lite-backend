@@ -73,7 +73,11 @@ class TenantUpdate(BaseModel):
     # enforced en el backend (verificar_permiso_carga_y_linea, importaciones.py
     # -- rechaza con 409 la carga manual/archivo si es "ERP"), pero nunca
     # tuvo forma de editarse por API -- un gap real, no un campo nuevo.
+    # Fase EZ.2: origen_maestros ahora gobierna sólo SKUs.
     origen_maestros: Optional[str] = None
+    # Fase EZ.2: split de origen_maestros -- gobierna Planes y Órdenes,
+    # independiente del de SKUs (ver Tenant.origen_maestros_planes).
+    origen_maestros_planes: Optional[str] = None
 
 class TenantLogoUpdate(BaseModel):
     logo_url: str

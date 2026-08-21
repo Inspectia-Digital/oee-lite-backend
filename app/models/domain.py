@@ -179,7 +179,20 @@ class Tenant(SQLModel, table=True):
     oee_objetivo_pct: float = Field(default=85.0)
     regex_parser_orden: Optional[str] = None
     regex_parser_sku: Optional[str] = None
+    # Origen de SKUs (Fase AF/BC, pedido Green Mills). Hasta Fase EZ.2 este
+    # mismo campo también gobernaba Planes/Órdenes -- un solo toggle
+    # tenant-wide para los tres, con Planes mostrándolo de sólo lectura
+    # (ver OrigenMaestrosSelector.tsx). El usuario pidió que fueran
+    # independientes (un tenant puede cargar SKUs a mano y recibir
+    # Planes/Órdenes del ERP, o viceversa) -- ver origen_maestros_planes.
     origen_maestros: str = Field(default="MANUAL")
+    # Fase EZ.2: split de origen_maestros -- gobierna Planes y Órdenes
+    # (las Órdenes viven dentro de un Plan, mismo criterio que ya usaban
+    # los guards de alta manual/masiva: un solo check para ambas). Ver
+    # migración fase_ez2_split_origen_maestros -- se backfillea con el
+    # valor de origen_maestros al momento de la migración para que ningún
+    # tenant en modo ERP pierda el bloqueo de golpe.
+    origen_maestros_planes: str = Field(default="MANUAL")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     # Suspensión de tenant (Fase D). Sólo SuperAdmin puede cambiarlo.

@@ -49,11 +49,18 @@ def _validar_cantidad_filas(df: pd.DataFrame) -> None:
 # ==========================================
 # HELPER: GUARDIA DE INTEGRACIÓN & PLANTA
 # ==========================================
-def verificar_permiso_carga_y_linea(db: Session, context: TenantContext, linea_id: str) -> Linea:
+def verificar_permiso_carga_y_linea(
+    db: Session, context: TenantContext, linea_id: str,
+    campo_origen: str = "origen_maestros",
+) -> Linea:
+    # Fase EZ.2: origen_maestros se dividió en SKUs (origen_maestros) y
+    # Planes/Órdenes (origen_maestros_planes), independientes -- cada
+    # caller pasa el campo que le corresponde chequear (ver call sites:
+    # /skus/upload usa el default, /plan/upload pasa "origen_maestros_planes").
     tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
-    if tenant and tenant.origen_maestros == "ERP":
+    if tenant and getattr(tenant, campo_origen) == "ERP":
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, 
+            status_code=status.HTTP_409_CONFLICT,
             detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP."
         )
     
@@ -108,8 +115,9 @@ async def subir_plan(
     db: Session = Depends(get_session),
     context: TenantContext = Depends(obtener_contexto_tenant_humano)
 ):
-    # 1. Validaciones Core (ERP & Planta)
-    verificar_permiso_carga_y_linea(db, context, linea_id)
+    # 1. Validaciones Core (ERP & Planta) -- Fase EZ.2: Planes/Órdenes
+    # chequea origen_maestros_planes, no origen_maestros (SKUs).
+    verificar_permiso_carga_y_linea(db, context, linea_id, "origen_maestros_planes")
 
     plan_uuid: Optional[uuid.UUID] = None
     siguiente_secuencia = 1
