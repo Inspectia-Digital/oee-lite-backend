@@ -18,6 +18,8 @@ reloj real)."""
 import uuid
 from datetime import date, datetime, timedelta
 
+from sqlalchemy import text
+
 from app.models.domain import (
     AsignacionSupervisor, AsignacionTurno, Estacion, EstadoParada,
     Linea, LiteEventoProduccion, Maquina, MaquinaEstacion, MotivoParada,
@@ -263,3 +265,42 @@ def test_linea_de_otro_tenant_devuelve_404(db, client, tenant_a, tenant_b, geren
         headers={"X-Sub-Tenant-Id": str(planta_b.id)},
     )
     assert r.status_code == 404
+
+
+def test_parada_con_exclusion_oee_legado_en_minuscula_no_rompe_la_radiografia(db, client, tenant_a, gerente_a):
+    """Fase EZ (bug real, reproducido contra datos de Green Mills):
+    ParadaDetectada.exclusion_oee sin `values_callable` hacía que
+    SQLAlchemy mapeara por el NAME del enum ("NINGUNA") al leer, pero la
+    columna es VARCHAR plano con server_default='ninguna' (el VALUE, en
+    minúscula -- ver migración f4a2d891c6e7). Cualquier fila que haya
+    recibido ese default directo de Postgres (backfill de ALTER TABLE,
+    nunca pasó por el bind processor de la ORM) quedaba con 'ninguna' en
+    minúscula y explotaba con LookupError al leerse -- exactamente lo que
+    le pasó a /analytics/dia-radiografia/ en producción. Se simula ese
+    escenario con un UPDATE crudo (bypass total de la ORM, igual que un
+    backfill de migración), no con el ORM -- así el test replica la causa
+    real, no sólo el síntoma."""
+    planta, linea, estacion, turno, maquina, supervisor, operario = _preparar_escenario(db, tenant_a)
+    _insertar_evento(db, tenant_a, estacion.id, _utc_para_hora_local("08:30"), linea)
+
+    parada = ParadaDetectadaModel(
+        tenant_id=tenant_a, estacion_fk=estacion.id,
+        inicio=_utc_para_hora_local("10:00"), fin=_utc_para_hora_local("10:18"),
+        duracion_segundos=18 * 60, estado=EstadoParada.CLASIFICADA,
+    )
+    db.add(parada)
+    db.commit()
+    db.refresh(parada)
+
+    db.execute(text("UPDATE paradas_detectadas SET exclusion_oee = 'ninguna' WHERE id = :id"), {"id": str(parada.id)})
+    db.commit()
+
+    autenticar_como(gerente_a.id)
+    r = client.get(
+        "/analytics/dia-radiografia/",
+        params={"fecha": FECHA.isoformat(), "linea_id": str(linea.id)},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
+    assert r.status_code == 200, r.text
+    p = r.json()["turnos"][0]["paradas"][0]
+    assert p["exclusion_oee"] is False

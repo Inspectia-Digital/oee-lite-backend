@@ -636,7 +636,25 @@ class ParadaDetectada(TenantBase, table=True):
     # Fase CC (FE-P0-08): workflow de falso positivo -- ver
     # EstadoExclusionOee. Todos nullable/con default NINGUNA porque las
     # paradas existentes antes de esta fase nunca pasaron por el flujo.
-    exclusion_oee: EstadoExclusionOee = Field(default=EstadoExclusionOee.NINGUNA)
+    #
+    # Fase EZ (bug real encontrado en dia-radiografia contra datos reales
+    # de Green Mills, post go-live): sin values_callable, SQLAlchemy
+    # mapea este campo por el NAME del enum ("NINGUNA") -- pero la
+    # columna es VARCHAR plano (ver migración f4a2d891c6e7, decisión
+    # deliberada de evitar un enum nativo) con server_default='ninguna'
+    # (el VALUE, minúscula). Todo registro preexistente al momento de esa
+    # migración quedó con 'ninguna' en minúscula vía el backfill del
+    # ALTER TABLE; cualquier lectura posterior de esas filas explota con
+    # LookupError. Mismo patrón de bug que EstadoPlan (ver migración
+    # 67f069bae880) -- acá se corrige en el modelo, no sólo en la data,
+    # para que no vuelva a pasar.
+    exclusion_oee: EstadoExclusionOee = Field(
+        default=EstadoExclusionOee.NINGUNA,
+        sa_column=Column(SaEnum(
+            EstadoExclusionOee, native_enum=False,
+            values_callable=lambda obj: [e.value for e in obj],
+        )),
+    )
     exclusion_motivo: Optional[str] = Field(default=None, description="Por qué se propone como falso positivo")
     exclusion_propuesta_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
     exclusion_propuesta_at: Optional[datetime] = Field(default=None)
