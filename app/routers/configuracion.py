@@ -696,6 +696,8 @@ def crear_sku(
     # individual, usado por "Nueva SKU" y por el modo manual del
     # importador -- no tenía ningún chequeo de origen_maestros: un tenant
     # "ERP" podía crear SKUs a mano igual. Gap real, se cierra acá.
+    # Fase EZ.2: origen_maestros quedó SOLO para SKUs -- Planes/Órdenes
+    # usan origen_maestros_planes, independiente (ver crear_plan/crear_orden).
     tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
     if tenant and tenant.origen_maestros == "ERP":
         raise HTTPException(
@@ -933,12 +935,14 @@ def crear_orden(
     context: TenantContext = Depends(obtener_contexto_tenant_humano),
     _: UsuarioSaaS = Depends(requerir_gerencia),
 ):
-    # Unificación UX Planes/Órdenes/SKUs: mismo guard que crear_sku/crear_plan.
+    # Unificación UX Planes/Órdenes/SKUs: mismo guard que crear_plan.
+    # Fase EZ.2: Órdenes se gobierna por origen_maestros_planes (no
+    # origen_maestros, que quedó sólo para SKUs -- ver domain.py).
     tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
-    if tenant and tenant.origen_maestros == "ERP":
+    if tenant and tenant.origen_maestros_planes == "ERP":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP.",
+            detail="Operación denegada. Tu empresa está configurada para recibir Planes y Órdenes exclusivamente desde el ERP.",
         )
 
     existente = db.exec(
@@ -1265,11 +1269,12 @@ def crear_plan(
     # alta masiva por archivo ya lo tenía (verificar_permiso_carga_y_linea,
     # importaciones.py), el alta individual no. Un tenant "ERP" no debería
     # poder crear Planes/Órdenes a mano tampoco.
+    # Fase EZ.2: origen_maestros_planes, independiente del de SKUs.
     tenant = db.exec(select(Tenant).where(Tenant.id == context.tenant_id)).first()
-    if tenant and tenant.origen_maestros == "ERP":
+    if tenant and tenant.origen_maestros_planes == "ERP":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Operación denegada. Tu empresa está configurada para recibir datos exclusivamente desde el ERP.",
+            detail="Operación denegada. Tu empresa está configurada para recibir Planes y Órdenes exclusivamente desde el ERP.",
         )
 
     linea = db.exec(select(Linea).where(Linea.id == payload.linea_id, Linea.tenant_id == context.tenant_id)).first()

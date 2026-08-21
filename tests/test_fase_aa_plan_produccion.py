@@ -129,8 +129,10 @@ def test_crear_plan_nombre_se_persiste_y_se_puede_renombrar(client, db, tenant_a
 
 
 def test_crear_plan_bloqueado_si_origen_erp(client, db, tenant_a, gerente_a):
+    # Fase EZ.2: Planes se gobierna por origen_maestros_planes, no por el
+    # de SKUs -- ver test_origen_maestros.py para la independencia entre ambos.
     tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_a)).first()
-    tenant_db.origen_maestros = "ERP"
+    tenant_db.origen_maestros_planes = "ERP"
     db.add(tenant_db)
     db.commit()
 
@@ -145,8 +147,9 @@ def test_crear_plan_bloqueado_si_origen_erp(client, db, tenant_a, gerente_a):
 
 
 def test_crear_orden_bloqueada_si_origen_erp(client, db, tenant_a, gerente_a):
+    # Fase EZ.2: Órdenes también por origen_maestros_planes (ver arriba).
     tenant_db = db.exec(select(Tenant).where(Tenant.id == tenant_a)).first()
-    tenant_db.origen_maestros = "ERP"
+    tenant_db.origen_maestros_planes = "ERP"
     db.add(tenant_db)
     db.commit()
 
