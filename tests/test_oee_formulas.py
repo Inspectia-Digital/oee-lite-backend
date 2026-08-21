@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlmodel import select
 
+from app.core.tiempo_planta import fecha_local
 from app.models.domain import Estacion, Linea, Planta, Turno, MetodoCalidadLinea
 from tests.conftest import autenticar_como
 
@@ -51,17 +52,29 @@ def test_calidad_por_rechazo_calcula_correctamente(client, db, tenant_a, gerente
     credencial = _emitir_key_y_credencial(client, gerente_a, estacion.id)
 
     ahora = datetime.now(timezone.utc)
+    timestamps = []
     for i, rechazadas in enumerate([0, 0, 1]):
-        ts = (ahora - timedelta(minutes=10 * (2 - i))).isoformat()
+        ts_dt = ahora - timedelta(minutes=10 * (2 - i))
+        timestamps.append(ts_dt)
         r = client.post(
             "/api/lite/scans",
-            json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ts, "unidades_rechazadas": rechazadas},
+            json={"event_id": str(uuid.uuid4()), "id_estacion": str(estacion.id), "timestamp": ts_dt.isoformat(), "unidades_rechazadas": rechazadas},
             headers={"X-Device-Key": credencial},
         )
         assert r.status_code == 201
 
     autenticar_como(gerente_a.id)
-    r = client.get("/analytics/oee-general/", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    # Fase EY (bug real de timing, reproducido en vivo cerca de medianoche
+    # LOCAL de planta): los 3 eventos van de "ahora - 20min" a "ahora" --
+    # si esa ventana cruza la medianoche local mientras corre el test, el
+    # primero cae en un día distinto del default "hoy" del endpoint.
+    # Rango explícito cubriendo la fecha local real de los 3 eventos.
+    fechas_locales = [fecha_local(ts.replace(tzinfo=None), planta) for ts in timestamps]
+    r = client.get(
+        "/analytics/oee-general/",
+        params={"fecha_desde": min(fechas_locales).isoformat(), "fecha_hasta": max(fechas_locales).isoformat()},
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
     assert r.status_code == 200
     data = r.json()
     # 3 unidades procesadas, 1 rechazada -> calidad = 2/3 = 66.7%
@@ -198,7 +211,24 @@ def test_lentitud_entre_optimo_y_alerta_suma_a_minutos_perdidos_y_baja_rendimien
     assert r2.status_code == 201
 
     autenticar_como(gerente_a.id)
-    r = client.get("/analytics/oee-general/", headers={"X-Sub-Tenant-Id": str(planta.id)})
+    # Fase EY (bug real de timing, reproducido en vivo contra el reloj real
+    # cerca de medianoche LOCAL de planta): /analytics/oee-general/ sin
+    # fecha_desde/fecha_hasta explícitos default a "hoy" (planta-local). Si
+    # el segundo evento (170s después del primero) cruza esa medianoche
+    # mientras corre el test, quedaba fuera de "hoy" -- el cálculo salía
+    # con un solo evento en vez de dos. Se pasa el rango explícito
+    # cubriendo la fecha local real de AMBOS eventos (casi siempre el
+    # mismo día, salvo esa ventana de segundos).
+    fecha_evento1 = fecha_local(ahora.replace(tzinfo=None), planta)
+    fecha_evento2 = fecha_local((ahora + timedelta(seconds=170)).replace(tzinfo=None), planta)
+    r = client.get(
+        "/analytics/oee-general/",
+        params={
+            "fecha_desde": min(fecha_evento1, fecha_evento2).isoformat(),
+            "fecha_hasta": max(fecha_evento1, fecha_evento2).isoformat(),
+        },
+        headers={"X-Sub-Tenant-Id": str(planta.id)},
+    )
     assert r.status_code == 200
     data = r.json()
 

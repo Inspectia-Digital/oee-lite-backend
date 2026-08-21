@@ -198,11 +198,19 @@ def test_kpi_reconstruible_desde_historial_de_sesiones_dos_operarios_mismo_dia(c
     # CALENDARIO UTC de `entrada` (naive) puede diferir de la fecha
     # LOCAL de ese mismo instante. `fecha_local` hace la conversión
     # correcta (misma que usa el propio endpoint).
-    fecha = fecha_local(sesion_a.entrada, planta).isoformat()
+    #
+    # Fase EY (bug real de timing, reproducido en vivo cerca de
+    # medianoche LOCAL de planta): A y B loguean segundos aparte contra
+    # el reloj real -- si esa ventana cruza la medianoche local mientras
+    # corre el test, sesion_a y sesion_b caen en fechas locales DISTINTAS.
+    # Antes se armaba el rango sólo con la fecha de A -- los eventos de B
+    # quedaban fuera. Se cubre el rango real de ambas sesiones.
+    fecha_a = fecha_local(sesion_a.entrada, planta)
+    fecha_b = fecha_local(sesion_b.entrada, planta)
     autenticar_como(gerente_a.id)
     r = client.get(
         "/analytics/rendimiento-operarios/",
-        params={"fecha_desde": fecha, "fecha_hasta": fecha},
+        params={"fecha_desde": min(fecha_a, fecha_b).isoformat(), "fecha_hasta": max(fecha_a, fecha_b).isoformat()},
         headers={"X-Sub-Tenant-Id": str(planta.id)},
     )
     assert r.status_code == 200
