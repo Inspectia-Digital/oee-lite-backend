@@ -182,8 +182,8 @@ jobs:
             --region $REGION \
             --project $PROJECT_ID \
             --add-cloudsql-instances $DB_INSTANCE \
-            --set-secrets="DATABASE_URL=PROD_DATABASE_URL:latest" \
-            --set-env-vars="ENVIRONMENT=production,AUTH0_DOMAIN=${{ secrets.PROD_AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.PROD_AUTH0_AUDIENCE }},CORS_ORIGINS=${{ secrets.PROD_CORS_ORIGINS }}" \
+            --set-secrets="DATABASE_URL=PROD_DATABASE_URL:latest,AUTH0_MGMT_CLIENT_SECRET=PROD_AUTH0_MGMT_CLIENT_SECRET:latest" \
+            --set-env-vars="ENVIRONMENT=production,AUTH0_DOMAIN=${{ secrets.PROD_AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.PROD_AUTH0_AUDIENCE }},CORS_ORIGINS=${{ secrets.PROD_CORS_ORIGINS }},AUTH0_MGMT_CLIENT_ID=Mj73xiHNsKsqCR9G6yGpVv26oTsBEqK1" \
             --allow-unauthenticated \
             --min-instances 1 \
             --max-instances 10 \
