@@ -201,6 +201,24 @@ class Tenant(SQLModel, table=True):
         sa_column=Column(SaEnum(EstadoTenant, values_callable=lambda obj: [e.value for e in obj]))
     )
 
+    # Fase FA (PRD Demo/Partners/Marketplace/Soporte/Planes): ambiente
+    # demo autoservicio para el equipo comercial. es_demo es ortogonal a
+    # tipo/categoria -- un tenant demo sigue siendo tipo=EMPRESA con su
+    # jerarquía normal. industria_demo orienta los datos generados al
+    # crearlo (ver app/core/demo_industrias.py); demo_simulando_desde
+    # NULL = simulación detenida; demo_expira_at gobierna la limpieza
+    # automática (ver app/core/demo_simulador.py) -- se cuida
+    # deliberadamente que ningún tenant demo quede corriendo/acumulado
+    # para siempre (performance/costo de infra).
+    es_demo: bool = Field(default=False)
+    industria_demo: Optional[str] = Field(default=None)
+    demo_simulando_desde: Optional[datetime] = Field(default=None)
+    demo_expira_at: Optional[datetime] = Field(default=None)
+    # Persistida porque el job del scheduler (demo_simulador.py) corre
+    # desacoplado del request que llamó a .../simular/iniciar -- no hay
+    # otro lugar de donde leer la velocidad elegida en cada tick.
+    demo_velocidad: str = Field(default="normal")
+
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
 # ==========================================
@@ -599,6 +617,27 @@ class ApiKeyDispositivo(TenantBase, table=True):
     # cada auth (una línea activa autentica un scan por pieza).
     creado_por_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
     ultimo_uso_at: Optional[datetime] = Field(default=None)
+
+
+class DemoCredencialSimulador(TenantBase, table=True):
+    """Fase FA (Ambiente Demo): credencial M2M interna, generada una sola
+    vez por estación de un tenant demo, usada EXCLUSIVAMENTE por
+    app/core/demo_simulador.py para llamar a POST /api/lite/scans -- el
+    mismo endpoint que usa cualquier PLC/ESP32 real (decisión de diseño
+    del PRD: la demo llama al producto real, no una lógica paralela).
+
+    A diferencia de ApiKeyDispositivo (que sólo persiste el hash bcrypt
+    del secret, irrecuperable a propósito), acá se persiste la
+    credencial completa en texto plano -- es la única forma de que el
+    scheduler la reuse en cada tick sin volver a emitir una key nueva.
+    Aceptable porque: (a) nunca se expone en ningún endpoint de
+    lectura (no tiene response_model ni ruta GET pública), (b) sólo
+    existe para tenants es_demo=true, con datos 100% descartables, (c)
+    se borra en cascada cuando la demo se limpia (ver limpiar_demos_expiradas)."""
+    __tablename__ = "demo_credenciales_simulador"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id", unique=True)
+    credencial_completa: str = Field(description="key_id.secret -- ver ApiKeyDispositivo/auth_m2m.py")
 
 # ==========================================
 # 5. TRANSACCIONES LEGACY (Retenidas por retrocompatibilidad)

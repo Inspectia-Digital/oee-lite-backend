@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -9,6 +10,7 @@ from sqlmodel import SQLModel
 
 from app.core.config import settings
 from app.core.database import engine
+from app.core.demo_simulador import detener_scheduler, iniciar_scheduler
 from app.core.observabilidad import RequestIDMiddleware, obtener_request_id_actual
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,9 @@ from app.routers import recomputo
 # Fase EB — Billing MVP (catálogo de módulos/planes/métodos de pago)
 from app.routers import billing
 
+# Fase FA — Ambiente Demo
+from app.routers import demo
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -47,8 +52,17 @@ async def lifespan(app: FastAPI):
     """
     if settings.AUTO_CREATE_TABLES:
         SQLModel.metadata.create_all(engine)
+    # Fase FA (Ambiente Demo): el scheduler NUNCA arranca bajo pytest --
+    # PYTEST_CURRENT_TEST lo setea pytest automáticamente en cada test,
+    # sin necesidad de tocar conftest.py. Sin este guard, cientos de
+    # tests instanciando la app arrancarían igual cantidad de schedulers
+    # en background pegándole a la DB de test.
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        iniciar_scheduler()
     yield
     # (Espacio reservado para cerrar conexiones de base de datos o Redis de forma segura)
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        detener_scheduler()
 
 # ==========================================
 # INICIALIZACIÓN DE LA APLICACIÓN
@@ -153,6 +167,9 @@ app.include_router(recomputo.router)
 
 # 8. Fase EB — Billing MVP
 app.include_router(billing.router)
+
+# 9. Fase FA — Ambiente Demo
+app.include_router(demo.router)
 
 
 # ==========================================
