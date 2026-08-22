@@ -23,7 +23,8 @@ from decimal import Decimal
 import uuid
 
 from app.core.database import get_session
-from app.core.auth import obtener_contexto_tenant_humano, TenantContext
+from app.core.auth import get_usuario_actual, obtener_contexto_tenant_humano, TenantContext
+from app.core.planes import submodulos_efectivos_tenant
 from app.core.rbac import requerir_superadmin, requerir_gerencia_o_superadmin
 from app.models.domain import (
     ModuloDisponible, EstadoModuloDisponible,
@@ -31,7 +32,7 @@ from app.models.domain import (
     CaracteristicaModulo, PlanCaracteristica,
     MetodoPagoConfigurado, EstadoMetodoPago,
     PlanComercial, EstadoPlanComercial, PlanComercialModulo, PlanComercialPlan,
-    AsignacionModuloTenant, EstadoAsignacionModulo,
+    AsignacionModuloTenant, EstadoAsignacionModulo, TenantAddonContratado,
     Factura, EstadoFactura,
     SuscripcionTenant, EstadoCuentaTenant,
     PagoInformado, EstadoPagoInformado,
@@ -902,6 +903,114 @@ def listar_mis_modulos(
     estaba en el PRD §9 (que sólo lista el admin-side), mismo criterio
     de completitud que motivó `informar_pago`/`solicitar_factura`."""
     return db.exec(select(AsignacionModuloTenant).where(AsignacionModuloTenant.tenant_id == context.tenant_id)).all()
+
+
+class SubmodulosEfectivosOut(BaseModel):
+    codigos: List[str]
+
+
+@router.get("/mi-empresa/submodulos-efectivos", response_model=SubmodulosEfectivosOut)
+def listar_submodulos_efectivos(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(get_usuario_actual),
+    context: TenantContext = Depends(obtener_contexto_tenant_humano),
+):
+    """Fase FA.4.2: a qué submódulos accede este tenant (unión de planes
+    activos + add-ons sueltos). El frontend gatea la navegación con
+    esto, sin reimplementar la regla del lado del cliente.
+
+    Sin `requerir_gerencia_o_superadmin` a propósito, a diferencia del
+    resto de este router: no es información comercial (no expone
+    precios ni asignaciones), es lo que CUALQUIER usuario del tenant
+    necesita para que su propio menú se arme bien -- un supervisor
+    también tiene que ver las pantallas que su empresa contrató."""
+    return SubmodulosEfectivosOut(codigos=sorted(submodulos_efectivos_tenant(db, context.tenant_id)))
+
+
+# ==========================================
+# ADD-ONS (característica/submódulo contratada suelta, sin plan)
+# ==========================================
+class AddonCreate(BaseModel):
+    caracteristica_id: uuid.UUID
+    precio: Decimal
+    fecha_inicio: date
+
+    @field_validator("precio")
+    @classmethod
+    def _validar_precio(cls, v: Decimal) -> Decimal:
+        if v < 0:
+            raise ValueError("precio no puede ser negativo.")
+        return v
+
+
+@router.get("/clientes/{tenant_id}/addons", response_model=List[TenantAddonContratado])
+def listar_addons_de_tenant(
+    tenant_id: str,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(Tenant, tenant_id):
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    return db.exec(select(TenantAddonContratado).where(TenantAddonContratado.tenant_id == tenant_id)).all()
+
+
+@router.post("/clientes/{tenant_id}/addons", response_model=TenantAddonContratado, status_code=status.HTTP_201_CREATED)
+def contratar_addon(
+    tenant_id: str,
+    payload: AddonCreate,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Contrata un submódulo suelto, sin pasar por ningún plan (PRD
+    §3.1: un tenant Free puede sumar sólo Planificación sin subir de
+    plan). A diferencia de AsignacionModuloTenant, NO requiere método
+    de pago ni plan comercial -- es una línea suelta con su precio."""
+    if not db.get(Tenant, tenant_id):
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    if not db.get(CaracteristicaModulo, payload.caracteristica_id):
+        raise HTTPException(status_code=404, detail="Característica no encontrada.")
+
+    ya_existe = db.exec(
+        select(TenantAddonContratado).where(
+            TenantAddonContratado.tenant_id == tenant_id,
+            TenantAddonContratado.caracteristica_id == payload.caracteristica_id,
+        )
+    ).first()
+    if ya_existe:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ese add-on ya está contratado por este tenant. Editá el existente en vez de duplicarlo.",
+        )
+
+    addon = TenantAddonContratado(tenant_id=tenant_id, **payload.model_dump())
+    db.add(addon)
+    db.commit()
+    db.refresh(addon)
+    return addon
+
+
+@router.delete("/clientes/{tenant_id}/addons/{addon_id}", status_code=status.HTTP_204_NO_CONTENT)
+def cancelar_addon(
+    tenant_id: str,
+    addon_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """Cancela (hard delete) el add-on. A diferencia de las entidades
+    referenciadas por datos históricos, un add-on no deja rastro que
+    haya que preservar: es sólo "tiene o no tiene acceso". Si mañana
+    hace falta historial, se pasa a estado='cancelada' (el campo ya
+    existe) sin migración."""
+    addon = db.exec(
+        select(TenantAddonContratado).where(
+            TenantAddonContratado.id == addon_id,
+            TenantAddonContratado.tenant_id == tenant_id,
+        )
+    ).first()
+    if not addon:
+        raise HTTPException(status_code=404, detail="Add-on no encontrado.")
+    db.delete(addon)
+    db.commit()
 
 
 @router.post("/clientes/{tenant_id}/modulos", response_model=AsignacionModuloTenant, status_code=status.HTTP_201_CREATED)

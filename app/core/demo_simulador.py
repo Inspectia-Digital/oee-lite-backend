@@ -38,7 +38,8 @@ import os
 import random
 import secrets
 import uuid
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Optional
 
 import bcrypt
@@ -49,8 +50,9 @@ from sqlmodel import Session, delete, select
 from app.core.database import engine
 from app.core.demo_industrias import INDUSTRIAS_DEMO
 from app.models.domain import (
-    ApiKeyDispositivo, AsignacionTurno, DemoCredencialSimulador, Estacion,
-    LiteEventoProduccion, Linea, MaestroSKU, ParadaDetectada, Planta,
+    ApiKeyDispositivo, AsignacionModuloTenant, AsignacionTurno,
+    DemoCredencialSimulador, Estacion, LiteEventoProduccion, Linea, MaestroSKU,
+    MetodoPagoConfigurado, ModuloDisponible, ParadaDetectada, Planta, PlanPrecio,
     SesionOperario, Tenant, TipoProduccion, Turno,
 )
 
@@ -156,10 +158,40 @@ def crear_estructura_demo(db: Session, nombre: str, industria: str, tamano: str 
             db.flush()
             _emitir_credencial_interna(db, tenant.id, estacion.id)
 
+    _asignar_plan_completo(db, tenant.id)
+
     db.commit()
     db.refresh(tenant)
     logger.info(f"[demo] Tenant demo creado: id={tenant.id} industria={industria} tamano={tamano}")
     return tenant
+
+
+def _asignar_plan_completo(db: Session, tenant_id: str) -> None:
+    """Fase FA.4.2: sin esto, una demo nueva nacería sin ningún
+    submódulo y mostraría MENOS pantallas que el producto real -- justo
+    lo contrario de para lo que existe una demo. Best-effort: si el
+    seed de "TYMEO Completo" todavía no corrió en este entorno, la demo
+    se crea igual (no se rompe el alta por un dato de catálogo)."""
+    plan = db.exec(
+        select(PlanPrecio)
+        .join(ModuloDisponible, ModuloDisponible.id == PlanPrecio.modulo_id)
+        .where(ModuloDisponible.codigo == "tymeo", PlanPrecio.codigo == "completo")
+    ).first()
+    metodo_pago = db.exec(select(MetodoPagoConfigurado)).first()
+    if not plan or not metodo_pago:
+        logger.warning(
+            "[demo] No hay plan 'TYMEO Completo' o método de pago sembrado -- "
+            "la demo queda sin submódulos. Correr seed.py en este entorno."
+        )
+        return
+
+    hoy = date.today()
+    db.add(AsignacionModuloTenant(
+        tenant_id=tenant_id, modulo_id=plan.modulo_id, plan_id=plan.id,
+        metodo_pago_id=metodo_pago.id, fecha_inicio=hoy,
+        fecha_renovacion=hoy.replace(year=hoy.year + 1),
+        precio_base=Decimal("0.00"), precio_con_descuento=Decimal("0.00"),
+    ))
 
 
 def _emitir_credencial_interna(db: Session, tenant_id: str, estacion_id: uuid.UUID) -> None:
@@ -289,6 +321,9 @@ def _borrar_tenant_demo(db: Session, tenant_id: str) -> None:
     db.exec(delete(AsignacionTurno).where(AsignacionTurno.tenant_id == tenant_id))
     db.exec(delete(DemoCredencialSimulador).where(DemoCredencialSimulador.tenant_id == tenant_id))
     db.exec(delete(ApiKeyDispositivo).where(ApiKeyDispositivo.tenant_id == tenant_id))
+    # Fase FA.4.2: la demo ahora nace con un plan asignado -- sin borrar
+    # esta fila, el DELETE del tenant choca contra la FK.
+    db.exec(delete(AsignacionModuloTenant).where(AsignacionModuloTenant.tenant_id == tenant_id))
     db.exec(delete(MaestroSKU).where(MaestroSKU.tenant_id == tenant_id))
     db.exec(delete(Turno).where(Turno.tenant_id == tenant_id))
     db.exec(delete(Estacion).where(Estacion.tenant_id == tenant_id))

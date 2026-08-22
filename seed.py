@@ -1,10 +1,14 @@
 import os
+from datetime import date
+from decimal import Decimal
 
 from sqlmodel import Session, select
 from app.core.database import engine
 from app.models.domain import (
     Tenant, Planta, Linea, Estacion, TipoProduccion, UsuarioSaaS, RolUsuario,
     ModuloDisponible, EstadoModuloDisponible,
+    CaracteristicaModulo, PlanCaracteristica, PlanPrecio,
+    MetodoPagoConfigurado, AsignacionModuloTenant,
 )
 
 # Estructura base repetible (para resets de dev/local). El superadmin real
@@ -169,6 +173,114 @@ def seed_data():
             ))
         db.commit()
         print("✅ Catálogo de módulos disponibles (Billing) sembrado.")
+
+        # ==========================================
+        # 5. SUBMÓDULOS DE TYMEO + PLAN COMPLETO (Fase FA.4.2, PRD
+        # Segmentación de Planes). El acceso a pantallas se resuelve por
+        # submódulo (CaracteristicaModulo -- ver su docstring: ES el
+        # "submódulo" del PRD), con gate ESTRICTO: quien no lo tiene, no
+        # lo ve. Por eso este bloque tiene que existir ANTES de que el
+        # gate entre en vigor, o los tenants vivos perderían pantallas.
+        #
+        # NO se siembran Free/Start/Pro/Enterprise: esa estructura
+        # comercial (y sus precios) es del próximo PRD, junto con los
+        # formularios de OEE que la componen. "TYMEO Completo" es el
+        # plan interno que representa acceso total, para los tenants que
+        # ya venían operando.
+        # ==========================================
+        modulo_tymeo = db.exec(select(ModuloDisponible).where(ModuloDisponible.codigo == "tymeo")).first()
+        if modulo_tymeo:
+            submodulos_tymeo = [
+                ("nucleo", "Núcleo", "Líneas, estaciones, máquinas, turnos, paradas y dashboard"),
+                ("planificacion", "Planificación", "Planes de producción, órdenes y maestro de SKUs"),
+                ("personas_rrhh", "Personas", "Operarios y supervisores de planta"),
+                ("registro_manual", "Registro manual de OEE", "Carga de producción sin hardware conectado"),
+            ]
+            for codigo, nombre, descripcion in submodulos_tymeo:
+                existente = db.exec(
+                    select(CaracteristicaModulo).where(
+                        CaracteristicaModulo.modulo_id == modulo_tymeo.id,
+                        CaracteristicaModulo.codigo == codigo,
+                    )
+                ).first()
+                if not existente:
+                    db.add(CaracteristicaModulo(
+                        modulo_id=modulo_tymeo.id, codigo=codigo, nombre=nombre, descripcion=descripcion,
+                    ))
+            db.commit()
+
+            plan_completo = db.exec(
+                select(PlanPrecio).where(
+                    PlanPrecio.modulo_id == modulo_tymeo.id, PlanPrecio.codigo == "completo",
+                )
+            ).first()
+            if not plan_completo:
+                plan_completo = PlanPrecio(
+                    modulo_id=modulo_tymeo.id, codigo="completo", nombre="TYMEO Completo",
+                    descripcion="Acceso a todos los submódulos. Plan interno, no un tier comercial.",
+                    # Precio 0: no representa una tarifa real, es el plan
+                    # de los tenants que ya operaban antes de que
+                    # existiera la estructura comercial. Los precios
+                    # reales llegan con el próximo PRD.
+                    precio=Decimal("0.00"), orden=99,
+                )
+                db.add(plan_completo)
+                db.commit()
+                db.refresh(plan_completo)
+
+            # Todos los submódulos van a este plan (es el "completo").
+            for caracteristica in db.exec(
+                select(CaracteristicaModulo).where(CaracteristicaModulo.modulo_id == modulo_tymeo.id)
+            ).all():
+                ya_incluida = db.exec(
+                    select(PlanCaracteristica).where(
+                        PlanCaracteristica.plan_id == plan_completo.id,
+                        PlanCaracteristica.caracteristica_id == caracteristica.id,
+                    )
+                ).first()
+                if not ya_incluida:
+                    db.add(PlanCaracteristica(plan_id=plan_completo.id, caracteristica_id=caracteristica.id))
+            db.commit()
+            print("✅ Submódulos de TYMEO + plan 'TYMEO Completo' sembrados.")
+
+            # Método de pago: AsignacionModuloTenant.metodo_pago_id es
+            # NOT NULL, así que sin al menos uno no se puede asignar
+            # ningún plan a nadie. Se siembra genérico y sin datos
+            # bancarios inventados -- el detalle real lo carga el
+            # SuperAdmin desde el panel.
+            metodo_pago = db.exec(select(MetodoPagoConfigurado).where(MetodoPagoConfigurado.codigo == "a_convenir")).first()
+            if not metodo_pago:
+                metodo_pago = MetodoPagoConfigurado(
+                    codigo="a_convenir", nombre="A convenir", tipo="transferencia",
+                    detalle=None, orden=1,
+                )
+                db.add(metodo_pago)
+                db.commit()
+                db.refresh(metodo_pago)
+
+            # Asignación a los tenants que YA operaban: sin esto pierden
+            # las pantallas nuevas cuando el gate estricto entre en
+            # vigor (ver submodulos_efectivos_tenant, app/core/planes.py).
+            hoy = date.today()
+            for tenant_id in ("green_mills", "springwall"):
+                if not db.get(Tenant, tenant_id):
+                    continue
+                ya_asignado = db.exec(
+                    select(AsignacionModuloTenant).where(
+                        AsignacionModuloTenant.tenant_id == tenant_id,
+                        AsignacionModuloTenant.plan_id == plan_completo.id,
+                    )
+                ).first()
+                if ya_asignado:
+                    continue
+                db.add(AsignacionModuloTenant(
+                    tenant_id=tenant_id, modulo_id=modulo_tymeo.id, plan_id=plan_completo.id,
+                    metodo_pago_id=metodo_pago.id, fecha_inicio=hoy,
+                    fecha_renovacion=hoy.replace(year=hoy.year + 1),
+                    precio_base=Decimal("0.00"), precio_con_descuento=Decimal("0.00"),
+                ))
+            db.commit()
+            print("✅ TYMEO Completo asignado a los tenants existentes.")
 
     print("🚀 Proceso de Seeding multi-tenant completo finalizado correctamente.")
 
