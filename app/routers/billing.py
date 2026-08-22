@@ -15,7 +15,7 @@ anterior a esta fase):
   un cálculo interno, nunca un PDF ni un email real).
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select, func
+from sqlmodel import Session, select, func, delete
 from pydantic import BaseModel, field_validator
 from typing import List, Optional, Tuple
 from datetime import datetime, date, timedelta
@@ -28,6 +28,7 @@ from app.core.rbac import requerir_superadmin, requerir_gerencia_o_superadmin
 from app.models.domain import (
     ModuloDisponible, EstadoModuloDisponible,
     PlanPrecio, EstadoPlanPrecio,
+    CaracteristicaModulo, PlanCaracteristica,
     MetodoPagoConfigurado, EstadoMetodoPago,
     PlanComercial, EstadoPlanComercial, PlanComercialModulo, PlanComercialPlan,
     AsignacionModuloTenant, EstadoAsignacionModulo,
@@ -261,6 +262,171 @@ def eliminar_plan_precio(
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
     db.delete(plan)
     db.commit()
+
+
+# ==========================================
+# PLANES -- listado plano (Fase FA.3: selector de planes específicos de
+# PlanComercial, bloqueado hasta ahora por no existir esto -- ver
+# PlanComercialCreate/Update más abajo, campo planes_ids)
+# ==========================================
+class PlanPrecioConModulo(BaseModel):
+    id: uuid.UUID
+    modulo_id: uuid.UUID
+    modulo_nombre: str
+    codigo: str
+    nombre: str
+    precio: Decimal
+    estado: EstadoPlanPrecio
+
+
+@router.get("/planes", response_model=List[PlanPrecioConModulo])
+def listar_todos_los_planes(
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    filas = db.exec(
+        select(PlanPrecio, ModuloDisponible.nombre)
+        .join(ModuloDisponible, PlanPrecio.modulo_id == ModuloDisponible.id)
+        .order_by(ModuloDisponible.nombre, PlanPrecio.orden)
+    ).all()
+    return [
+        PlanPrecioConModulo(
+            id=plan.id, modulo_id=plan.modulo_id, modulo_nombre=modulo_nombre,
+            codigo=plan.codigo, nombre=plan.nombre, precio=plan.precio, estado=plan.estado,
+        )
+        for plan, modulo_nombre in filas
+    ]
+
+
+# ==========================================
+# CARACTERÍSTICAS DE MÓDULO (Fase FA.3: "qué incluye cada plan" más
+# allá de los límites numéricos -- ver CaracteristicaModulo, domain.py)
+# ==========================================
+class CaracteristicaModuloCreate(BaseModel):
+    codigo: str
+    nombre: str
+    descripcion: Optional[str] = None
+
+    @field_validator("codigo")
+    @classmethod
+    def _normalizar_codigo(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v:
+            raise ValueError("codigo no puede estar vacío.")
+        return v
+
+
+@router.get("/modulos/{modulo_id}/caracteristicas", response_model=List[CaracteristicaModulo])
+def listar_caracteristicas_de_modulo(
+    modulo_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(ModuloDisponible, modulo_id):
+        raise HTTPException(status_code=404, detail="Módulo no encontrado.")
+    return db.exec(
+        select(CaracteristicaModulo).where(CaracteristicaModulo.modulo_id == modulo_id).order_by(CaracteristicaModulo.nombre)
+    ).all()
+
+
+@router.post("/modulos/{modulo_id}/caracteristicas", response_model=CaracteristicaModulo, status_code=status.HTTP_201_CREATED)
+def crear_caracteristica(
+    modulo_id: uuid.UUID,
+    payload: CaracteristicaModuloCreate,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(ModuloDisponible, modulo_id):
+        raise HTTPException(status_code=404, detail="Módulo no encontrado.")
+    ya_existe = db.exec(
+        select(CaracteristicaModulo).where(
+            CaracteristicaModulo.modulo_id == modulo_id, CaracteristicaModulo.codigo == payload.codigo,
+        )
+    ).first()
+    if ya_existe:
+        raise HTTPException(status_code=409, detail=f"Ya existe una característica con código '{payload.codigo}' en este módulo.")
+    caracteristica = CaracteristicaModulo(modulo_id=modulo_id, **payload.model_dump())
+    db.add(caracteristica)
+    db.commit()
+    db.refresh(caracteristica)
+    return caracteristica
+
+
+@router.delete("/caracteristicas/{caracteristica_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_caracteristica(
+    caracteristica_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    caracteristica = db.get(CaracteristicaModulo, caracteristica_id)
+    if not caracteristica:
+        raise HTTPException(status_code=404, detail="Característica no encontrada.")
+    db.exec(delete(PlanCaracteristica).where(PlanCaracteristica.caracteristica_id == caracteristica_id))
+    db.delete(caracteristica)
+    db.commit()
+
+
+class PlanCaracteristicasUpdate(BaseModel):
+    caracteristicas_ids: List[uuid.UUID]
+
+
+@router.get("/planes/{plan_id}/caracteristicas", response_model=List[CaracteristicaModulo])
+def listar_caracteristicas_de_plan(
+    plan_id: uuid.UUID,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    if not db.get(PlanPrecio, plan_id):
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+    return db.exec(
+        select(CaracteristicaModulo)
+        .join(PlanCaracteristica, PlanCaracteristica.caracteristica_id == CaracteristicaModulo.id)
+        .where(PlanCaracteristica.plan_id == plan_id)
+        .order_by(CaracteristicaModulo.nombre)
+    ).all()
+
+
+@router.put("/planes/{plan_id}/caracteristicas", response_model=List[CaracteristicaModulo])
+def actualizar_caracteristicas_de_plan(
+    plan_id: uuid.UUID,
+    payload: PlanCaracteristicasUpdate,
+    db: Session = Depends(get_session),
+    _usuario: UsuarioSaaS = Depends(requerir_superadmin),
+):
+    """PUT reemplaza el set completo -- mismo criterio simple que
+    TenantModulosUpdate (admin.py): el caller manda la lista final, no
+    un diff. Valida que cada característica pertenezca al MISMO módulo
+    del plan (no tiene sentido asignarle a un plan de TYMEO una
+    característica de otro módulo)."""
+    plan = db.get(PlanPrecio, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado.")
+
+    if payload.caracteristicas_ids:
+        validas = set(db.exec(
+            select(CaracteristicaModulo.id).where(
+                CaracteristicaModulo.id.in_(payload.caracteristicas_ids),
+                CaracteristicaModulo.modulo_id == plan.modulo_id,
+            )
+        ).all())
+        invalidas = set(payload.caracteristicas_ids) - validas
+        if invalidas:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Características inválidas para el módulo de este plan: {sorted(str(i) for i in invalidas)}",
+            )
+
+    db.exec(delete(PlanCaracteristica).where(PlanCaracteristica.plan_id == plan_id))
+    for caracteristica_id in payload.caracteristicas_ids:
+        db.add(PlanCaracteristica(plan_id=plan_id, caracteristica_id=caracteristica_id))
+    db.commit()
+
+    return db.exec(
+        select(CaracteristicaModulo)
+        .join(PlanCaracteristica, PlanCaracteristica.caracteristica_id == CaracteristicaModulo.id)
+        .where(PlanCaracteristica.plan_id == plan_id)
+        .order_by(CaracteristicaModulo.nombre)
+    ).all()
 
 
 # ==========================================

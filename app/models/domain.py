@@ -952,6 +952,31 @@ class PlanPrecio(SQLModel, table=True):
     )
 
 
+class CaracteristicaModulo(SQLModel, table=True):
+    """Fase FA.3 (PRD Demo/Partners/Marketplace/Soporte/Planes): "qué
+    funcionalidades incluye cada plan" -- lo que faltaba más allá de los
+    límites numéricos (limite_usuarios/plantas/lineas de PlanPrecio, ya
+    existían y ya alcanzan). Un checklist de features del módulo (ej.
+    "exportacion_excel", "recompute_historico"), no un número."""
+    __tablename__ = "caracteristicas_modulo"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    modulo_id: uuid.UUID = Field(foreign_key="modulos_disponibles.id")
+    codigo: str = Field(description="Único DENTRO del módulo, ver índice compuesto abajo")
+    nombre: str
+    descripcion: Optional[str] = None
+
+    __table_args__ = (
+        Index("ix_caracteristicas_modulo_modulo_codigo", "modulo_id", "codigo", unique=True),
+    )
+
+
+class PlanCaracteristica(SQLModel, table=True):
+    """M2M: qué características de su módulo incluye un PlanPrecio dado."""
+    __tablename__ = "plan_caracteristicas"
+    plan_id: uuid.UUID = Field(foreign_key="planes_precio.id", primary_key=True)
+    caracteristica_id: uuid.UUID = Field(foreign_key="caracteristicas_modulo.id", primary_key=True)
+
+
 class EstadoMetodoPago(str, Enum):
     ACTIVO = "activo"
     INACTIVO = "inactivo"
