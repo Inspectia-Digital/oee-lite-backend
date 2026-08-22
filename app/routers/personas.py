@@ -47,6 +47,63 @@ class SupervisorUpdate(BaseModel):
     legajo: Optional[str] = None
     nombre_completo: Optional[str] = None
     activo: Optional[bool] = None
+    # Fase FA.4.1: vincular/desvincular la cuenta web del supervisor.
+    # `None` explícito = DESvincular; ausente = no tocar -- la diferencia
+    # la resuelve `exclude_unset=True` en el endpoint, no un sentinela.
+    usuario_id: Optional[uuid.UUID] = None
+
+
+class SupervisorOut(BaseModel):
+    """Fase FA.4.1: `response_model=Supervisor` (el modelo de tabla) no
+    puede traer el email del usuario vinculado -- vive en otra tabla.
+    Mismo patrón que PlanComercialOut (billing.py): schema de salida
+    propio que resuelve el dato derivado."""
+    id: uuid.UUID
+    tenant_id: str
+    legajo: str
+    nombre_completo: str
+    activo: bool
+    usuario_id: Optional[uuid.UUID] = None
+    usuario_email: Optional[str] = None
+
+
+def _serializar_supervisor(db: Session, supervisor: Supervisor) -> SupervisorOut:
+    email = None
+    if supervisor.usuario_id:
+        usuario = db.get(UsuarioSaaS, supervisor.usuario_id)
+        email = usuario.email if usuario else None
+    return SupervisorOut(**supervisor.model_dump(), usuario_email=email)
+
+
+def _validar_vinculo_usuario(
+    db: Session, tenant_id: str, usuario_id: Optional[uuid.UUID], supervisor_id: uuid.UUID,
+) -> None:
+    """Desvincular (None) siempre es válido. Vincular exige que el
+    usuario exista, sea del MISMO tenant, y no esté ya tomado por otro
+    supervisor -- el frontend ya calcula `usuariosOcupados` asumiendo
+    esta última regla (LinkSupervisorUserDialog.tsx)."""
+    if usuario_id is None:
+        return
+
+    usuario = db.get(UsuarioSaaS, usuario_id)
+    # Mismo criterio que el resto del backend: un id de otro tenant se
+    # trata como inexistente, no se confirma que exista (evita filtrar
+    # la existencia de usuarios ajenos).
+    if not usuario or usuario.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    ocupado = db.exec(
+        select(Supervisor).where(
+            Supervisor.tenant_id == tenant_id,
+            Supervisor.usuario_id == usuario_id,
+            Supervisor.id != supervisor_id,
+        )
+    ).first()
+    if ocupado:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Ese usuario ya está vinculado al supervisor '{ocupado.nombre_completo}'.",
+        )
 
 
 # ==========================================
@@ -163,7 +220,7 @@ def desactivar_operario(
 # ==========================================
 # SUPERVISORES
 # ==========================================
-@router.post("/supervisores/", response_model=Supervisor, status_code=status.HTTP_201_CREATED)
+@router.post("/supervisores/", response_model=SupervisorOut, status_code=status.HTTP_201_CREATED)
 def crear_supervisor(
     payload: SupervisorCreate,
     db: Session = Depends(get_session),
@@ -186,10 +243,10 @@ def crear_supervisor(
     db.add(nuevo)
     db.commit()
     db.refresh(nuevo)
-    return nuevo
+    return _serializar_supervisor(db, nuevo)
 
 
-@router.get("/supervisores/", response_model=List[Supervisor])
+@router.get("/supervisores/", response_model=List[SupervisorOut])
 def listar_supervisores(
     incluir_inactivos: bool = False,
     limit: Optional[int] = None,
@@ -205,10 +262,10 @@ def listar_supervisores(
         query = query.where(Supervisor.activo == True)  # noqa: E712
     query = query.order_by(Supervisor.legajo)
     query = aplicar_paginacion(query, limit, offset)
-    return db.exec(query).all()
+    return [_serializar_supervisor(db, s) for s in db.exec(query).all()]
 
 
-@router.get("/supervisores/{supervisor_id}", response_model=Supervisor)
+@router.get("/supervisores/{supervisor_id}", response_model=SupervisorOut)
 def obtener_supervisor(
     supervisor_id: uuid.UUID,
     db: Session = Depends(get_session),
@@ -217,10 +274,10 @@ def obtener_supervisor(
     supervisor = db.exec(select(Supervisor).where(Supervisor.id == supervisor_id, Supervisor.tenant_id == context.tenant_id)).first()
     if not supervisor:
         raise HTTPException(status_code=404, detail="Supervisor no encontrado.")
-    return supervisor
+    return _serializar_supervisor(db, supervisor)
 
 
-@router.patch("/supervisores/{supervisor_id}", response_model=Supervisor)
+@router.patch("/supervisores/{supervisor_id}", response_model=SupervisorOut)
 def actualizar_supervisor(
     supervisor_id: uuid.UUID,
     payload: SupervisorUpdate,
@@ -250,12 +307,18 @@ def actualizar_supervisor(
         if conflicto:
             raise HTTPException(status_code=409, detail=f"Ya existe un supervisor activo con legajo '{legajo_nuevo}'.")
 
+    # Fase FA.4.1: sólo se valida si vino en el payload -- `in datos`
+    # (no `datos.get(...)`) porque `usuario_id: None` explícito ES un
+    # valor válido (desvincular) y `get` no lo distingue de "ausente".
+    if "usuario_id" in datos:
+        _validar_vinculo_usuario(db, context.tenant_id, datos["usuario_id"], supervisor_id)
+
     for key, value in datos.items():
         setattr(supervisor, key, value)
     db.add(supervisor)
     db.commit()
     db.refresh(supervisor)
-    return supervisor
+    return _serializar_supervisor(db, supervisor)
 
 
 @router.delete("/supervisores/{supervisor_id}")
