@@ -219,6 +219,17 @@ class Tenant(SQLModel, table=True):
     # otro lugar de donde leer la velocidad elegida en cada tick.
     demo_velocidad: str = Field(default="normal")
 
+    # Fase FA.2 (PRD Demo/Partners/Marketplace/Soporte/Planes): tenant
+    # tipo Partner/Canal/Consultor. Ortogonal a tipo (empresa/planta) y
+    # a es_demo -- un Partner es un tenant categoria=partner que además
+    # puede tener su propio tenant demo asociado (demo_asociado_id,
+    # apunta a un Tenant de Fase FA.1). "Consultor" es una categoría de
+    # TENANT, no un rol dentro de un tenant cliente (confirmado por el
+    # propio pedido: "tiene que tener una empresa de prueba propia") --
+    # los roles internos (Gerencia, etc.) ya existentes no cambian.
+    categoria: str = Field(default="cliente")  # cliente | partner | interno
+    demo_asociado_id: Optional[str] = Field(default=None, foreign_key="tenants_saas.id")
+
 # ==========================================
 # 2.5 ACCESO SAAS (Usuarios B2B)
 # ==========================================
@@ -638,6 +649,23 @@ class DemoCredencialSimulador(TenantBase, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     estacion_id: uuid.UUID = Field(foreign_key="dim_estaciones.id", unique=True)
     credencial_completa: str = Field(description="key_id.secret -- ver ApiKeyDispositivo/auth_m2m.py")
+
+
+class MaterialPartner(SQLModel, table=True):
+    """Fase FA.2 (Tenant Partner): material comercial/publicitario para
+    que un Partner pueda vender el producto sin que InspectIA
+    intervenga en cada instancia de venta -- GLOBAL (no por partner,
+    no lleva tenant_id), lo carga SuperAdmin una sola vez y lo ven
+    TODOS los tenants categoria=partner en su sección "Material
+    Comercial" del sidebar."""
+    __tablename__ = "materiales_partner"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    titulo: str
+    descripcion: Optional[str] = Field(default=None)
+    url_archivo: Optional[str] = Field(default=None, description="Brochure, deck, video, etc. -- puntero externo, no se sube el archivo acá")
+    categoria: str = Field(default="otro")  # presentacion | brochure | pricing | video | otro
+    visible: bool = Field(default=True)
+    creado_at: datetime = Field(default_factory=datetime.utcnow)
 
 # ==========================================
 # 5. TRANSACCIONES LEGACY (Retenidas por retrocompatibilidad)

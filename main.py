@@ -39,6 +39,9 @@ from app.routers import billing
 # Fase FA — Ambiente Demo
 from app.routers import demo
 
+# Fase FA.2 — Tenant Partner
+from app.routers import partners
+
 
 # ==========================================
 # GESTIÓN DEL CICLO DE VIDA (CLOUD RUN)
@@ -170,6 +173,9 @@ app.include_router(billing.router)
 
 # 9. Fase FA — Ambiente Demo
 app.include_router(demo.router)
+
+# 10. Fase FA.2 — Tenant Partner
+app.include_router(partners.router)
 
 
 # ==========================================

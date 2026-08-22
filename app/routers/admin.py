@@ -54,6 +54,12 @@ class UsuarioGlobalUpdate(BaseModel):
 class TenantCreate(BaseModel):
     id: str
     nombre: str
+    # Fase FA.2 (Tenant Partner): categoria por default "cliente" -- el
+    # alta de un Partner desde Panel SaaS reusa este mismo endpoint,
+    # sólo pasando categoria="partner" (y opcionalmente demo_asociado_id,
+    # si ya existe un tenant demo de Fase FA.1 para asociarle).
+    categoria: str = "cliente"
+    demo_asociado_id: Optional[str] = None
 
 class TenantEstadoUpdate(BaseModel):
     estado: EstadoTenant
@@ -469,7 +475,10 @@ def crear_tenant_global(datos: TenantCreate, db: Session = Depends(get_session),
     if db.exec(select(Tenant).where(Tenant.id == datos.id)).first():
         raise HTTPException(status_code=400, detail="El ID del tenant ya existe.")
         
-    nuevo_tenant = Tenant(id=datos.id, nombre=datos.nombre)
+    nuevo_tenant = Tenant(
+        id=datos.id, nombre=datos.nombre,
+        categoria=datos.categoria, demo_asociado_id=datos.demo_asociado_id,
+    )
     db.add(nuevo_tenant)
     db.commit()
     db.refresh(nuevo_tenant)
