@@ -51,6 +51,20 @@ class UsuarioGlobalUpdate(BaseModel):
     apellido: Optional[str] = None
     activo: Optional[bool] = None
 
+# Fase FA.2/FA.2.1: valores válidos de Tenant.categoria. Se valida acá y
+# no con un enum de Postgres a propósito -- mismo criterio que
+# origen_maestros y el resto de los campos "de negocio" de Tenant: el
+# valor vive como string y la validación en el schema del router (ver
+# nota en RegistroRechazoManual sobre por qué este codebase no usa CHECK).
+CATEGORIAS_TENANT_VALIDAS = ("cliente", "partner", "interno")
+
+
+def _validar_categoria(v: Optional[str]) -> Optional[str]:
+    if v is not None and v not in CATEGORIAS_TENANT_VALIDAS:
+        raise ValueError(f"categoria inválida. Válidas: {', '.join(CATEGORIAS_TENANT_VALIDAS)}.")
+    return v
+
+
 class TenantCreate(BaseModel):
     id: str
     nombre: str
@@ -60,6 +74,11 @@ class TenantCreate(BaseModel):
     # si ya existe un tenant demo de Fase FA.1 para asociarle).
     categoria: str = "cliente"
     demo_asociado_id: Optional[str] = None
+
+    @field_validator("categoria")
+    @classmethod
+    def _categoria_valida(cls, v: str) -> str:
+        return _validar_categoria(v)
 
 class TenantEstadoUpdate(BaseModel):
     estado: EstadoTenant
@@ -84,6 +103,19 @@ class TenantUpdate(BaseModel):
     # Fase EZ.2: split de origen_maestros -- gobierna Planes y Órdenes,
     # independiente del de SKUs (ver Tenant.origen_maestros_planes).
     origen_maestros_planes: Optional[str] = None
+    # Fase FA.2.1 (hueco real encontrado por el usuario): FA.2 agregó
+    # `categoria` al modelo y a TenantCreate, pero NO acá -- así que un
+    # tenant que YA existía (el caso normal: convertir un cliente actual
+    # en Partner) no se podía cambiar por ningún medio, ni siquiera por
+    # API. El backend, los endpoints de material comercial y el gating
+    # del sidebar estaban listos; sólo faltaba poder asignar el valor.
+    categoria: Optional[str] = None
+    demo_asociado_id: Optional[str] = None
+
+    @field_validator("categoria")
+    @classmethod
+    def _categoria_valida(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_categoria(v)
 
 class TenantLogoUpdate(BaseModel):
     logo_url: str
@@ -456,14 +488,22 @@ def listar_todos_los_tenants(db: Session = Depends(get_session), usuario_actual:
     # switches de "Módulos contratados" sin un fetch extra por tenant.
     # Válido en GROUP BY sin agregarlo ahí: depende funcionalmente de
     # Tenant.id (su PK), Postgres lo permite igual que con nombre/logo_url.
+    # Fase FA.2.1: `categoria`/`demo_asociado_id` se agregan por el mismo
+    # motivo que `modulos_contratados` en su momento -- el panel SaaS los
+    # necesita para mostrar la columna Categoría y para que el diálogo de
+    # edición abra con el valor real. Sin esto, un Partner se veía como
+    # "cliente" (el default del frontend ante un campo ausente), que es
+    # peor que no mostrarlo: parece un dato correcto y no lo es.
     stmt = select(
         Tenant.id, Tenant.nombre, Tenant.color_primario, Tenant.logo_url,
-        Tenant.modulos_contratados, func.count(UsuarioSaaS.id).label("total_usuarios")
+        Tenant.modulos_contratados, Tenant.categoria, Tenant.demo_asociado_id,
+        func.count(UsuarioSaaS.id).label("total_usuarios")
     ).outerjoin(UsuarioSaaS, Tenant.id == UsuarioSaaS.tenant_id).group_by(Tenant.id)
     return [
         {
             "id": r.id, "nombre": r.nombre, "color_primario": r.color_primario,
             "logo_url": r.logo_url, "modulos_contratados": r.modulos_contratados,
+            "categoria": r.categoria, "demo_asociado_id": r.demo_asociado_id,
             "total_usuarios": r.total_usuarios,
         }
         for r in db.exec(stmt).all()
@@ -501,6 +541,20 @@ def actualizar_tenant_global(tenant_id: str, payload: TenantUpdate, db: Session 
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
     datos = payload.model_dump(exclude_unset=True)
+
+    # Fase FA.2.1: `demo_asociado_id` sólo tiene sentido apuntando a un
+    # tenant DEMO (es la empresa ficticia que el Partner usa para
+    # mostrar). Apuntarlo a un cliente real sería darle acceso a datos
+    # productivos ajenos -- por eso se valida acá y no sólo en la UI.
+    # `in datos` (no `.get`) porque None explícito = desasociar.
+    if "demo_asociado_id" in datos and datos["demo_asociado_id"] is not None:
+        demo = db.get(Tenant, datos["demo_asociado_id"])
+        if not demo or not demo.es_demo:
+            raise HTTPException(
+                status_code=422,
+                detail="demo_asociado_id debe apuntar a un tenant de demo existente.",
+            )
+
     for key, value in datos.items():
         setattr(tenant, key, value)
     db.add(tenant)
