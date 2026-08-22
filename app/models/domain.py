@@ -972,7 +972,22 @@ class CaracteristicaModulo(SQLModel, table=True):
     funcionalidades incluye cada plan" -- lo que faltaba más allá de los
     límites numéricos (limite_usuarios/plantas/lineas de PlanPrecio, ya
     existían y ya alcanzan). Un checklist de features del módulo (ej.
-    "exportacion_excel", "recompute_historico"), no un número."""
+    "exportacion_excel", "recompute_historico"), no un número.
+
+    Fase FA.4.2: esta entidad ES el "submódulo" del PRD de Segmentación
+    de Planes (§3.1). Ese documento proponía crear `submodulos` +
+    `plan_submodulos`, estructuralmente idénticas a esta tabla y a
+    `plan_caracteristicas` (mismos campos, mismo UNIQUE(modulo_id,
+    codigo)) -- se decidió con el usuario reusar lo que ya existía en
+    vez de duplicarlo. Por eso los códigos son unidades navegables
+    (`planificacion`, `personas_rrhh`, `registro_manual`), no sólo
+    feature flags finos. El nombre de la tabla queda como está: un
+    rename sería migración pura sin ganancia funcional.
+
+    Jerarquía real: Módulo (agrupa y se muestra en el Marketplace) ->
+    Característica/Submódulo (gatea el acceso real a pantallas) ->
+    incluida en planes y/o contratada suelta como add-on
+    (TenantAddonContratado)."""
     __tablename__ = "caracteristicas_modulo"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     modulo_id: uuid.UUID = Field(foreign_key="modulos_disponibles.id")
@@ -990,6 +1005,31 @@ class PlanCaracteristica(SQLModel, table=True):
     __tablename__ = "plan_caracteristicas"
     plan_id: uuid.UUID = Field(foreign_key="planes_precio.id", primary_key=True)
     caracteristica_id: uuid.UUID = Field(foreign_key="caracteristicas_modulo.id", primary_key=True)
+
+
+class TenantAddonContratado(TenantBase, table=True):
+    """Fase FA.4.2 (PRD Segmentación de Planes §3.1): una característica
+    contratada SUELTA, fuera de cualquier plan. El caso del PRD: un
+    tenant en Free contrata sólo "Planificación" sin subir de plan.
+
+    El acceso efectivo de un tenant es la UNIÓN de lo que traen sus
+    planes activos + estos add-ons -- ver submodulos_efectivos_tenant
+    en app/core/planes.py. Los dos caminos son intercambiables: no
+    importa por cuál llegó la característica.
+
+    `precio` es propio del add-on, independiente del plan base (por eso
+    no se deriva de PlanPrecio). NUMERIC explícito, nunca float: es
+    dinero, mismo criterio que PlanPrecio.precio."""
+    __tablename__ = "tenant_addons_contratados"
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    caracteristica_id: uuid.UUID = Field(foreign_key="caracteristicas_modulo.id")
+    precio: Decimal = Field(sa_column=Column(Numeric(10, 2), nullable=False), description="ARS, propio del add-on")
+    fecha_inicio: date
+    estado: str = Field(default="activa")  # activa | suspendida | cancelada
+
+    __table_args__ = (
+        Index("ix_tenant_addons_unico", "tenant_id", "caracteristica_id", unique=True),
+    )
 
 
 class EstadoMetodoPago(str, Enum):
