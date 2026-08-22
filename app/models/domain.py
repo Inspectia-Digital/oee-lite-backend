@@ -296,6 +296,21 @@ class Supervisor(TenantBase, table=True):
     legajo: str = Field(index=True)
     nombre_completo: str
     activo: bool = Field(default=True)
+    # Fase FA.4.1 (bug real, encontrado auditando el PRD de Segmentación
+    # de Planes contra el código): el frontend YA mandaba `usuario_id` a
+    # PATCH /config/supervisores/{id} (LinkSupervisorUserDialog.tsx ->
+    # useAsignacionSupervisores.ts) y la pantalla de Personal
+    # (PersonalCrudPanel.tsx) YA mostraba la columna "acceso" leyéndolo
+    # -- pero la columna no existía acá ni el campo en SupervisorUpdate,
+    # así que Pydantic descartaba el valor en silencio: el endpoint
+    # respondía 200, el front cantaba "Usuario web vinculado" y no se
+    # persistía nada. Nullable a propósito: un Supervisor puede estar
+    # dado de alta operativamente (asignable a línea/turno) sin tener
+    # todavía cuenta web -- ese estado se muestra explícitamente, no es
+    # un error. El Operario NUNCA necesita este vínculo (opera sólo por
+    # Terminal, ver login_operario_terminal en scans.py), por eso el
+    # campo vive acá y no en un modelo compartido.
+    usuario_id: Optional[uuid.UUID] = Field(default=None, foreign_key="usuarios_saas.id")
 
 class Estacion(TenantBase, table=True):
     __tablename__ = "dim_estaciones"
